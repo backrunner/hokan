@@ -1,0 +1,388 @@
+use std::ops::Range;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum QuoteContext {
+    #[default]
+    Unquoted,
+    Single,
+    Double,
+    Opaque,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TokenKind {
+    Word,
+    Whitespace,
+    Pipe,
+    AndIf,
+    OrIf,
+    Separator,
+    Redirect,
+    Comment,
+    Opaque,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Token {
+    pub kind: TokenKind,
+    pub range: Range<usize>,
+    pub cooked_prefix: String,
+    pub quote: QuoteContext,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParsedLine {
+    pub tokens: Vec<Token>,
+    pub active_segment: Range<usize>,
+    pub replacement: Range<usize>,
+    pub quote: QuoteContext,
+    pub command: Option<String>,
+    pub current_prefix: String,
+}
+
+pub fn parse_line(text: &str, cursor: usize) -> Result<ParsedLine, crate::Error> {
+    if cursor > text.len() || !text.is_char_boundary(cursor) {
+        return Err(crate::Error::Parse(
+            "cursor does not fall on a UTF-8 boundary".into(),
+        ));
+    }
+    let tokens = lex(text);
+    let segment_start = tokens
+        .iter()
+        .filter(|token| token.range.end <= cursor && is_segment_boundary(token.kind))
+        .map(|token| token.range.end)
+        .next_back()
+        .unwrap_or(0);
+    let segment_end = tokens
+        .iter()
+        .find(|token| token.range.start >= cursor && is_segment_boundary(token.kind))
+        .map_or(text.len(), |token| token.range.start);
+    let active_segment = segment_start..segment_end;
+
+    let current = tokens.iter().find(|token| {
+        token.kind == TokenKind::Word
+            && token.range.start <= cursor
+            && cursor <= token.range.end
+            && token.range.start >= active_segment.start
+            && token.range.end <= active_segment.end
+    });
+    let (replacement, quote, current_prefix) = current.map_or_else(
+        || (cursor..cursor, quote_at(text, cursor), String::new()),
+        |token| {
+            let prefix = cook_word(&text[token.range.start..cursor]);
+            (token.range.clone(), quote_at(text, cursor), prefix)
+        },
+    );
+    let command = tokens
+        .iter()
+        .find(|token| {
+            token.kind == TokenKind::Word
+                && token.range.start >= active_segment.start
+                && token.range.end <= active_segment.end
+        })
+        .map(|token| cook_word(&text[token.range.clone()]));
+
+    Ok(ParsedLine {
+        tokens,
+        active_segment,
+        replacement,
+        quote,
+        command,
+        current_prefix,
+    })
+}
+
+fn lex(text: &str) -> Vec<Token> {
+    let bytes = text.as_bytes();
+    let mut tokens = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        let start = index;
+        if bytes[index].is_ascii_whitespace() {
+            index += 1;
+            while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+                index += 1;
+            }
+            push_token(
+                &mut tokens,
+                TokenKind::Whitespace,
+                start..index,
+                text,
+                QuoteContext::Unquoted,
+            );
+            continue;
+        }
+        if matches!(bytes[index..], [b'<', b'(', ..] | [b'>', b'(', ..]) {
+            index = consume_opaque(bytes, index + 2);
+            push_token(
+                &mut tokens,
+                TokenKind::Opaque,
+                start..index,
+                text,
+                QuoteContext::Opaque,
+            );
+            continue;
+        }
+        let (kind, width) = match bytes[index..] {
+            [b'&', b'&', ..] => (Some(TokenKind::AndIf), 2),
+            [b'|', b'|', ..] => (Some(TokenKind::OrIf), 2),
+            [b'|', ..] => (Some(TokenKind::Pipe), 1),
+            [b';', ..] => (Some(TokenKind::Separator), 1),
+            [b'<', ..] | [b'>', ..] => (Some(TokenKind::Redirect), 1),
+            [b'#', ..] => (Some(TokenKind::Comment), bytes.len() - index),
+            _ => (None, 0),
+        };
+        if let Some(kind) = kind {
+            index += width;
+            push_token(
+                &mut tokens,
+                kind,
+                start..index,
+                text,
+                QuoteContext::Unquoted,
+            );
+            continue;
+        }
+
+        let mut quote = QuoteContext::Unquoted;
+        let mut token_quote = QuoteContext::Unquoted;
+        while index < bytes.len() {
+            let byte = bytes[index];
+            match quote {
+                QuoteContext::Unquoted => match byte {
+                    b'\'' => {
+                        quote = QuoteContext::Single;
+                        if token_quote != QuoteContext::Opaque {
+                            token_quote = QuoteContext::Single;
+                        }
+                        index += 1;
+                    }
+                    b'"' => {
+                        quote = QuoteContext::Double;
+                        if token_quote != QuoteContext::Opaque {
+                            token_quote = QuoteContext::Double;
+                        }
+                        index += 1;
+                    }
+                    b'\\' => index = (index + 2).min(bytes.len()),
+                    b'$' if bytes.get(index + 1) == Some(&b'(') => {
+                        index = consume_opaque(bytes, index + 2);
+                        token_quote = QuoteContext::Opaque;
+                    }
+                    b'$' if is_zsh_eval_expansion(bytes, index) => {
+                        index += 1;
+                        token_quote = QuoteContext::Opaque;
+                    }
+                    b'`' => {
+                        index = consume_backticks(bytes, index + 1);
+                        token_quote = QuoteContext::Opaque;
+                    }
+                    b if b.is_ascii_whitespace() || b"|;&<>".contains(&b) => break,
+                    _ => index += utf8_width_at(bytes, index),
+                },
+                QuoteContext::Single => {
+                    index += utf8_width_at(bytes, index);
+                    if byte == b'\'' {
+                        quote = QuoteContext::Unquoted;
+                    }
+                }
+                QuoteContext::Double => match byte {
+                    b'"' => {
+                        quote = QuoteContext::Unquoted;
+                        index += 1;
+                    }
+                    b'\\' => index = (index + 2).min(bytes.len()),
+                    b'$' if bytes.get(index + 1) == Some(&b'(') => {
+                        index = consume_opaque(bytes, index + 2);
+                        token_quote = QuoteContext::Opaque;
+                    }
+                    b'$' if is_zsh_eval_expansion(bytes, index) => {
+                        index += 1;
+                        token_quote = QuoteContext::Opaque;
+                    }
+                    b'`' => {
+                        index = consume_backticks(bytes, index + 1);
+                        token_quote = QuoteContext::Opaque;
+                    }
+                    _ => index += utf8_width_at(bytes, index),
+                },
+                QuoteContext::Opaque => index += utf8_width_at(bytes, index),
+            }
+        }
+        push_token(
+            &mut tokens,
+            TokenKind::Word,
+            start..index,
+            text,
+            token_quote,
+        );
+    }
+    tokens
+}
+
+fn push_token(
+    tokens: &mut Vec<Token>,
+    kind: TokenKind,
+    range: Range<usize>,
+    text: &str,
+    quote: QuoteContext,
+) {
+    tokens.push(Token {
+        kind,
+        cooked_prefix: if kind == TokenKind::Word {
+            cook_word(&text[range.clone()])
+        } else {
+            String::new()
+        },
+        range,
+        quote,
+    });
+}
+
+fn quote_at(text: &str, cursor: usize) -> QuoteContext {
+    let prefix = &text[..cursor];
+    let mut quote = QuoteContext::Unquoted;
+    let mut escaped = false;
+    for character in prefix.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match (quote, character) {
+            (QuoteContext::Unquoted | QuoteContext::Double, '\\') => escaped = true,
+            (QuoteContext::Unquoted, '\'') => quote = QuoteContext::Single,
+            (QuoteContext::Unquoted, '"') => quote = QuoteContext::Double,
+            (QuoteContext::Single, '\'') | (QuoteContext::Double, '"') => {
+                quote = QuoteContext::Unquoted;
+            }
+            _ => {}
+        }
+    }
+    quote
+}
+
+fn cook_word(raw: &str) -> String {
+    let mut output = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(character) = chars.next() {
+        match character {
+            '\'' | '"' => {}
+            '\\' => {
+                if let Some(next) = chars.next() {
+                    output.push(next);
+                }
+            }
+            _ => output.push(character),
+        }
+    }
+    output
+}
+
+const fn is_segment_boundary(kind: TokenKind) -> bool {
+    matches!(
+        kind,
+        TokenKind::Pipe | TokenKind::AndIf | TokenKind::OrIf | TokenKind::Separator
+    )
+}
+
+fn consume_opaque(bytes: &[u8], mut index: usize) -> usize {
+    let mut depth = 1_u32;
+    while index < bytes.len() && depth > 0 {
+        match bytes[index] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b'\\' => index = (index + 1).min(bytes.len()),
+            _ => {}
+        }
+        index += 1;
+    }
+    index
+}
+
+fn consume_backticks(bytes: &[u8], mut index: usize) -> usize {
+    while index < bytes.len() {
+        match bytes[index] {
+            b'`' => return index + 1,
+            b'\\' => index = (index + 2).min(bytes.len()),
+            _ => index += 1,
+        }
+    }
+    index
+}
+
+fn is_zsh_eval_expansion(bytes: &[u8], index: usize) -> bool {
+    let Some(flags) = bytes.get(index.saturating_add(3)..) else {
+        return false;
+    };
+    if bytes.get(index..index.saturating_add(3)) != Some(b"${(".as_slice()) {
+        return false;
+    }
+    let Some(end) = flags.iter().position(|byte| *byte == b')') else {
+        return false;
+    };
+    flags[..end].contains(&b'e')
+}
+
+fn utf8_width_at(bytes: &[u8], index: usize) -> usize {
+    let width = match bytes[index] {
+        0x00..=0x7f => 1,
+        0xc2..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf4 => 4,
+        _ => 1,
+    };
+    width.min(bytes.len() - index)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finds_segment_command_and_replacement() {
+        let text = "cat data | rg 'fo";
+        let parsed = parse_line(text, text.len()).expect("line should parse");
+        assert_eq!(&text[parsed.active_segment], " rg 'fo");
+        assert_eq!(parsed.command.as_deref(), Some("rg"));
+        assert_eq!(&text[parsed.replacement], "'fo");
+        assert_eq!(parsed.current_prefix, "fo");
+        assert_eq!(parsed.quote, QuoteContext::Single);
+    }
+
+    #[test]
+    fn accepts_incomplete_unicode_quotes_and_opaque_substitutions() {
+        let text = "echo \"中 $(date";
+        let parsed = parse_line(text, text.len()).expect("incomplete input should parse");
+        assert_eq!(parsed.command.as_deref(), Some("echo"));
+        assert!(
+            parsed
+                .tokens
+                .iter()
+                .any(|token| token.quote == QuoteContext::Opaque)
+        );
+    }
+
+    #[test]
+    fn marks_executable_substitutions_as_opaque_in_every_executable_context() {
+        for text in [
+            "echo $(rm -rf /)",
+            "echo `rm -rf /`",
+            "echo \"$(rm -rf /)\"",
+            "echo \"`rm -rf /`\"",
+            "cat <(rm -rf /)",
+            "cat >(rm -rf /)",
+            "echo ${(e)payload}",
+            "echo \"${(Xe)payload}\"",
+            "echo ${${(e)name}}",
+        ] {
+            let parsed = parse_line(text, text.len()).expect("line should parse");
+            assert!(
+                parsed
+                    .tokens
+                    .iter()
+                    .any(|token| token.quote == QuoteContext::Opaque),
+                "missing opaque token for {text:?}"
+            );
+        }
+    }
+}

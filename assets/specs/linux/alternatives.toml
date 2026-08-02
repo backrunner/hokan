@@ -1,0 +1,31 @@
+schema = 1
+
+[[commands]]
+id = "linux.ip"
+name = "ip"
+description = "查看或配置 Linux 网络"
+platforms = ["linux"]
+requires_arguments = true
+risk = "medium"
+default = "recipe:address"
+
+[[commands.recipes]]
+id = "address"
+template = "ip addr"
+description = "显示网络接口与地址"
+risk = "read_only"
+activation = "insert"
+
+[[commands.recipes]]
+id = "link"
+template = "ip link"
+description = "显示链路层接口状态"
+risk = "read_only"
+activation = "insert"
+
+[[commands.recipes]]
+id = "route"
+template = "ip route"
+description = "显示内核路由表"
+risk = "read_only"
+activation = "insert"

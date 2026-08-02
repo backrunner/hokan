@@ -1,0 +1,355 @@
+schema = 1
+
+[[commands]]
+id = "core.ls"
+name = "ls"
+description = "列出目录内容"
+platforms = ["linux", "macos"]
+requires_arguments = false
+risk = "read_only"
+default = "run_current"
+
+[[commands.recipes]]
+id = "long_all"
+template = "ls -la"
+description = "以长格式显示全部条目"
+risk = "read_only"
+activation = "insert"
+
+[[commands.recipes]]
+id = "human_all"
+template = "ls -lah"
+description = "显示隐藏条目和易读大小"
+risk = "read_only"
+activation = "insert"
+
+[[commands.recipes]]
+id = "newest_first"
+template = "ls -lt"
+description = "按修改时间从新到旧排列"
+risk = "read_only"
+activation = "insert"
+
+[[commands.recipes]]
+id = "directories_first"
+template = "ls -la --group-directories-first"
+description = "以长格式显示并把目录排列在文件之前"
+risk = "read_only"
+activation = "insert"
+platforms = ["linux"]
+
+[[commands.recipes]]
+id = "extended_attributes"
+template = "ls -l@"
+description = "显示文件的扩展属性信息"
+risk = "read_only"
+activation = "insert"
+platforms = ["macos"]
+
+[[commands]]
+id = "core.df"
+name = "df"
+description = "查看文件系统磁盘空间"
+platforms = ["linux", "macos"]
+requires_arguments = false
+risk = "read_only"
+default = "run_current"
+
+[[commands.recipes]]
+id = "human"
+template = "df -h"
+description = "以易读单位显示磁盘使用量"
+risk = "read_only"
+activation = "insert"
+
+[[commands.recipes]]
+id = "path"
+template = "df -h ${path}"
+description = "查看指定路径所在文件系统"
+risk = "read_only"
+activation = "continue"
+
+[[commands.recipes.slots]]
+name = "path"
+kind = "path"
+provider = "filesystem"
+
+[[commands.recipes]]
+id = "all"
+template = "df -a"
+description = "包含特殊和伪文件系统"
+risk = "read_only"
+activation = "insert"
+
+[[commands.recipes]]
+id = "filesystem_type"
+template = "df -hT"
+description = "以易读单位显示文件系统类型和使用量"
+risk = "read_only"
+activation = "insert"
+platforms = ["linux"]
+
+[[commands.recipes]]
+id = "inode_usage"
+template = "df -hi"
+description = "显示各文件系统的 inode 使用情况"
+risk = "read_only"
+activation = "insert"
+platforms = ["macos"]
+
+[[commands]]
+id = "core.tar"
+name = "tar"
+description = "创建、展开或检查归档"
+platforms = ["linux", "macos"]
+requires_arguments = true
+risk = "medium"
+default = "recipe:create_gzip"
+
+[[commands.recipes]]
+id = "create_gzip"
+template = "tar -czf ${archive} ${paths}"
+description = "创建 gzip 压缩归档"
+risk = "medium"
+activation = "continue"
+
+[[commands.recipes.slots]]
+name = "archive"
+kind = "new_file"
+provider = "filesystem"
+
+[[commands.recipes.slots]]
+name = "paths"
+kind = "path"
+provider = "filesystem"
+repeatable = true
+
+[[commands.recipes]]
+id = "extract_gzip"
+template = "tar -xzf ${archive}"
+description = "展开 gzip 压缩归档"
+risk = "medium"
+activation = "continue"
+
+[[commands.recipes.slots]]
+name = "archive"
+kind = "file"
+provider = "filesystem"
+
+[[commands.recipes]]
+id = "list"
+template = "tar -tf ${archive}"
+description = "只列出归档内容而不展开"
+risk = "read_only"
+activation = "continue"
+
+[[commands.recipes.slots]]
+name = "archive"
+kind = "file"
+provider = "filesystem"
+
+[[commands]]
+id = "core.lsof"
+name = "lsof"
+description = "列出打开的文件与网络端点"
+platforms = ["linux", "macos"]
+requires_arguments = false
+risk = "read_only"
+default = "run_current"
+
+[[commands.recipes]]
+id = "network"
+template = "lsof -i"
+description = "列出网络连接与监听端口"
+risk = "read_only"
+activation = "insert"
+
+[[commands.recipes]]
+id = "port"
+template = "lsof -i :${port}"
+description = "查找占用指定端口的进程"
+risk = "read_only"
+activation = "continue"
+
+[[commands.recipes.slots]]
+name = "port"
+kind = "port"
+provider = "value"
+
+[[commands.recipes]]
+id = "directory"
+template = "lsof +D ${directory}"
+description = "递归查找目录内打开的文件，可能较慢"
+risk = "medium"
+activation = "continue"
+
+[[commands.recipes.slots]]
+name = "directory"
+kind = "directory"
+provider = "filesystem"
+
+[[commands]]
+id = "core.ifconfig"
+name = "ifconfig"
+description = "查看或配置网络接口"
+platforms = ["linux", "macos"]
+requires_arguments = false
+risk = "read_only"
+default = "run_current"
+
+[[commands.recipes]]
+id = "interface"
+template = "ifconfig ${interface}"
+description = "查看指定网络接口的状态"
+risk = "read_only"
+activation = "continue"
+
+[[commands.recipes.slots]]
+name = "interface"
+kind = "interface"
+provider = "network_interface"
+
+[[commands.recipes]]
+id = "all"
+template = "ifconfig -a"
+description = "显示包括未启用接口在内的全部接口"
+risk = "read_only"
+activation = "insert"
+
+[[commands]]
+id = "core.ps"
+name = "ps"
+description = "查看进程快照"
+platforms = ["linux", "macos"]
+requires_arguments = false
+risk = "read_only"
+default = "run_current"
+
+[[commands.recipes]]
+id = "aux"
+template = "ps aux"
+description = "显示所有用户的详细进程列表"
+risk = "read_only"
+activation = "insert"
+
+[[commands.recipes]]
+id = "full"
+template = "ps -ef"
+description = "以完整格式显示全部进程"
+risk = "read_only"
+activation = "insert"
+
+[[commands.recipes]]
+id = "forest"
+template = "ps aux --forest"
+description = "以树状层级显示进程关系"
+risk = "read_only"
+activation = "insert"
+platforms = ["linux"]
+
+[[commands.recipes]]
+id = "columns"
+template = "ps -Ao pid,ppid,user,%cpu,%mem,command"
+description = "按指定列显示进程、资源占用和完整命令"
+risk = "read_only"
+activation = "insert"
+platforms = ["macos"]
+
+[[commands.recipes]]
+id = "user"
+template = "ps -u ${user}"
+description = "只显示指定用户的进程"
+risk = "read_only"
+activation = "continue"
+
+[[commands.recipes.slots]]
+name = "user"
+kind = "value"
+provider = "value"
+
+[[commands]]
+id = "core.kill"
+name = "kill"
+description = "向进程发送信号"
+platforms = ["linux", "macos"]
+requires_arguments = true
+risk = "high"
+default = "recipe:term"
+
+[[commands.recipes]]
+id = "term"
+template = "kill -TERM ${process}"
+description = "请求进程正常终止"
+risk = "medium"
+activation = "continue"
+
+[[commands.recipes.slots]]
+name = "process"
+kind = "process"
+provider = "process"
+
+[[commands.recipes]]
+id = "default_signal"
+template = "kill ${process}"
+description = "使用默认 TERM 信号终止进程"
+risk = "medium"
+activation = "continue"
+
+[[commands.recipes.slots]]
+name = "process"
+kind = "process"
+provider = "process"
+
+[[commands.recipes]]
+id = "force"
+template = "kill -9 ${process}"
+description = "强制终止进程，进程无法清理资源"
+risk = "high"
+activation = "continue"
+
+[[commands.recipes.slots]]
+name = "process"
+kind = "process"
+provider = "process"
+
+[[commands]]
+id = "core.bash"
+name = "bash"
+description = "启动 Bash 或执行 shell 脚本"
+platforms = ["linux", "macos"]
+requires_arguments = false
+risk = "low"
+default = "run_current"
+
+[[commands.recipes]]
+id = "script"
+template = "bash ${script}"
+description = "使用 Bash 执行脚本文件"
+risk = "medium"
+activation = "continue"
+
+[[commands.recipes.slots]]
+name = "script"
+kind = "executable"
+provider = "filesystem"
+
+[[commands]]
+id = "core.cd"
+name = "cd"
+description = "切换当前工作目录"
+platforms = ["linux", "macos"]
+requires_arguments = true
+risk = "low"
+default = "recipe:directory"
+
+[[commands.recipes]]
+id = "directory"
+template = "cd ${directory}"
+description = "切换到选择的目录"
+risk = "low"
+activation = "continue"
+
+[[commands.recipes.slots]]
+name = "directory"
+kind = "directory"
+provider = "filesystem"
