@@ -1,0 +1,146 @@
+.TH HOKANN 1 "2026-08-02" "hokann 0.1.0" "User Commands"
+.SH NAME
+hokann \- shell-aware terminal completion overlay
+.SH SYNOPSIS
+.B hokann
+.RI [ OPTIONS ]
+.RI [ COMMAND ]
+.SH DESCRIPTION
+Hokann starts an interactive zsh, bash, or fish inside a PTY and renders an
+inline completion list below the real shell prompt. Candidates come from shell
+history, built-in command recipes, the filesystem, package.json scripts, and an
+explicitly selected OpenAI-compatible provider.
+.PP
+Hokann does not use the terminal alternate screen for its overlay. AI results,
+history entries, and commands classified as high or unknown risk are inserted
+for review and are never executed by candidate selection.
+.SH OPTIONS
+.TP
+.BR --shell " " zsh|bash|fish
+Select the interactive child shell. The default is derived from
+.BR $SHELL .
+.TP
+.B --login
+Start the child as a login shell.
+.TP
+.BR -h , " " --help
+Print help.
+.TP
+.BR -V , " " --version
+Print the version.
+.SH COMMANDS
+.TP
+.BI "init " SHELL
+Print versioned shell integration code.
+.TP
+.B setup
+Install a managed integration block in the selected shell rc file. Existing
+files are backed up. Use
+.B --rc-file
+to select an explicit file. For zsh, a new real interactive terminal session
+automatically execs Hokann; the completion hook is loaded only in the managed
+child shell.
+.TP
+.B uninstall --integration-only
+Remove only the managed integration block and preserve configuration, history,
+and other rc content.
+.TP
+.B doctor [--json]
+Inspect TTY, terminal, shell, configuration, directory permissions, AI, and
+active shell integration state.
+.TP
+.BI "config " path|show|validate|init
+Inspect, validate, or initialize the TOML configuration.
+.TP
+.B config ai
+Inspect or update the OpenAI-compatible endpoint, model, and credential source.
+Use
+.B --api-key-stdin
+to store a private credential file.
+.TP
+.BI "history " import|stats|prune|repair|compact|clear
+Import and maintain Hokann's private history store. Clearing requires
+.BR --yes
+and never modifies the shell's own history.
+.TP
+.BI "spec " list|show|validate
+Inspect the effective built-in and user command specifications.
+.SH DEFAULT KEYS
+.TP
+.B Up, Down, PageUp, PageDown
+Move the current selection.
+.TP
+.B Tab
+Insert or continue a candidate. Tab never executes a command.
+.TP
+.B Enter
+Activate the selection. Only an unchanged, complete, low-risk RunCurrent item
+may submit the current shell buffer directly.
+.TP
+.B Esc
+Close the overlay or cancel an active AI request.
+.TP
+.B Ctrl-R
+Toggle the history-only view.
+.TP
+.B Shift-Tab
+Show or hide the completion list.
+.SH ENVIRONMENT
+.TP
+.B SHELL
+Default child shell.
+.TP
+.B TERM
+Terminal capability identifier. TERM=dumb is not supported.
+.TP
+.B XDG_CONFIG_HOME
+Base directory for config.toml, credentials.toml, and user command specs.
+.TP
+.B XDG_STATE_HOME
+Base directory for the private history store and optional diagnostic log.
+.TP
+.B XDG_CACHE_HOME
+Base directory for caches.
+.TP
+.B OPENAI_API_KEY
+Default API credential environment variable. The configured name may differ.
+.TP
+.B NO_COLOR
+Disable color when ui.color is auto.
+.TP
+.B HOKANN_AUTO_START
+Set to 0 to bypass managed zsh auto-start for the new shell process.
+.TP
+.B HOKANN_BIN
+Override the Hokann executable used by a managed integration block or active
+child-shell hook.
+.SH FILES
+.TP
+.I ~/.config/hokann/config.toml
+Default configuration.
+.TP
+.I ~/.config/hokann/credentials.toml
+Optional credential file; must be owned by the user and mode 0600 or stricter.
+.TP
+.I ~/.config/hokann/specs/
+User command specifications.
+.TP
+.I ~/.local/state/hokann/
+Private event log, snapshots, locks, and import checkpoints.
+.TP
+.I ~/.local/state/hokann/debug.log
+Optional bounded JSONL diagnostic log. Disabled by default; excludes query text,
+history, working-directory paths, HTTP bodies, and environment values.
+.SH EXIT STATUS
+Interactive mode returns the child shell exit status, capped at 255. CLI
+commands return zero on success and nonzero on configuration, I/O, validation,
+or runtime failure.
+.SH RECOVERY
+On a recoverable failure Hokann restores termios and cursor state. If a forced
+termination leaves terminal input or echo broken, run
+.BR "stty sane" .
+.SH SEE ALSO
+.BR bash (1),
+.BR fish (1),
+.BR tmux (1),
+.BR zsh (1)
