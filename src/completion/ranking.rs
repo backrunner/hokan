@@ -2,6 +2,8 @@ use std::collections::HashMap;
 
 use crate::{
     completion::{Candidate, CandidateAction, Completeness, CompletionContext, CursorPlacement},
+    parser::apply_edit,
+    project::WorkspaceMarkers,
     terminal::RiskLevel,
 };
 
@@ -14,6 +16,9 @@ pub fn rank_and_dedupe(
     let mut deduped: HashMap<(usize, usize, String), Candidate> = HashMap::new();
     for mut candidate in candidates {
         if candidate.query_id != context.query_id || !has_valid_edit(context, &candidate) {
+            continue;
+        }
+        if produces_current_buffer(context, &candidate) {
             continue;
         }
         let replacement_target = candidate
@@ -37,6 +42,7 @@ pub fn rank_and_dedupe(
             }
         }
         candidate.score.source_trust = candidate.source.trust();
+        candidate.score.context = workspace_bonus(context.workspace, replacement_target);
         candidate.score.risk_penalty = risk_penalty(candidate.risk);
         candidate.score.incomplete_penalty = match candidate.completeness {
             Completeness::Runnable => 0,
@@ -73,6 +79,23 @@ pub fn rank_and_dedupe(
     });
     candidates.truncate(limit);
     candidates
+}
+
+/// A candidate whose FULL resulting buffer equals what is already typed adds
+/// nothing — accepting it would rewrite the edit line to itself (the classic
+/// case is the spec "bare command" row duplicating the user's input). The
+/// comparison is trim-normalized so trailing-whitespace near-misses count as
+/// identical too.
+fn produces_current_buffer(context: &CompletionContext, candidate: &Candidate) -> bool {
+    let resulting = match candidate.edit.as_ref() {
+        Some(edit) => match apply_edit(&context.buffer.text, edit.range.clone(), &edit.replacement)
+        {
+            Ok(text) => text,
+            Err(_) => return false,
+        },
+        None => candidate.display.primary.clone(),
+    };
+    resulting.trim() == context.buffer.text.trim()
 }
 
 fn has_valid_edit(context: &CompletionContext, candidate: &Candidate) -> bool {
@@ -140,6 +163,41 @@ fn is_subsequence(query: &str, candidate: &str) -> bool {
     false
 }
 
+/// Project-context bonus: commands that match the detected workspace markers
+/// score higher so e.g. `git` wins inside a git repository and `npm run`
+/// inside a Node package. Applied centrally so every source benefits. Each
+/// matched rule adds 40; the sum is clamped to [0, 100] (the rules key on
+/// the first token and are therefore mutually exclusive in practice — the
+/// clamp is defensive).
+fn workspace_bonus(markers: WorkspaceMarkers, command: &str) -> i16 {
+    let command = command.trim_start();
+    let mut bonus = 0_i16;
+    if markers.git && command.starts_with("git ") {
+        bonus += 40;
+    }
+    if markers.package_json {
+        let mut tokens = command.split_whitespace();
+        if matches!(tokens.next(), Some("npm" | "pnpm" | "yarn" | "bun"))
+            && matches!(
+                tokens.next(),
+                Some("run" | "test" | "start" | "build" | "dev")
+            )
+        {
+            bonus += 40;
+        }
+    }
+    if markers.cargo_toml && command.starts_with("cargo ") {
+        bonus += 40;
+    }
+    if markers.makefile && command.starts_with("make ") {
+        bonus += 40;
+    }
+    if markers.justfile && command.starts_with("just ") {
+        bonus += 40;
+    }
+    bonus.clamp(0, 100)
+}
+
 const fn risk_penalty(risk: RiskLevel) -> i16 {
     match risk {
         RiskLevel::ReadOnly => 0,
@@ -150,7 +208,8 @@ const fn risk_penalty(risk: RiskLevel) -> i16 {
     }
 }
 
-const fn stricter_risk(left: RiskLevel, right: RiskLevel) -> RiskLevel {
+#[must_use]
+pub const fn stricter_risk(left: RiskLevel, right: RiskLevel) -> RiskLevel {
     if risk_severity(left) >= risk_severity(right) {
         left
     } else {
@@ -231,5 +290,192 @@ mod tests {
         );
         assert_eq!(ranked.len(), 1);
         assert_eq!(ranked[0].display.primary, "x-safe");
+    }
+
+    fn buffer_context(text: &str) -> CompletionContext {
+        let buffer =
+            BufferSnapshot::new(text, text.len(), BufferRevision::new(1), SyncQuality::Exact)
+                .expect("buffer");
+        CompletionContext::new(
+            QueryId::new(1),
+            ShellKind::Zsh,
+            PathBuf::from("/tmp"),
+            buffer,
+        )
+        .expect("context")
+    }
+
+    fn history_candidate(
+        context: &CompletionContext,
+        replacement: &str,
+        range_end: usize,
+    ) -> Candidate {
+        Candidate::new(
+            context.query_id,
+            replacement,
+            "history",
+            Some(TextEdit {
+                range: 0..range_end,
+                replacement: replacement.into(),
+                cursor_after: CursorPlacement::End,
+            }),
+            CandidateAction::Insert,
+            CandidateSource::History,
+            CandidateKind::History,
+            Completeness::Runnable,
+            RiskLevel::Low,
+            "history",
+        )
+    }
+
+    #[test]
+    fn drops_candidates_identical_to_the_current_buffer() {
+        let context = buffer_context("git status");
+        let ranked = rank_and_dedupe(
+            &context,
+            vec![
+                // Spec-style bare command duplicating the typed buffer.
+                history_candidate(&context, "git status", 10),
+                // Trim-normalized near-miss: trailing space still counts as identical.
+                history_candidate(&context, "git status ", 10),
+                // Genuinely different completion stays.
+                history_candidate(&context, "git status --short", 10),
+            ],
+            10,
+        );
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].display.primary, "git status --short");
+    }
+
+    #[test]
+    fn drops_editless_candidates_matching_the_current_buffer() {
+        let context = buffer_context("make build");
+        let editless = Candidate::new(
+            context.query_id,
+            "make build",
+            "project",
+            None,
+            CandidateAction::None,
+            CandidateSource::Project,
+            CandidateKind::Recipe,
+            Completeness::Runnable,
+            RiskLevel::Low,
+            "project",
+        );
+        let different = Candidate::new(
+            context.query_id,
+            "make build release",
+            "project",
+            None,
+            CandidateAction::None,
+            CandidateSource::Project,
+            CandidateKind::Recipe,
+            Completeness::Runnable,
+            RiskLevel::Low,
+            "project-x",
+        );
+        let ranked = rank_and_dedupe(&context, vec![editless, different], 10);
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].display.primary, "make build release");
+    }
+
+    #[test]
+    fn stricter_risk_keeps_the_more_severe_level() {
+        assert_eq!(
+            stricter_risk(RiskLevel::Low, RiskLevel::High),
+            RiskLevel::High
+        );
+        assert_eq!(
+            stricter_risk(RiskLevel::Unknown, RiskLevel::Medium),
+            RiskLevel::Unknown
+        );
+        assert_eq!(
+            stricter_risk(RiskLevel::ReadOnly, RiskLevel::ReadOnly),
+            RiskLevel::ReadOnly
+        );
+    }
+
+    #[test]
+    fn workspace_bonus_rewards_commands_matching_the_markers() {
+        let git = WorkspaceMarkers {
+            git: true,
+            ..WorkspaceMarkers::default()
+        };
+        let node = WorkspaceMarkers {
+            package_json: true,
+            ..WorkspaceMarkers::default()
+        };
+        let rust = WorkspaceMarkers {
+            cargo_toml: true,
+            ..WorkspaceMarkers::default()
+        };
+        let make = WorkspaceMarkers {
+            makefile: true,
+            ..WorkspaceMarkers::default()
+        };
+        let just = WorkspaceMarkers {
+            justfile: true,
+            ..WorkspaceMarkers::default()
+        };
+
+        assert_eq!(workspace_bonus(git, "git status"), 40);
+        assert_eq!(workspace_bonus(git, "cargo build"), 0);
+        assert_eq!(workspace_bonus(git, "git"), 0, "bare command gets nothing");
+        assert_eq!(workspace_bonus(node, "npm run build"), 40);
+        assert_eq!(workspace_bonus(node, "pnpm test"), 40);
+        assert_eq!(workspace_bonus(node, "yarn dev"), 40);
+        assert_eq!(workspace_bonus(node, "bun start"), 40);
+        assert_eq!(workspace_bonus(node, "npm install"), 0);
+        assert_eq!(workspace_bonus(rust, "cargo build"), 40);
+        assert_eq!(workspace_bonus(make, "make install"), 40);
+        assert_eq!(workspace_bonus(just, "just build"), 40);
+        assert_eq!(
+            workspace_bonus(WorkspaceMarkers::default(), "git status"),
+            0
+        );
+        assert!(
+            workspace_bonus(
+                WorkspaceMarkers {
+                    git: true,
+                    package_json: true,
+                    cargo_toml: true,
+                    makefile: true,
+                    justfile: true,
+                },
+                "git status"
+            ) <= 100,
+            "bonus stays clamped"
+        );
+    }
+
+    #[test]
+    fn workspace_bonus_is_applied_centrally_to_ranked_candidates() {
+        let markers = WorkspaceMarkers {
+            git: true,
+            ..WorkspaceMarkers::default()
+        };
+        let context = buffer_context("git st").with_workspace(markers);
+        let ranked = rank_and_dedupe(
+            &context,
+            vec![history_candidate(&context, "git status", 6)],
+            10,
+        );
+        assert_eq!(ranked[0].score.context, 40);
+
+        let plain = buffer_context("git st");
+        let ranked = rank_and_dedupe(&plain, vec![history_candidate(&plain, "git status", 6)], 10);
+        assert_eq!(ranked[0].score.context, 0);
+    }
+
+    #[test]
+    fn failed_penalty_pushes_recently_failed_commands_down() {
+        let context = buffer_context("x");
+        let mut failed = history_candidate(&context, "x-failed", 1);
+        failed.score.failed_penalty = 150;
+        failed.score.frecency = 200;
+        let mut healthy = history_candidate(&context, "x-healthy", 1);
+        healthy.score.frecency = 100;
+        let ranked = rank_and_dedupe(&context, vec![failed, healthy], 10);
+        assert_eq!(ranked[0].display.primary, "x-healthy");
     }
 }

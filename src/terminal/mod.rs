@@ -1,5 +1,6 @@
 pub mod compositor;
 pub mod guard;
+pub mod icons;
 pub mod input;
 pub mod model;
 pub mod output;

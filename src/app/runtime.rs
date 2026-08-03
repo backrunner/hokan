@@ -16,8 +16,9 @@ use super::buffer::{EditableBuffer, MirrorOutcome};
 use crate::{
     ai::{AiClient, build_context},
     completion::{
-        Activation, BufferSnapshot, Candidate, CandidateSource, CompletionContext,
-        CompletionEngine, ProviderOutput, SyncQuality, activate_candidate, rank_and_dedupe,
+        Activation, BufferSnapshot, Candidate, CandidateAction, CandidateSource, Completeness,
+        CompletionContext, CompletionEngine, ProviderOutput, SyncQuality, activate_candidate,
+        rank_and_dedupe, stricter_risk,
     },
     config::{Config, ConfigPaths, ConfigReload, ConfigWatcher},
     diagnostics::DebugLog,
@@ -33,7 +34,10 @@ use crate::{
         ai_result_candidates,
     },
     pty::{PtyChild, PtyReadEvent, PtyReadPump, SignalBridge, SignalEvent},
-    shell::{ControlMessage, ShellEvent, ShellKind, ShellSession, replacement_sequence},
+    safety::classify_command,
+    shell::{
+        ControlMessage, ShellEvent, ShellKind, ShellSession, accept_sequence, replacement_sequence,
+    },
     specs::SpecRegistry,
     terminal::{
         BufferRevision, FrameRequest, FrameRevision, FrameTicket, InputDecoder, InputEvent,
@@ -63,9 +67,9 @@ pub struct SessionOptions {
 
 pub fn run_session(options: SessionOptions) -> crate::Result<u8> {
     validate_terminal_session()?;
-    if std::env::var_os("HOKANN_ACTIVE").is_some() {
+    if std::env::var_os("HOKAN_ACTIVE").is_some() {
         return Err(crate::Error::Runtime(
-            "refusing to start a recursive Hokann session".into(),
+            "refusing to start a recursive Hokan session".into(),
         ));
     }
 
@@ -290,12 +294,12 @@ pub fn run_session(options: SessionOptions) -> crate::Result<u8> {
 fn validate_terminal_session() -> crate::Result<()> {
     if !std::io::stdin().is_terminal() || !crate::terminal::process_stdout_is_terminal() {
         return Err(crate::Error::Runtime(
-            "hokann requires terminal stdin and stdout".into(),
+            "hokan requires terminal stdin and stdout".into(),
         ));
     }
     if std::env::var("TERM").ok().as_deref() == Some("dumb") {
         return Err(crate::Error::Runtime(
-            "TERM=dumb does not support the Hokann overlay".into(),
+            "TERM=dumb does not support the Hokan overlay".into(),
         ));
     }
     Ok(())
@@ -309,7 +313,7 @@ fn current_terminal_size() -> crate::Result<TerminalSize> {
 fn spawn_input_reader() -> crate::Result<Receiver<Vec<u8>>> {
     let (sender, receiver) = unbounded();
     thread::Builder::new()
-        .name("hokann-stdin".into())
+        .name("hokan-stdin".into())
         .spawn(move || {
             let mut stdin = std::io::stdin().lock();
             let mut bytes = vec![0_u8; 16 * 1024];
@@ -358,6 +362,7 @@ fn load_history(
             event.shell,
             event.cwd.as_deref(),
             event.occurrences,
+            event.exit_code,
             &policy,
         );
     }
@@ -366,11 +371,16 @@ fn load_history(
         && let Ok(bytes) = read_history_tail(&path, SHELL_HISTORY_STARTUP_MAX_BYTES)
     {
         let now = crate::history_now_ms();
-        for (offset, imported) in parse_history(shell, &bytes).into_iter().rev().enumerate() {
+        // Ingest in chronological order so the transition bigram learns the
+        // real command sequences; the timestamp assignment matches the old
+        // newest-first enumeration exactly.
+        let imported = parse_history(shell, &bytes);
+        let total = imported.len();
+        for (offset, imported) in imported.into_iter().enumerate() {
             let timestamp = imported
                 .timestamp_ms
-                .unwrap_or_else(|| now.saturating_sub(offset as i64));
-            index.ingest(&imported.command, timestamp, shell, None, &policy);
+                .unwrap_or_else(|| now.saturating_sub((total - 1 - offset) as i64));
+            index.ingest(&imported.command, timestamp, shell, None, None, &policy);
         }
     }
     Ok((store, Arc::new(RwLock::new(index)), policy, cursor))
@@ -487,6 +497,7 @@ fn handle_config_reload(
             worker.replace_engine(engine)?;
             state.cancel_ai();
             state.overlay_visible = false;
+            state.pending_confirm = None;
             state.update_overlay_height(u16::try_from(live.ui.max_rows).unwrap_or(u16::MAX).max(1));
             configure_overlay(output, &live)?;
             *config = live;
@@ -538,6 +549,7 @@ fn configure_overlay(output: &OutputHandle, config: &Config) -> crate::Result<()
             u16::try_from(config.ui.max_rows).unwrap_or(u16::MAX),
             u16::try_from(config.ui.max_width).unwrap_or(u16::MAX),
             color,
+            config.ui.nerd_fonts,
         )
         .map_err(output_error)
 }
@@ -551,6 +563,7 @@ struct RuntimeState {
     context: Option<Arc<CompletionContext>>,
     candidates: Vec<Candidate>,
     selected: Option<crate::completion::CandidateId>,
+    selection_intent: Option<SelectionIntent>,
     history_only: bool,
     provider_pending: bool,
     overlay_visible: bool,
@@ -561,6 +574,11 @@ struct RuntimeState {
     escape_deadline: Option<Instant>,
     need_cpr: bool,
     pending_command: Option<String>,
+    /// Last command recorded as executed in this session; feeds the
+    /// transition bigram signal on the next completion query.
+    previous_command: Option<String>,
+    workspace_probe: crate::project::WorkspaceProbe,
+    pending_confirm: Option<PendingConfirm>,
     ai_query: Option<ActiveAiRequest>,
     foreground_process: bool,
     suspended: bool,
@@ -607,6 +625,7 @@ impl RuntimeState {
             context: None,
             candidates: Vec::new(),
             selected: None,
+            selection_intent: None,
             history_only: false,
             provider_pending: false,
             overlay_visible: false,
@@ -617,6 +636,9 @@ impl RuntimeState {
             escape_deadline: None,
             need_cpr: false,
             pending_command: None,
+            previous_command: None,
+            workspace_probe: crate::project::WorkspaceProbe::default(),
+            pending_confirm: None,
             ai_query: None,
             foreground_process: false,
             suspended: false,
@@ -661,28 +683,38 @@ impl RuntimeState {
     fn schedule_query(&mut self, worker: &ProviderWorker) -> crate::Result<()> {
         self.cancel_ai();
         self.status = None;
-        self.overlay_visible = false;
-        self.candidates.clear();
-        self.selected = None;
+        self.pending_confirm = None;
         if self.buffer.sync == SyncQuality::Uncertain
             || (self.buffer.text.trim().is_empty() && !self.history_only)
         {
             self.context = None;
             self.candidates.clear();
             self.selected = None;
+            self.overlay_visible = false;
             self.provider_pending = false;
             return Ok(());
         }
+        // The previous candidates stay visible and routable while the new
+        // query is in flight: queued buffer events arrive in bursts, and
+        // clearing here would flap the overlay closed mid-burst — leaking
+        // navigation keys to the shell and wiping selections made against
+        // the still-visible list. Stale rows lose activation eligibility
+        // through `resolve_selected_activation`, and the next provider
+        // result replaces them.
         self.query_id = self
             .query_id
             .checked_next()
             .ok_or_else(|| crate::Error::Runtime("query id exhausted".into()))?;
-        let context = Arc::new(CompletionContext::new(
-            self.query_id,
-            self.shell,
-            self.cwd.clone(),
-            self.snapshot()?,
-        )?);
+        let context = Arc::new(
+            CompletionContext::new(
+                self.query_id,
+                self.shell,
+                self.cwd.clone(),
+                self.snapshot()?,
+            )?
+            .with_previous_command(self.previous_command.clone())
+            .with_workspace(self.workspace_probe.markers(&self.cwd)),
+        );
         self.context = Some(Arc::clone(&context));
         self.provider_pending = true;
         worker.schedule(context)
@@ -718,11 +750,22 @@ struct ActiveAiRequest {
     cancel: CancellationToken,
 }
 
+/// A dangerous candidate execution awaiting explicit confirmation: the full
+/// final command text plus the effective risk that triggered the prompt.
+struct PendingConfirm {
+    text: String,
+    risk: crate::terminal::RiskLevel,
+    reasons: Vec<String>,
+}
+
+/// Number of candidate rows visible per page: the overlay box height minus
+/// its two border rows (pagination lives in the top border, status/hints in
+/// the bottom border, so no item row is reserved).
 fn visible_page_size(max_overlay_height: u16, terminal_size: TerminalSize) -> usize {
     let height = max_overlay_height
         .min(terminal_size.rows.saturating_sub(1))
         .max(1);
-    usize::from(height.saturating_sub(1).max(1))
+    usize::from(height.saturating_sub(2).max(1))
 }
 
 struct ProviderResult {
@@ -750,7 +793,7 @@ impl ProviderWorker {
         let engine = Arc::new(RwLock::new(engine));
         let worker_engine = Arc::clone(&engine);
         let join = thread::Builder::new()
-            .name("hokann-providers".into())
+            .name("hokan-providers".into())
             .spawn(move || {
                 while let Ok(context) = receiver.recv() {
                     let engine = match worker_engine.read() {
@@ -850,6 +893,48 @@ struct AiResult {
     result: Result<Vec<crate::ai::AiCommand>, crate::ai::AiClientError>,
 }
 
+/// A navigation the user made against the overlay, kept across query changes.
+///
+/// Buffer events queued behind user input each create a new query whose
+/// candidates carry fresh ids, so the old id-based carry-over cannot survive
+/// the catch-up: without this, an Up/Down press that landed while the app was
+/// catching up would be silently lost. The intent is re-applied to fresh
+/// provider results by content identity first (the same command keeps its
+/// selection), falling back to the navigation delta against the fresh list
+/// (Down from nothing selects the first row again). Any further real keypress
+/// clears it, so typing after selecting keeps the existing "selection
+/// cleared" behavior.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SelectionIntent {
+    delta: isize,
+    key: SelectionKey,
+}
+
+/// Content identity of a candidate row: two queries for different buffer
+/// revisions agree on it while per-query candidate ids never match.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SelectionKey {
+    source: crate::completion::CandidateSource,
+    primary: String,
+    replacement: Option<String>,
+}
+
+impl SelectionKey {
+    fn of(candidate: &Candidate) -> Self {
+        Self {
+            source: candidate.source,
+            primary: candidate.display.primary.clone(),
+            replacement: candidate.edit.as_ref().map(|edit| edit.replacement.clone()),
+        }
+    }
+
+    fn matches(&self, candidate: &Candidate) -> bool {
+        self.source == candidate.source
+            && self.primary == candidate.display.primary
+            && self.replacement.as_ref() == candidate.edit.as_ref().map(|edit| &edit.replacement)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn route_terminal_input(
     bytes: &[u8],
@@ -897,6 +982,29 @@ fn handle_input_event(
         return Ok(());
     }
 
+    // Any further keypress invalidates a pending re-selection intent; the
+    // overlay navigation keys below re-establish it via `move_selection`.
+    state.selection_intent = None;
+
+    // Danger-confirmation routing takes precedence over the normal overlay
+    // block: Enter proceeds with the pending execution, Esc cancels back to
+    // the candidate list, and any other key drops the confirmation and is
+    // then processed normally.
+    if state.pending_confirm.is_some() {
+        if config.keys.activate.matches(&event.kind) {
+            let confirm = state
+                .pending_confirm
+                .take()
+                .ok_or_else(|| crate::Error::Runtime("pending confirmation disappeared".into()))?;
+            return execute_text(state, pty, session, output, confirm.text);
+        }
+        if config.keys.dismiss.matches(&event.kind) {
+            state.pending_confirm = None;
+            return render_current(state, output);
+        }
+        state.pending_confirm = None;
+    }
+
     if state.overlay_visible {
         if config.keys.up.matches(&event.kind) {
             move_selection(state, -1);
@@ -914,20 +1022,21 @@ fn handle_input_event(
             move_selection(state, state.page_size as isize);
             return render_current(state, output);
         }
-        let accept = config.keys.accept.matches(&event.kind);
-        let activate = config.keys.activate.matches(&event.kind);
-        if accept || activate {
+        // The activate key (Enter) is two-state. With an explicit selection it
+        // activates that candidate: runnable candidates are EXECUTED (with a
+        // confirmation step when dangerous), everything else degrades to the
+        // Tab behavior below. With no selection it falls through to the
+        // generic Enter branch, which submits the typed buffer unchanged.
+        if config.keys.activate.matches(&event.kind) && state.selected.is_some() {
+            return enter_with_selection(state, pty, session, output, worker, config, ai_sender);
+        }
+        // The accept key (Tab) always activates as an edit-back fill — it
+        // never executes.
+        if config.keys.accept.matches(&event.kind) {
             if state.selected.is_some() {
-                return activate_selected(
-                    activate, state, pty, session, output, worker, config, ai_sender,
-                );
+                return activate_selected(state, pty, session, output, worker, config, ai_sender);
             }
-            if accept {
-                return Ok(());
-            }
-            state.overlay_visible = false;
-            state.cancel_ai();
-            output.hide_overlay().map_err(output_error)?;
+            return Ok(());
         }
         if config.keys.dismiss.matches(&event.kind) {
             state.overlay_visible = false;
@@ -949,6 +1058,16 @@ fn handle_input_event(
     } else if config.keys.history.matches(&event.kind) || config.keys.toggle.matches(&event.kind) {
         state.history_only = config.keys.history.matches(&event.kind);
         state.schedule_query(worker)?;
+        if state.provider_pending {
+            // These keys write nothing to the shell, so no redisplay follows
+            // and no render gate opens on an idle prompt — re-anchor with a
+            // cursor probe (same path as `pending_reanchor`) so the result
+            // frame can actually be admitted.
+            output
+                .allow_cursor_probe(state.buffer.revision)
+                .map_err(output_error)?;
+            state.need_cpr = true;
+        }
         return Ok(());
     }
 
@@ -977,6 +1096,13 @@ fn handle_input_event(
         output.invalidate_anchor().map_err(output_error)?;
     }
 
+    // Any key that reaches this point edits (or moves within) the shell
+    // buffer rather than navigating the overlay. Drop the selection right
+    // away: for exact-sync shells the authoritative buffer update only
+    // arrives later via the control channel, and a stale selection must
+    // never turn a following Enter into a candidate execution.
+    state.selected = None;
+
     pty.write_all(&event.raw)?;
 
     if state.shell.exact_buffer_sync() {
@@ -991,6 +1117,7 @@ fn handle_input_event(
         MirrorOutcome::Changed => {
             state.pending_mirror_revision = Some(state.buffer.revision);
             state.schedule_query(worker)?;
+            hide_overlay_if_query_suppressed(state, output)?;
         }
         MirrorOutcome::Uncertain => {
             state.overlay_visible = false;
@@ -1001,9 +1128,7 @@ fn handle_input_event(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn activate_selected(
-    enter: bool,
     state: &mut RuntimeState,
     pty: &mut PtyChild,
     session: &ShellSession,
@@ -1026,6 +1151,12 @@ fn activate_selected(
     };
     match activation {
         Activation::ReplaceBuffer { text, cursor } => {
+            // Edit-back (rewriting the shell buffer) is reachable only via an
+            // explicit key: Tab always fills, and Enter on a selection fills
+            // for non-runnable candidates. Runnable candidates selected with
+            // Enter go through `execute_text` instead — execution always
+            // submits text the user saw in full (they typed it, or they
+            // explicitly selected it and confirmed when it is dangerous).
             output.hide_overlay().map_err(output_error)?;
             replace_shell_buffer(state.shell, &text, cursor, pty, session)?;
             state.overlay_visible = false;
@@ -1035,22 +1166,13 @@ fn activate_selected(
                 state.schedule_query(worker)?;
             }
         }
-        Activation::SubmitCurrent if enter => {
-            state.cancel_ai();
-            state.pending_command = Some(state.buffer.text.clone());
-            state.editing = false;
-            state.overlay_visible = false;
-            output.hide_overlay().map_err(output_error)?;
-            output.set_foreground_and_wait(true).map_err(output_error)?;
-            pty.write_all(b"\r")?;
-        }
-        Activation::SubmitCurrent => {}
         Activation::RequestAi => {
             start_ai_request(state, &context, config, ai_sender, output)?;
         }
         Activation::ConfigureAi => {
             state.cancel_ai();
-            let text = "hokann config ai".to_owned();
+            let text = "hokan config ai".to_owned();
+            // Same explicit edit-back contract as ReplaceBuffer above.
             output.hide_overlay().map_err(output_error)?;
             replace_shell_buffer(state.shell, &text, text.len(), pty, session)?;
             state.overlay_visible = false;
@@ -1076,6 +1198,134 @@ enum SelectedActivation {
         context: Arc<CompletionContext>,
     },
     Rejected,
+}
+
+/// Outcome of pressing the activate key (Enter) with a selection.
+enum EnterResolution {
+    /// Non-runnable candidates degrade to the Tab behavior: edit-back fill
+    /// for insertions, the action itself for AI/configure/retry rows — never
+    /// a shell execution.
+    Fill,
+    /// Runnable and safe enough: execute immediately.
+    Execute(String),
+    /// Runnable but dangerous: ask for confirmation first.
+    Confirm {
+        text: String,
+        risk: crate::terminal::RiskLevel,
+        reasons: Vec<String>,
+    },
+}
+
+fn resolve_enter(candidate: &Candidate, activation: &Activation) -> EnterResolution {
+    let executable = matches!(candidate.action, CandidateAction::Insert)
+        && matches!(candidate.completeness, Completeness::Runnable);
+    if !executable {
+        return EnterResolution::Fill;
+    }
+    let Activation::ReplaceBuffer { text, .. } = activation else {
+        return EnterResolution::Fill;
+    };
+    let assessed = classify_command(text);
+    let risk = stricter_risk(candidate.risk, assessed.level);
+    if matches!(
+        risk,
+        crate::terminal::RiskLevel::High | crate::terminal::RiskLevel::Unknown
+    ) {
+        EnterResolution::Confirm {
+            text: text.clone(),
+            risk,
+            reasons: assessed
+                .reasons
+                .iter()
+                .map(|reason| reason.describe().to_owned())
+                .collect(),
+        }
+    } else {
+        EnterResolution::Execute(text.clone())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn enter_with_selection(
+    state: &mut RuntimeState,
+    pty: &mut PtyChild,
+    session: &ShellSession,
+    output: &OutputHandle,
+    worker: &ProviderWorker,
+    config: &Arc<Config>,
+    ai_sender: &Sender<AiResult>,
+) -> crate::Result<()> {
+    let Some(candidate) = selected_candidate(state).cloned() else {
+        return Ok(());
+    };
+    let activation = match resolve_selected_activation(state)? {
+        SelectedActivation::None => return Ok(()),
+        SelectedActivation::Ready { activation, .. } => activation,
+        SelectedActivation::Rejected => {
+            state.schedule_query(worker)?;
+            state.status = Some("HK-CMP-STALE selection expired; candidates refreshed".into());
+            return render_current(state, output);
+        }
+    };
+    match resolve_enter(&candidate, &activation) {
+        EnterResolution::Fill => {
+            activate_selected(state, pty, session, output, worker, config, ai_sender)
+        }
+        EnterResolution::Execute(text) => execute_text(state, pty, session, output, text),
+        EnterResolution::Confirm {
+            text,
+            risk,
+            reasons,
+        } => {
+            state.pending_confirm = Some(PendingConfirm {
+                text,
+                risk,
+                reasons,
+            });
+            render_current(state, output)
+        }
+    }
+}
+
+/// Submit `text` as the shell's next command line: rewrite the buffer to
+/// exactly `text` and accept it in the same step. Bookkeeping mirrors the
+/// typed Enter branch so END/history recording still works.
+fn execute_text(
+    state: &mut RuntimeState,
+    pty: &mut PtyChild,
+    session: &ShellSession,
+    output: &OutputHandle,
+    text: String,
+) -> crate::Result<()> {
+    state.pending_command = Some(text.clone());
+    state.editing = false;
+    state.overlay_visible = false;
+    state.pending_confirm = None;
+    state.cancel_ai();
+    output.hide_overlay().map_err(output_error)?;
+    output.set_foreground_and_wait(true).map_err(output_error)?;
+    match state.shell {
+        ShellKind::Zsh => {
+            session.write_edit(&text, text.len())?;
+            if let Some(sequence) = accept_sequence(state.shell) {
+                pty.write_all(sequence)?;
+            }
+        }
+        ShellKind::Bash => {
+            // Keystroke replay (same as the fill path) plus a literal Enter.
+            pty.write_all(b"\x01\x0b")?;
+            pty.write_all(text.as_bytes())?;
+            pty.write_all(b"\r")?;
+        }
+        ShellKind::Fish => {
+            // PTY input is FIFO-ordered: the widget replaces the commandline,
+            // then the appended carriage return executes it.
+            session.write_edit(&text, text.len())?;
+            pty.write_all(replacement_sequence(state.shell))?;
+            pty.write_all(b"\r")?;
+        }
+    }
+    Ok(())
 }
 
 fn resolve_selected_activation(state: &RuntimeState) -> crate::Result<SelectedActivation> {
@@ -1118,7 +1368,7 @@ fn start_ai_request(
     let cancel = CancellationToken::new();
     let request_cancel = cancel.clone();
     thread::Builder::new()
-        .name("hokann-ai".into())
+        .name("hokan-ai".into())
         .spawn(move || {
             let result = AiClient::new(&ai_config, &credential_path).and_then(|client| {
                 tokio::runtime::Builder::new_current_thread()
@@ -1206,8 +1456,10 @@ fn handle_control_message(
             state.context = None;
             state.candidates.clear();
             state.selected = None;
+            state.selection_intent = None;
             state.provider_pending = false;
             state.overlay_visible = false;
+            state.pending_confirm = None;
             state.foreground_process = false;
             state.pending_reanchor = false;
             output.set_foreground(false).map_err(output_error)?;
@@ -1227,6 +1479,7 @@ fn handle_control_message(
                     })
                     .map_err(output_error)?;
                 state.schedule_query(worker)?;
+                hide_overlay_if_query_suppressed(state, output)?;
             }
         }
         ControlMessage::Event(ShellEvent::CommandStart { command }) => {
@@ -1234,6 +1487,8 @@ fn handle_control_message(
             state.pending_command = Some(command);
             state.editing = false;
             state.overlay_visible = false;
+            state.pending_confirm = None;
+            state.selection_intent = None;
             state.foreground_process = true;
             output.hide_overlay().map_err(output_error)?;
             output.set_foreground(true).map_err(output_error)?;
@@ -1255,6 +1510,8 @@ fn handle_control_message(
             state.cancel_ai();
             state.buffer.mark_uncertain();
             state.overlay_visible = false;
+            state.pending_confirm = None;
+            state.selection_intent = None;
             output.hide_overlay().map_err(output_error)?;
         }
     }
@@ -1270,6 +1527,7 @@ fn record_history(
     policy: &HistoryPolicy,
 ) -> crate::Result<()> {
     let timestamp_ms = crate::history_now_ms();
+    state.previous_command = Some(command.clone());
     if !policy.allows(&command) {
         return Ok(());
     }
@@ -1293,6 +1551,7 @@ fn record_history(
             event.shell,
             event.cwd.as_deref(),
             event.occurrences,
+            event.exit_code,
             policy,
         );
     }
@@ -1349,6 +1608,7 @@ fn sync_history(
                 event.shell,
                 event.cwd.as_deref(),
                 event.occurrences,
+                event.exit_code,
                 policy,
             );
         }
@@ -1392,7 +1652,7 @@ fn maybe_start_history_compaction(
     let store = store.clone();
     let active = Arc::clone(&state.history_compaction);
     if let Err(error) = thread::Builder::new()
-        .name("hokann-history-compact".into())
+        .name("hokan-history-compact".into())
         .spawn(move || {
             let _ = store.compact();
             active.store(false, Ordering::Release);
@@ -1470,6 +1730,7 @@ fn handle_signal(
             let size = current_terminal_size()?;
             state.update_terminal_size(size);
             state.overlay_visible = false;
+            state.pending_confirm = None;
             state.pending_reanchor = state.editing;
             pty.resize(size)?;
             output.resize(size).map_err(output_error)?;
@@ -1484,6 +1745,7 @@ fn handle_signal(
             state.cancel_ai();
             output.restore_for_suspend().map_err(output_error)?;
             state.overlay_visible = false;
+            state.pending_confirm = None;
             state.suspended = true;
             signal_hook::low_level::emulate_default_handler(signal_hook::consts::SIGTSTP)?;
             Ok(false)
@@ -1501,6 +1763,7 @@ fn handle_signal(
         }
         SignalEvent::Terminate(signal) => {
             state.cancel_ai();
+            state.pending_confirm = None;
             output.hide_overlay().map_err(output_error)?;
             let signal = nix::sys::signal::Signal::try_from(signal)
                 .unwrap_or(nix::sys::signal::Signal::SIGTERM);
@@ -1530,11 +1793,32 @@ fn handle_provider_result(
             .candidates
             .retain(|candidate| candidate.source == CandidateSource::History);
     }
+    // No implicit selection: the first row is never pre-selected, but a
+    // selection the user already made survives batches while the candidate
+    // id is still present. When queued buffer events moved the query on and
+    // the user's navigation never reached the screen, re-apply the last
+    // navigation intent against the fresh list instead of silently losing
+    // the keypress: same content keeps its row, otherwise the delta lands
+    // where it would have on the new list.
     let previous = state.selected;
     state.candidates = result.output.candidates;
     state.selected = previous
         .filter(|id| state.candidates.iter().any(|candidate| candidate.id == *id))
-        .or_else(|| state.candidates.first().map(|candidate| candidate.id));
+        .or_else(|| {
+            let intent = state.selection_intent.as_ref()?;
+            state
+                .candidates
+                .iter()
+                .find(|candidate| intent.key.matches(candidate))
+                .map(|candidate| candidate.id)
+                .or_else(|| {
+                    (!state.candidates.is_empty()).then(|| {
+                        let index =
+                            landing_row(state.candidates.len(), state.page_size, intent.delta);
+                        state.candidates[index].id
+                    })
+                })
+        });
     state.provider_pending = !result.final_batch;
     state.status = result
         .output
@@ -1562,13 +1846,14 @@ fn handle_ai_result(
         return Ok(());
     };
     let _ = state.ai_query.take();
+    state.selection_intent = None;
     match result.result {
         Ok(commands) => {
             if let Some(log) = &state.debug_log {
                 log.ai_event("succeeded");
             }
             state.candidates = rank_and_dedupe(context, ai_result_candidates(context, commands), 5);
-            state.selected = state.candidates.first().map(|candidate| candidate.id);
+            state.selected = None;
             state.status = None;
         }
         Err(error) => {
@@ -1584,7 +1869,7 @@ fn handle_ai_result(
             );
             let message = format!("{} {error}", error.code());
             let candidate = crate::providers::ai_error_candidate(context, &message, configure);
-            state.selected = Some(candidate.id);
+            state.selected = None;
             state.candidates = vec![candidate];
             state.status = Some(message);
         }
@@ -1651,6 +1936,20 @@ fn flush_scheduled_frame(state: &mut RuntimeState, output: &OutputHandle) -> cra
     Ok(())
 }
 
+/// When `schedule_query` suppresses completion (empty trimmed buffer without
+/// history focus, or uncertain sync), no provider result will ever arrive to
+/// clear the overlay — hide it here so stale rows cannot linger on screen.
+fn hide_overlay_if_query_suppressed(
+    state: &mut RuntimeState,
+    output: &OutputHandle,
+) -> crate::Result<()> {
+    if !state.provider_pending && state.candidates.is_empty() && state.status.is_none() {
+        state.overlay_visible = false;
+        output.hide_overlay().map_err(output_error)?;
+    }
+    Ok(())
+}
+
 fn detect_foreground_process(
     state: &mut RuntimeState,
     pty: &PtyChild,
@@ -1660,6 +1959,7 @@ fn detect_foreground_process(
         state.foreground_process = true;
         state.editing = false;
         state.overlay_visible = false;
+        state.pending_confirm = None;
         state.cancel_ai();
         output.hide_overlay().map_err(output_error)?;
         output.set_foreground(true).map_err(output_error)?;
@@ -1668,10 +1968,14 @@ fn detect_foreground_process(
 }
 
 fn render_current(state: &mut RuntimeState, output: &OutputHandle) -> crate::Result<()> {
-    if !state.overlay_visible && state.candidates.is_empty() && state.status.is_none() {
+    if !state.overlay_visible
+        && state.candidates.is_empty()
+        && state.status.is_none()
+        && state.pending_confirm.is_none()
+    {
         return Ok(());
     }
-    if state.candidates.is_empty() && state.status.is_none() {
+    if state.candidates.is_empty() && state.status.is_none() && state.pending_confirm.is_none() {
         state.overlay_visible = false;
         output.hide_overlay().map_err(output_error)?;
         return Ok(());
@@ -1691,6 +1995,18 @@ fn render_current(state: &mut RuntimeState, output: &OutputHandle) -> crate::Res
     {
         return Ok(());
     }
+    // Never commit a frame whose rows belong to a superseded query: their
+    // ids already fail activation's freshness check, so painting the list
+    // (and especially a selection marker) would present a choice the user
+    // cannot act on. The last committed frame stays on screen until fresh
+    // results replace it.
+    if state.pending_confirm.is_none()
+        && state.candidates.first().is_some_and(|candidate| {
+            Some(candidate.query_id) != state.context.as_ref().map(|context| context.query_id)
+        })
+    {
+        return Ok(());
+    }
     let Some(geometry) = output.prepare_surface().map_err(output_error)? else {
         return Ok(());
     };
@@ -1704,56 +2020,74 @@ fn render_current(state: &mut RuntimeState, output: &OutputHandle) -> crate::Res
         screen_revision: output_state.screen_revision,
         screen_epoch: output_state.screen_epoch,
     };
-    let selected_index = state
-        .selected
-        .and_then(|selected| {
-            state
-                .candidates
-                .iter()
-                .position(|candidate| candidate.id == selected)
-        })
-        .unwrap_or(0);
-    let page_start = selected_index / state.page_size * state.page_size;
-    let page_end = (page_start + state.page_size).min(state.candidates.len());
-    let mut view = OverlayView::with_rows(
-        state.candidates[page_start..page_end]
-            .iter()
-            .map(|candidate| {
-                let mut row = OverlayRow::new(
-                    candidate.id.0,
-                    candidate.source.label(),
-                    &candidate.display.primary,
-                    &candidate.display.description,
-                    candidate.risk,
-                );
-                row.annotation = candidate
-                    .display
-                    .annotation
-                    .as_deref()
-                    .map(SanitizedText::new);
-                row
+    let view = if let Some(confirm) = &state.pending_confirm {
+        // Danger confirmation: a single synthetic EXEC row with the full final
+        // command and the joined risk reasons; the bottom border carries the
+        // confirm/cancel hint instead of the usual status.
+        let mut row = OverlayRow::new(
+            0,
+            "EXEC",
+            &confirm.text,
+            &confirm.reasons.join(" · "),
+            confirm.risk,
+        );
+        row.danger = true;
+        let mut view = OverlayView::with_rows(vec![row], None);
+        view.status = Some(SanitizedText::new("Enter 确认执行 · Esc 取消"));
+        view
+    } else {
+        let selected_index = state
+            .selected
+            .and_then(|selected| {
+                state
+                    .candidates
+                    .iter()
+                    .position(|candidate| candidate.id == selected)
             })
-            .collect(),
-        state.selected.map(|id| id.0),
-    );
-    let can_show_status = state
-        .max_overlay_height
-        .min(state.terminal_size.rows.saturating_sub(1))
-        >= 2;
-    let pagination = (can_show_status && state.candidates.len() > state.page_size).then(|| {
-        format!(
-            "{}-{}/{}",
-            page_start.saturating_add(1),
-            page_end,
-            state.candidates.len()
-        )
-    });
-    let status = match (&state.status, pagination) {
-        (Some(status), Some(pagination)) => Some(format!("{status} | {pagination}")),
-        (Some(status), None) => Some(status.clone()),
-        (None, pagination) => pagination,
+            .unwrap_or(0);
+        let page_start = selected_index / state.page_size * state.page_size;
+        let page_end = (page_start + state.page_size).min(state.candidates.len());
+        let mut view = OverlayView::with_rows(
+            state.candidates[page_start..page_end]
+                .iter()
+                .map(|candidate| {
+                    let mut row = OverlayRow::new(
+                        candidate.id.0,
+                        candidate.source.label(),
+                        &candidate.display.primary,
+                        &candidate.display.description,
+                        candidate.risk,
+                    );
+                    row.annotation = candidate
+                        .display
+                        .annotation
+                        .as_deref()
+                        .map(SanitizedText::new);
+                    let word = candidate
+                        .display
+                        .primary
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or_default();
+                    row.icon = Some(crate::terminal::icons::lookup_icon(word));
+                    row
+                })
+                .collect(),
+            state.selected.map(|id| id.0),
+        );
+        // Pagination is embedded in the top border; status replaces the key hints
+        // in the bottom border.
+        view.pagination = (state.candidates.len() > state.page_size)
+            .then_some((selected_index.saturating_add(1), state.candidates.len()));
+        view.status = state.status.as_deref().map(SanitizedText::new);
+        let typed = state
+            .buffer
+            .text
+            .get(..state.buffer.cursor)
+            .unwrap_or_default();
+        view.highlight = (!typed.is_empty()).then(|| SanitizedText::new(typed));
+        view
     };
-    view.status = status.as_deref().map(SanitizedText::new);
     let request = FrameRequest {
         ticket,
         key: SurfaceKey {
@@ -1785,18 +2119,39 @@ fn move_selection(state: &mut RuntimeState, delta: isize) {
         state.selected = None;
         return;
     }
-    let current = state
-        .selected
-        .and_then(|id| {
-            state
-                .candidates
-                .iter()
-                .position(|candidate| candidate.id == id)
-        })
-        .unwrap_or(0);
     let length = state.candidates.len() as isize;
-    let next = (current as isize + delta).rem_euclid(length) as usize;
+    let next = match state.selected.and_then(|id| {
+        state
+            .candidates
+            .iter()
+            .position(|candidate| candidate.id == id)
+    }) {
+        Some(current) => (current as isize + delta).rem_euclid(length) as usize,
+        // No implicit selection: the first Down lands on the first row, the
+        // first Up on the last; page jumps go to the first row / the start of
+        // the last page.
+        None => landing_row(state.candidates.len(), state.page_size, delta),
+    };
     state.selected = Some(state.candidates[next].id);
+    state.selection_intent = Some(SelectionIntent {
+        delta,
+        key: SelectionKey::of(&state.candidates[next]),
+    });
+}
+
+/// Where a navigation lands when nothing is selected yet: Down on the first
+/// row, Up on the last, page-down on the first row, page-up at the start of
+/// the last page.
+fn landing_row(candidate_count: usize, page_size: usize, delta: isize) -> usize {
+    if delta == 1 {
+        0
+    } else if delta == -1 {
+        candidate_count - 1
+    } else if delta > 1 {
+        (candidate_count - 1) / page_size * page_size
+    } else {
+        0
+    }
 }
 
 fn output_error(error: crate::terminal::OutputError) -> crate::Error {
@@ -1994,11 +2349,11 @@ mod tests {
     fn pagination_capacity_tracks_terminal_height() {
         assert_eq!(
             visible_page_size(12, TerminalSize::new(24, 80).expect("size")),
-            11
+            10
         );
         assert_eq!(
             visible_page_size(12, TerminalSize::new(5, 80).expect("size")),
-            3
+            2
         );
     }
 
@@ -2025,5 +2380,366 @@ mod tests {
         assert_eq!(live.history, current.history);
         assert_eq!(live.logging, current.logging);
         assert_eq!(restart, vec!["core", "history", "logging"]);
+    }
+
+    fn selection_candidate(state: &RuntimeState, primary: &str) -> Candidate {
+        Candidate::new(
+            QueryId::new(1),
+            primary,
+            "test",
+            Some(TextEdit {
+                range: 0..state.buffer.text.len(),
+                replacement: primary.into(),
+                cursor_after: CursorPlacement::End,
+            }),
+            CandidateAction::Insert,
+            CandidateSource::History,
+            CandidateKind::History,
+            Completeness::Runnable,
+            RiskLevel::Low,
+            primary,
+        )
+    }
+
+    #[test]
+    fn move_selection_from_none_lands_on_the_edges() {
+        let directory = tempfile::tempdir().expect("directory");
+        let mut state = runtime_state(directory.path());
+        state
+            .buffer
+            .set_exact("ec".into(), 2)
+            .expect("initial buffer");
+        state.candidates = (0..25)
+            .map(|index| selection_candidate(&state, &format!("echo {index:02}")))
+            .collect();
+        state.selected = None;
+
+        move_selection(&mut state, 1);
+        assert_eq!(state.selected, Some(state.candidates[0].id));
+
+        state.selected = None;
+        move_selection(&mut state, -1);
+        assert_eq!(state.selected, Some(state.candidates[24].id));
+
+        // Page jumps land on the first row / the start of the last page.
+        let page_size = state.page_size as isize;
+        state.selected = None;
+        move_selection(&mut state, page_size);
+        assert_eq!(state.selected, Some(state.candidates[20].id));
+
+        state.selected = None;
+        move_selection(&mut state, -page_size);
+        assert_eq!(state.selected, Some(state.candidates[0].id));
+
+        // Selection movement still wraps once a selection exists.
+        move_selection(&mut state, -1);
+        assert_eq!(state.selected, Some(state.candidates[24].id));
+    }
+
+    fn enter_candidate(
+        primary: &str,
+        action: CandidateAction,
+        completeness: Completeness,
+        risk: RiskLevel,
+    ) -> Candidate {
+        Candidate::new(
+            QueryId::new(1),
+            primary,
+            "test",
+            (matches!(
+                action,
+                CandidateAction::Insert | CandidateAction::InsertAndContinue { .. }
+            ))
+            .then(|| TextEdit {
+                range: 0..2,
+                replacement: primary.into(),
+                cursor_after: CursorPlacement::End,
+            }),
+            action,
+            CandidateSource::History,
+            CandidateKind::History,
+            completeness,
+            risk,
+            primary,
+        )
+    }
+
+    #[test]
+    fn enter_executes_runnable_safe_candidates() {
+        let candidate = enter_candidate(
+            "echo ok",
+            CandidateAction::Insert,
+            Completeness::Runnable,
+            RiskLevel::Low,
+        );
+        let activation = Activation::ReplaceBuffer {
+            text: "echo ok".into(),
+            cursor: 7,
+        };
+        assert!(matches!(
+            resolve_enter(&candidate, &activation),
+            EnterResolution::Execute(text) if text == "echo ok"
+        ));
+    }
+
+    #[test]
+    fn enter_degrades_non_runnable_candidates_to_fill() {
+        let needs_input = enter_candidate(
+            "tar -czf",
+            CandidateAction::InsertAndContinue {
+                next_slot: crate::completion::SlotKind::File,
+            },
+            Completeness::NeedsInput {
+                slot: crate::completion::SlotKind::File,
+            },
+            RiskLevel::Low,
+        );
+        let activation = Activation::ReplaceBuffer {
+            text: "tar -czf".into(),
+            cursor: 8,
+        };
+        assert!(matches!(
+            resolve_enter(&needs_input, &activation),
+            EnterResolution::Fill
+        ));
+
+        let ai = enter_candidate(
+            "ask ai",
+            CandidateAction::RequestAi,
+            Completeness::ActionOnly,
+            RiskLevel::Low,
+        );
+        assert!(matches!(
+            resolve_enter(&ai, &Activation::RequestAi),
+            EnterResolution::Fill
+        ));
+    }
+
+    #[test]
+    fn enter_confirms_when_the_effective_risk_is_dangerous() {
+        // Classified risk is stricter than the provider-assigned Low.
+        let dangerous = enter_candidate(
+            "rm -rf /tmp/x",
+            CandidateAction::Insert,
+            Completeness::Runnable,
+            RiskLevel::Low,
+        );
+        let activation = Activation::ReplaceBuffer {
+            text: "rm -rf /tmp/x".into(),
+            cursor: 13,
+        };
+        match resolve_enter(&dangerous, &activation) {
+            EnterResolution::Confirm {
+                text,
+                risk,
+                reasons,
+            } => {
+                assert_eq!(text, "rm -rf /tmp/x");
+                assert_eq!(risk, RiskLevel::High);
+                assert!(reasons.contains(&"recursive operation".to_owned()));
+                assert!(reasons.contains(&"force flag".to_owned()));
+            }
+            other => panic!("expected confirmation, got {}", enter_label(&other)),
+        }
+
+        // Provider-assigned risk is stricter than the classified ReadOnly.
+        let flagged = enter_candidate(
+            "ls",
+            CandidateAction::Insert,
+            Completeness::Runnable,
+            RiskLevel::Unknown,
+        );
+        let activation = Activation::ReplaceBuffer {
+            text: "ls".into(),
+            cursor: 2,
+        };
+        assert!(matches!(
+            resolve_enter(&flagged, &activation),
+            EnterResolution::Confirm {
+                risk: RiskLevel::Unknown,
+                ..
+            }
+        ));
+
+        // Medium risk still executes without confirmation.
+        let medium = enter_candidate(
+            "rm file",
+            CandidateAction::Insert,
+            Completeness::Runnable,
+            RiskLevel::Low,
+        );
+        let activation = Activation::ReplaceBuffer {
+            text: "rm file".into(),
+            cursor: 7,
+        };
+        assert!(matches!(
+            resolve_enter(&medium, &activation),
+            EnterResolution::Execute(_)
+        ));
+    }
+
+    fn enter_label(resolution: &EnterResolution) -> &'static str {
+        match resolution {
+            EnterResolution::Fill => "fill",
+            EnterResolution::Execute(_) => "execute",
+            EnterResolution::Confirm { .. } => "confirm",
+        }
+    }
+
+    fn session_token() -> crate::terminal::SessionToken {
+        crate::terminal::SessionToken::parse("0123456789abcdef0123456789abcdef")
+            .expect("fixture token is valid")
+    }
+
+    fn history_candidate(query_id: QueryId, text: &str) -> Candidate {
+        Candidate::new(
+            query_id,
+            text,
+            "from history",
+            Some(TextEdit {
+                range: 0..0,
+                replacement: text.into(),
+                cursor_after: CursorPlacement::End,
+            }),
+            CandidateAction::Insert,
+            CandidateSource::History,
+            CandidateKind::History,
+            Completeness::Runnable,
+            RiskLevel::Low,
+            "reselection-test",
+        )
+    }
+
+    fn refresh_context(state: &mut RuntimeState, query_id: QueryId) {
+        let context = Arc::new(
+            CompletionContext::new(
+                query_id,
+                ShellKind::Zsh,
+                state.cwd.clone(),
+                state.snapshot().expect("snapshot"),
+            )
+            .expect("context"),
+        );
+        state.context = Some(context);
+    }
+
+    fn provider_result(state: &RuntimeState, candidates: Vec<Candidate>) -> ProviderResult {
+        ProviderResult {
+            context: Arc::clone(state.context.as_ref().expect("context")),
+            output: ProviderOutput {
+                candidates,
+                diagnostics: Vec::new(),
+            },
+            final_batch: true,
+        }
+    }
+
+    #[test]
+    fn navigation_intent_is_reapplied_when_queued_buffer_events_move_the_query() {
+        let directory = tempfile::tempdir().expect("directory");
+        let mut state = runtime_state(directory.path());
+        let (output, join) = crate::terminal::spawn_with_writer(
+            Vec::new(),
+            session_token(),
+            TerminalSize::new(24, 80).expect("terminal size"),
+            3,
+        )
+        .expect("output actor");
+
+        // The user navigates against the visible list…
+        state.buffer.set_exact("ec".into(), 2).expect("buffer");
+        refresh_context(&mut state, QueryId::new(1));
+        state.candidates = vec![history_candidate(QueryId::new(1), "echo HKSEL_HIDDEN")];
+        move_selection(&mut state, 1);
+        let first = state.selected.expect("navigation selects a row");
+
+        // …but queued buffer events move the query on before the selection
+        // is rendered; fresh candidates carry unrelated per-query ids.
+        state
+            .buffer
+            .set_exact("echo HKSEL_H".into(), 12)
+            .expect("buffer");
+        refresh_context(&mut state, QueryId::new(2));
+        state.selected = None;
+        let result = provider_result(
+            &state,
+            vec![history_candidate(QueryId::new(2), "echo HKSEL_HIDDEN")],
+        );
+        handle_provider_result(result, &mut state, &output).expect("provider result");
+
+        let reselected = state.selected.expect("intent re-applies the selection");
+        assert_ne!(reselected, first, "the fresh candidate has a fresh id");
+        assert_eq!(
+            state
+                .candidates
+                .iter()
+                .find(|candidate| candidate.id == reselected)
+                .map(|candidate| candidate.display.primary.as_str()),
+            Some("echo HKSEL_HIDDEN")
+        );
+        output.restore_and_exit().expect("shutdown");
+        join.join().expect("actor joins").expect("actor exits");
+    }
+
+    #[test]
+    fn navigation_intent_falls_back_to_the_delta_when_the_row_vanishes() {
+        let directory = tempfile::tempdir().expect("directory");
+        let mut state = runtime_state(directory.path());
+        let (output, join) = crate::terminal::spawn_with_writer(
+            Vec::new(),
+            session_token(),
+            TerminalSize::new(24, 80).expect("terminal size"),
+            3,
+        )
+        .expect("output actor");
+
+        state.buffer.set_exact("ec".into(), 2).expect("buffer");
+        refresh_context(&mut state, QueryId::new(1));
+        state.candidates = vec![history_candidate(QueryId::new(1), "echo gone")];
+        move_selection(&mut state, 1);
+        state.buffer.set_exact("echo HK".into(), 6).expect("buffer");
+        refresh_context(&mut state, QueryId::new(2));
+        state.selected = None;
+        let result = provider_result(
+            &state,
+            vec![
+                history_candidate(QueryId::new(2), "echo HKSEL_HIDDEN"),
+                history_candidate(QueryId::new(2), "echo HKOTHER"),
+            ],
+        );
+        handle_provider_result(result, &mut state, &output).expect("provider result");
+
+        assert_eq!(
+            state.selected,
+            Some(state.candidates[0].id),
+            "Down from nothing lands on the first row of the fresh list"
+        );
+        output.restore_and_exit().expect("shutdown");
+        join.join().expect("actor joins").expect("actor exits");
+    }
+
+    #[test]
+    fn navigation_intent_does_not_create_a_selection_by_itself() {
+        let directory = tempfile::tempdir().expect("directory");
+        let mut state = runtime_state(directory.path());
+        let (output, join) = crate::terminal::spawn_with_writer(
+            Vec::new(),
+            session_token(),
+            TerminalSize::new(24, 80).expect("terminal size"),
+            3,
+        )
+        .expect("output actor");
+
+        // No navigation happened: results must never pre-select a row.
+        state.buffer.set_exact("ec".into(), 2).expect("buffer");
+        refresh_context(&mut state, QueryId::new(1));
+        let result = provider_result(
+            &state,
+            vec![history_candidate(QueryId::new(1), "echo HKSEL_HIDDEN")],
+        );
+        handle_provider_result(result, &mut state, &output).expect("provider result");
+        assert_eq!(state.selected, None);
+        output.restore_and_exit().expect("shutdown");
+        join.join().expect("actor joins").expect("actor exits");
     }
 }

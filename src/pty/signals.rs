@@ -25,7 +25,7 @@ impl SignalBridge {
         let mut signals = Signals::new([SIGWINCH, SIGINT, SIGTERM, SIGHUP, SIGTSTP, SIGCONT])?;
         let handle = signals.handle();
         let join = thread::Builder::new()
-            .name("hokann-signals".into())
+            .name("hokan-signals".into())
             .spawn(move || {
                 for signal in signals.forever() {
                     let event = match signal {

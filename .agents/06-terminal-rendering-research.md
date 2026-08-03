@@ -1,4 +1,4 @@
-# Hokann 终端渲染专项研究
+# Hokan 终端渲染专项研究
 
 > 状态：Architecture baseline v0.1  
 > 调研日期：2026-08-01  
@@ -7,7 +7,7 @@
 
 ## 1. 结论先行
 
-Hokann 的渲染不能只是“拼一段 ANSI 字符串并尽快写出”。它必须是一套带屏幕版本、锚点置信度和提交协议的 compositor。最终选型如下：
+Hokan 的渲染不能只是“拼一段 ANSI 字符串并尽快写出”。它必须是一套带屏幕版本、锚点置信度和提交协议的 compositor。最终选型如下：
 
 1. 使用 Ratatui 的 `Buffer`、layout、style 和 widgets 构造离屏 surface，复用其 Unicode cell 模型与 `Buffer::diff_iter`。
 2. 不让 Ratatui 的 `Terminal<Viewport::Inline>` 长期拥有真实 stdout。child shell 会在 Ratatui render pass 之外写屏幕，使它的双 buffer 假设失效。
@@ -16,12 +16,12 @@ Hokann 的渲染不能只是“拼一段 ANSI 字符串并尽快写出”。它�
 5. 支持并主动探测 synchronized output（DEC private mode 2026）。支持时帧为 `BSU -> diff -> 恢复 shell 状态 -> ESU`，终端只展示完成态。
 6. 不支持 mode 2026 时仍使用 cell diff、非破坏性覆盖和单次 staged write；正常导航不得先清空 surface 再重画。
 7. 使用 `vt100` 作为 P0 首选 child-output 观察模型，跟踪光标、SGR、滚动和 alternate screen；用 `avt` 做差分测试和备选。裸 `vte` 只提供 parser state machine，不足以单独维护屏幕语义。
-8. 不使用 `ESC 7`/`ESC 8` 保存恢复光标，因为它们通常只有一个槽位，会和 child 的保存状态互相覆盖。Hokann 使用经过校验的绝对坐标恢复 shell 光标。
+8. 不使用 `ESC 7`/`ESC 8` 保存恢复光标，因为它们通常只有一个槽位，会和 child 的保存状态互相覆盖。Hokan 使用经过校验的绝对坐标恢复 shell 光标。
 9. 任意可能改变 terminal model 的 child output 推进 `screen_revision`；resize、滚动、prompt boundary、未知 VT 序列和屏幕切换推进 `screen_epoch`。旧 revision/epoch 的 frame 永远不得提交。
 10. 无法证明锚点或安全注入边界时隐藏 UI。宁可少显示一次候选，也不能覆盖 prompt、污染 scrollback 或切断 child 的控制序列。
 11. shell control FD 事件不是“已经画完”的证明。buffer snapshot 只启动 query；frame 必须等待 PTY 内的 prompt marker 或 terminal-model redisplay convergence，不能用固定 sleep 猜测回显完成。
 
-“所有终端都无条件原子呈现”在协议层不可承诺：有些终端不支持 mode 2026，PTY write 也不等于一次屏幕 present。Hokann 的可验证承诺应是：
+“所有终端都无条件原子呈现”在协议层不可承诺：有些终端不支持 mode 2026，PTY write 也不等于一次屏幕 present。Hokan 的可验证承诺应是：
 
 - 支持 mode 2026 的路径不展示半帧；
 - fallback 路径不设计空白中间帧，不进行全屏清除，并通过逐 byte/chunk 审计和真实终端矩阵限制可见 tearing；
@@ -65,7 +65,7 @@ shell/PTY output --------------------+
 
 ### 3.2 会造成闪烁或失步的实现
 
-| 实现 | 直接后果 | Hokann 的处理 |
+| 实现 | 直接后果 | Hokan 的处理 |
 | --- | --- | --- |
 | 每帧 `Clear()` 固定清除最多 8 行，再完整重画 | 终端可在 clear 和 paint 之间 present 空白帧 | 固定 surface + cell diff；只有消失的尾部 cell 被擦除 |
 | 没有 `CSI ?2026h/l` | 单次 `Write` 也可能被终端分多次渲染 | 探测并使用 synchronized output；fallback 不先清空 |
@@ -86,7 +86,7 @@ IRIS 在 `draw()` 中先关闭 autowrap、保存光标、输出若干空行，�
 - PR #15 修复 data race、内存问题并优化 `ComputeCursorCol`。
 - PR #20 再次修复 ghost text、prompt 删除、UTF-8/visual width 和 overlay race。
 
-这不是对 IRIS 的否定，而是一个清晰信号：如果 shell 回显、控制 FD、PTY output 和 overlay frame 没有统一的版本与写入顺序，继续调 20 ms 或 25 ms 只能改变复现概率。Hokann 应借鉴 IRIS 的产品交互，不复制这套时序模型。
+这不是对 IRIS 的否定，而是一个清晰信号：如果 shell 回显、控制 FD、PTY output 和 overlay frame 没有统一的版本与写入顺序，继续调 20 ms 或 25 ms 只能改变复现概率。Hokan 应借鉴 IRIS 的产品交互，不复制这套时序模型。
 
 ### 3.4 测试覆盖缺口
 
@@ -100,7 +100,7 @@ IRIS 当前测试主要验证简单 prompt column 和 ghost suffix，没有覆�
 - 每个可见中间态是否出现空白帧；
 - 两个独立 VT emulator 对最终屏幕和光标是否一致。
 
-Hokann 的 P0 必须先补齐这些测试，再做复杂候选样式。
+Hokan 的 P0 必须先补齐这些测试，再做复杂候选样式。
 
 ### 3.5 控制 FD 与 PTY 没有天然全序
 
@@ -115,10 +115,10 @@ child PTY:                                      redisplay N -------->
 
 此时即使 frame 本身原子，随后到达的 shell redisplay 仍可能移动光标、覆盖 prompt 或使 overlay anchor 失效。把 timer 从 20 ms 调到 25 ms 只能改变概率。
 
-Hokann 必须把“语义状态”和“屏幕状态”分开：
+Hokan 必须把“语义状态”和“屏幕状态”分开：
 
 - `BufferSnapshot(N)` 允许启动 provider，但把 render readiness 置为 `AwaitingRedisplay`；
-- shell adapter 能证明时，在 PTY 流中发一个带 session token/boundary id 的零宽 render marker；marker 由 Hokann 在到达 terminal 前消费，因此它与之前的 child bytes 有全序；
+- shell adapter 能证明时，在 PTY 流中发一个带 session token/boundary id 的零宽 render marker；marker 由 Hokan 在到达 terminal 前消费，因此它与之前的 child bytes 有全序；
 - prompt marker 必须由 zsh `%{...%}`、Bash `\[...\]` 等 shell-native 非打印包装生成，并在 P0 验证不会改变 prompt width；不具备可靠 post-redraw hook 的 adapter 不得假装支持；
 - zsh v1 在 `line-pre-redraw` 发出的 redisplay marker 只是 redraw-start marker，不是 buffer 已经可见的证明。收到 marker 后必须至少观察到后续 screen byte，并在同一 nonblocking read cycle 达到 `DrainedToEagain`，同时通过 cursor/layout convergence，才能解锁对应 frame；只有未来经验证的真正 post-redraw marker 才可直接作为完成边界；
 - 没有 post-redraw marker 时，`TerminalModel` 至少要观察到安全边界、期望 cursor/layout 收敛和一次 PTY readiness cycle 的 `DrainedToEagain`，才可生成 `RedisplayConverged`；control event 后到时允许匹配已经收敛的 current model/read cycle；
@@ -151,7 +151,7 @@ CSI ? 2026 l       End Synchronized Update（ESU）
 
 DECRPM 返回值处理：
 
-| 值 | 含义 | Hokann 决策 |
+| 值 | 含义 | Hokan 决策 |
 | ---: | --- | --- |
 | `0` | mode 不识别 | 不支持，走 fallback |
 | `1` | mode 当前 set | 协议可用但当前 busy；不擅自发送 ESU |
@@ -180,7 +180,7 @@ tmux 有两个不同层面的 synchronized output：
 
 ### 4.4 Fallback 的明确目标
 
-没有 mode 2026 时，Hokann 仍遵守：
+没有 mode 2026 时，Hokan 仍遵守：
 
 - 不发送 `ED 2`/`ED 3`，不清全屏和 scrollback；
 - 普通导航直接覆盖改变的 cells，不先 erase 整个列表；
@@ -234,7 +234,7 @@ Ratatui 0.30.2 的 MSRV 是 Rust 1.88。若项目 MSRV 低于 1.88，就必须�
 - 让 Ratatui 自己读取 cursor、append lines 或 flush stdout；
 - 在 widget 文本里夹带 ANSI。
 
-Ratatui 源码明确警告：在正常 render pass 外直接写 backend 或移动 cursor 后，下一次 draw 可能基于 stale assumptions。Hokann 的 child shell 正是这种外部 writer，所以必须由自建 compositor 决定何时复用 previous buffer。
+Ratatui 源码明确警告：在正常 render pass 外直接写 backend 或移动 cursor 后，下一次 draw 可能基于 stale assumptions。Hokan 的 child shell 正是这种外部 writer，所以必须由自建 compositor 决定何时复用 previous buffer。
 
 ### 5.4 `vt100` 的使用边界
 
@@ -246,7 +246,7 @@ Ratatui 源码明确警告：在正常 render pass 外直接写 backend 或移�
 - unhandled cursor/mode/erase sequence 降低 anchor confidence；
 - prompt boundary 上用 CPR 修正 absolute cursor，避免 width policy 长期漂移。
 
-因为 `vt100` parser 不公开“当前是否处于半个 CSI/OSC/DCS 中”，另外实现窄职责的 `SafeBoundaryScanner`。它只回答当前是否可以插入 Hokann bytes，不能解释屏幕语义。该 scanner 必须对任意 chunking、UTF-8、C0/C1、CSI、OSC、DCS、SOS/PM/APC 做 fuzz，并与 `vte`/`avt` parser corpus 差分验证。
+因为 `vt100` parser 不公开“当前是否处于半个 CSI/OSC/DCS 中”，另外实现窄职责的 `SafeBoundaryScanner`。它只回答当前是否可以插入 Hokan bytes，不能解释屏幕语义。该 scanner 必须对任意 chunking、UTF-8、C0/C1、CSI、OSC、DCS、SOS/PM/APC 做 fuzz，并与 `vte`/`avt` parser corpus 差分验证。
 
 ## 6. 渲染架构
 
@@ -383,7 +383,7 @@ flush_once()
 要求：
 
 - `BSU` 和 `ESU` 必须在同一个 staged frame 中生成；
-- 写 BSU 前把 ownership 标记为 `MayBeOpenByHokann`，完整写出 ESU 后清除；`TerminalGuard` 只在 ownership 未清除时补发 ESU；
+- 写 BSU 前把 ownership 标记为 `MayBeOpenByHokan`，完整写出 ESU 后清除；`TerminalGuard` 只在 ownership 未清除时补发 ESU；
 - frame build error 发生在 BSU 编码前；
 - stdout error 后尝试发送 ESU/restore，但不能吞掉原始 I/O error；
 - frame 中禁止 `ED 2`、`ED 3`、DECSC、DECRC 和 alternate-screen sequence；
@@ -407,9 +407,9 @@ parse child delta -> new cursor / mode / scroll impact / safe boundary
                                   整体可由一次 BSU/ESU 包围
 ```
 
-不能在半个 UTF-8 codepoint、CSI、OSC 或 DCS 中插入 Hokann sequence。若某个超长 control string 长时间不结束，达到 byte/time 上限后立即转为透明 passthrough 并把 anchor 标为 `Unknown`，不能无限缓存 child output。
+不能在半个 UTF-8 codepoint、CSI、OSC 或 DCS 中插入 Hokan sequence。若某个超长 control string 长时间不结束，达到 byte/time 上限后立即转为透明 passthrough 并把 anchor 标为 `Unknown`，不能无限缓存 child output。
 
-`TerminalModel` 同时跟踪 child 发出的 DECSET/DECRST 2026。child-owned 或启动时已 set 的 synchronized update 期间，Hokann 不嵌套 BSU、不发送 ESU，overlay request 延后或隐藏；只有 Hokann 自己标记为 `MayBeOpenByHokann` 的 transaction 才能由恢复路径结束。
+`TerminalModel` 同时跟踪 child 发出的 DECSET/DECRST 2026。child-owned 或启动时已 set 的 synchronized update 期间，Hokan 不嵌套 BSU、不发送 ESU，overlay request 延后或隐藏；只有 Hokan 自己标记为 `MayBeOpenByHokan` 的 transaction 才能由恢复路径结束。
 
 ### 7.3 打开、导航、关闭
 
@@ -505,7 +505,7 @@ candidate command、history 和文件名都可能含控制字符。进入 ViewMo
 | frame encode error | 丢弃 frame，不影响 child output |
 | resize storm | 合并尺寸，旧 frame 全部作废，只按最终 size 重建 |
 | child 进入 alternate screen | 清 overlay 后纯透传 |
-| suspend/crash/normal exit | 结束可能未闭合的 Hokann-owned BSU，恢复 SGR/cursor/termios，再退出或挂起 |
+| suspend/crash/normal exit | 结束可能未闭合的 Hokan-owned BSU，恢复 SGR/cursor/termios，再退出或挂起 |
 
 日志只记录 revision、epoch、rect、byte count、耗时和 error code；不记录完整 shell buffer、candidate command 或 terminal reply raw payload。
 
@@ -525,8 +525,8 @@ candidate command、history 和文件名都可能含控制字符。进入 ViewMo
 
 同一 transcript 以所有边界和随机边界切分：
 
-1. child bytes 喂给 Hokann output pipeline；
-2. Hokann 最终 bytes 分别喂给 `vt100` 与 `avt` adapter；
+1. child bytes 喂给 Hokan output pipeline；
+2. Hokan 最终 bytes 分别喂给 `vt100` 与 `avt` adapter；
 3. 比较 prompt cells、overlay cells、cursor、alternate-screen 和 scroll 结果；
 4. mode 2026 模型只在 ESU 时采样 presented screen；
 5. fallback 模型在每个 byte/随机 chunk 后采样，断言正常导航没有全空 surface 或 prompt 覆盖；

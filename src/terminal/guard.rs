@@ -66,7 +66,7 @@ impl<W: Write> TerminalGuard<W> {
     }
 
     pub fn observe_external_ownership(&mut self, ownership: SyncOwnership) {
-        if self.sync_ownership != SyncOwnership::MayBeOpenByHokann {
+        if self.sync_ownership != SyncOwnership::MayBeOpenByHokan {
             self.sync_ownership = ownership;
         }
     }
@@ -95,7 +95,7 @@ impl<W: Write> TerminalGuard<W> {
             ));
         }
         if frame.synchronized {
-            self.sync_ownership = SyncOwnership::MayBeOpenByHokann;
+            self.sync_ownership = SyncOwnership::MayBeOpenByHokan;
         }
         let result = (|| {
             let writer = self.writer_mut()?;
@@ -139,7 +139,7 @@ impl<W: Write> TerminalGuard<W> {
     }
 
     fn restore_presentation(&mut self) -> io::Result<()> {
-        let end_own_transaction = self.sync_ownership == SyncOwnership::MayBeOpenByHokann;
+        let end_own_transaction = self.sync_ownership == SyncOwnership::MayBeOpenByHokan;
         let writer = self.writer_mut()?;
         if end_own_transaction {
             writer.write_all(END_SYNCHRONIZED_UPDATE)?;
@@ -212,7 +212,7 @@ mod tests {
     }
 
     #[test]
-    fn successful_frame_clears_hokann_ownership() {
+    fn successful_frame_clears_hokan_ownership() {
         let mut guard = TerminalGuard::new(Vec::new());
         guard
             .write_staged(&frame(true))

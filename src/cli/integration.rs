@@ -9,22 +9,35 @@ use tempfile::NamedTempFile;
 
 use crate::shell::{PROTOCOL_VERSION, ShellKind};
 
-const START: &str = "# >>> hokann integration >>>";
-const END: &str = "# <<< hokann integration <<<";
+pub(crate) const START: &str = "# >>> hokan integration >>>";
+pub(crate) const END: &str = "# <<< hokan integration <<<";
+// Legacy markers written by the pre-rename `hokann` beta. New installs always
+// use the `hokan` markers above, but `setup`/`uninstall` must still recognize
+// these so beta users who ran the old `hokann setup` are not stranded with an
+// unremovable block.
+const LEGACY_START: &str = "# >>> hokann integration >>>";
+const LEGACY_END: &str = "# <<< hokann integration <<<";
 const SHELL_RC_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
 pub fn setup(
     output: &mut dyn Write,
     requested_shell: Option<ShellKind>,
     requested_path: Option<&Path>,
+    on_demand: bool,
 ) -> crate::Result<()> {
     let shell = resolve_shell(requested_shell, requested_path)?;
+    if on_demand && shell == ShellKind::Fish {
+        return Err(crate::Error::Config(
+            "--on-demand is not supported for fish yet; run `hokan setup --shell fish` without it"
+                .into(),
+        ));
+    }
     let requested_path = requested_path
         .map(Path::to_owned)
         .map_or_else(|| default_rc_path(shell), Ok)?;
     let path = resolve_rc_target(&requested_path)?;
     let original = read_optional_utf8(&path)?;
-    let block = integration_block(shell, &env::current_exe()?);
+    let block = integration_block(shell, &env::current_exe()?, on_demand);
     let existing = block_range(&original)?;
     let action = if existing.is_some() {
         "updated"
@@ -62,6 +75,18 @@ pub fn setup(
     writeln!(output, "{action}: {}", path.display())?;
     if let Some(backup) = backup {
         writeln!(output, "backup: {}", backup.display())?;
+    }
+    if on_demand {
+        writeln!(
+            output,
+            "on-demand mode: open a new shell and type `hk` to enter Hokan"
+        )?;
+    } else {
+        writeln!(
+            output,
+            "tip: `hokan setup --shell {} --on-demand` installs an `hk` alias instead of auto-starting Hokan",
+            shell.name()
+        )?;
     }
     Ok(())
 }
@@ -138,39 +163,49 @@ fn default_rc_path(shell: ShellKind) -> crate::Result<PathBuf> {
     })
 }
 
-fn integration_block(shell: ShellKind, executable: &Path) -> String {
+fn integration_block(shell: ShellKind, executable: &Path, on_demand: bool) -> String {
+    if on_demand {
+        // Non-invasive mode: only an `hk` alias, no exec, no shell replacement.
+        // The absolute binary path is pinned the same way the auto-exec block
+        // pins `__hokan_setup_bin`. Fish is rejected by `setup` before this.
+        let alias_value = format!("{} --shell {}", executable.to_string_lossy(), shell.name());
+        return format!(
+            "{START}\n# protocol {PROTOCOL_VERSION}; managed by `hokan setup` (on-demand)\nalias hk='{}'\n{END}\n",
+            alias_value.replace('\'', "'\\''")
+        );
+    }
     let executable = quote_shell_word(executable);
     let command = match shell {
         ShellKind::Fish => format!(
-            "set -l __hokann_setup_bin {executable}\n\
-             if set -q HOKANN_BIN\n\
-               command \"$HOKANN_BIN\" init fish | source\n\
+            "set -l __hokan_setup_bin {executable}\n\
+             if set -q HOKAN_BIN\n\
+               command \"$HOKAN_BIN\" init fish | source\n\
              else\n\
-               command \"$__hokann_setup_bin\" init fish | source\n\
+               command \"$__hokan_setup_bin\" init fish | source\n\
              end"
         ),
         ShellKind::Zsh => format!(
-            "__hokann_setup_bin={executable}\n\
-             __hokann_bin=${{HOKANN_BIN:-$__hokann_setup_bin}}\n\
-             if [[ ${{HOKANN_AUTO_START:-1}} != 0\n\
-                   && -z ${{HOKANN_ACTIVE:-}}\n\
+            "__hokan_setup_bin={executable}\n\
+             __hokan_bin=${{HOKAN_BIN:-$__hokan_setup_bin}}\n\
+             if [[ ${{HOKAN_AUTO_START:-1}} != 0\n\
+                   && -z ${{HOKAN_ACTIVE:-}}\n\
                    && -o interactive\n\
                    && -z ${{ZSH_EXECUTION_STRING:-}}\n\
                    && -t 0\n\
                    && -t 1\n\
                    && ${{TERM:-dumb}} != dumb\n\
-                   && -x \"$__hokann_bin\" ]]; then\n\
-               exec \"$__hokann_bin\" --shell zsh\n\
+                   && -x \"$__hokan_bin\" ]]; then\n\
+               exec \"$__hokan_bin\" --shell zsh\n\
              fi\n\
-             unset __hokann_bin __hokann_setup_bin"
+             unset __hokan_bin __hokan_setup_bin"
         ),
         ShellKind::Bash => format!(
-            "__hokann_setup_bin={executable}\n\
-             eval \"$(\"${{HOKANN_BIN:-$__hokann_setup_bin}}\" init bash)\"\n\
-             unset __hokann_setup_bin"
+            "__hokan_setup_bin={executable}\n\
+             eval \"$(\"${{HOKAN_BIN:-$__hokan_setup_bin}}\" init bash)\"\n\
+             unset __hokan_setup_bin"
         ),
     };
-    format!("{START}\n# protocol {PROTOCOL_VERSION}; managed by `hokann setup`\n{command}\n{END}\n")
+    format!("{START}\n# protocol {PROTOCOL_VERSION}; managed by `hokan setup`\n{command}\n{END}\n")
 }
 
 fn quote_shell_word(path: &Path) -> String {
@@ -225,29 +260,48 @@ fn read_optional_utf8(path: &Path) -> crate::Result<String> {
 }
 
 fn block_range(contents: &str) -> crate::Result<Option<std::ops::Range<usize>>> {
-    let starts: Vec<_> = contents
+    // Match both current and legacy (pre-rename `hokann`) marker pairs; the
+    // two pairs are disjoint strings, so each index belongs to exactly one
+    // variant. Any combination other than a single matched pair is rejected.
+    let mut starts: Vec<(usize, &str)> = contents
         .match_indices(START)
-        .map(|(index, _)| index)
+        .map(|(index, _)| (index, START))
+        .chain(
+            contents
+                .match_indices(LEGACY_START)
+                .map(|(index, _)| (index, LEGACY_START)),
+        )
         .collect();
-    let ends: Vec<_> = contents
+    let mut ends: Vec<(usize, &str)> = contents
         .match_indices(END)
-        .map(|(index, _)| index)
+        .map(|(index, _)| (index, END))
+        .chain(
+            contents
+                .match_indices(LEGACY_END)
+                .map(|(index, _)| (index, LEGACY_END)),
+        )
         .collect();
+    starts.sort_unstable_by_key(|(index, _)| *index);
+    ends.sort_unstable_by_key(|(index, _)| *index);
     match (starts.as_slice(), ends.as_slice()) {
         ([], []) => Ok(None),
-        ([start], [end]) if start < end => {
+        // A start/end pair must use the same marker variant; mixing current
+        // and legacy markers counts as malformed.
+        ([(start, start_marker)], [(end, end_marker)])
+            if start < end && (start_marker == &START) == (end_marker == &END) =>
+        {
             let mut range_start = *start;
             if range_start > 0 && contents.as_bytes().get(range_start - 1) == Some(&b'\n') {
                 range_start -= 1;
             }
-            let mut range_end = end + END.len();
+            let mut range_end = end + end_marker.len();
             if contents.as_bytes().get(range_end) == Some(&b'\n') {
                 range_end += 1;
             }
             Ok(Some(range_start..range_end))
         }
         _ => Err(crate::Error::Config(
-            "malformed or duplicate Hokann integration markers; refusing to modify the file".into(),
+            "malformed or duplicate Hokan integration markers; refusing to modify the file".into(),
         )),
     }
 }
@@ -260,9 +314,9 @@ fn backup_existing(path: &Path) -> crate::Result<Option<PathBuf>> {
     let source_mode = source.metadata()?.permissions().mode();
     for suffix in 0_u32..10_000 {
         let extension = if suffix == 0 {
-            "hokann.bak".to_owned()
+            "hokan.bak".to_owned()
         } else {
-            format!("hokann.bak.{suffix}")
+            format!("hokan.bak.{suffix}")
         };
         let candidate = path.with_extension(extension);
         let mut destination = match fs::OpenOptions::new()
@@ -325,23 +379,23 @@ mod tests {
         let path = directory.path().join(".zshrc");
         fs::write(&path, "export USER_VALUE=1\n").expect("fixture");
         let mut output = Vec::new();
-        setup(&mut output, Some(ShellKind::Zsh), Some(&path)).expect("setup");
+        setup(&mut output, Some(ShellKind::Zsh), Some(&path), false).expect("setup");
         let once = fs::read_to_string(&path).expect("installed file");
         assert!(once.starts_with(START));
         assert!(once.find(END) < once.find("export USER_VALUE=1"));
-        assert!(once.contains("__hokann_setup_bin='"));
+        assert!(once.contains("__hokan_setup_bin='"));
         assert!(!once.contains("init zsh"));
-        assert!(once.contains("HOKANN_AUTO_START"));
-        assert!(once.contains(r#"exec "$__hokann_bin" --shell zsh"#));
-        setup(&mut output, Some(ShellKind::Zsh), Some(&path)).expect("idempotent setup");
+        assert!(once.contains("HOKAN_AUTO_START"));
+        assert!(once.contains(r#"exec "$__hokan_bin" --shell zsh"#));
+        setup(&mut output, Some(ShellKind::Zsh), Some(&path), false).expect("idempotent setup");
         assert_eq!(fs::read_to_string(&path).expect("same file"), once);
         uninstall(&mut output, Some(ShellKind::Zsh), Some(&path)).expect("uninstall");
         assert_eq!(
             fs::read_to_string(&path).expect("restored content"),
             "export USER_VALUE=1\n"
         );
-        assert!(path.with_extension("hokann.bak").exists());
-        assert!(path.with_extension("hokann.bak.1").exists());
+        assert!(path.with_extension("hokan.bak").exists());
+        assert!(path.with_extension("hokan.bak.1").exists());
     }
 
     #[test]
@@ -352,7 +406,7 @@ mod tests {
         fs::write(
             &target,
             format!(
-                "export USER_VALUE=1\n\n{START}\n# protocol 1; managed by `hokann setup`\nold integration\n{END}\n"
+                "export USER_VALUE=1\n\n{START}\n# protocol 1; managed by `hokan setup`\nold integration\n{END}\n"
             ),
         )
         .expect("old integration");
@@ -360,7 +414,7 @@ mod tests {
         std::os::unix::fs::symlink(&target, &path).expect("rc symlink");
 
         let mut output = Vec::new();
-        setup(&mut output, Some(ShellKind::Zsh), Some(&path)).expect("upgrade setup");
+        setup(&mut output, Some(ShellKind::Zsh), Some(&path), false).expect("upgrade setup");
         assert!(
             fs::symlink_metadata(&path)
                 .expect("symlink")
@@ -368,9 +422,9 @@ mod tests {
                 .is_symlink()
         );
         let upgraded = fs::read_to_string(&target).expect("upgraded target");
-        assert!(upgraded.contains("HOKANN_AUTO_START"));
+        assert!(upgraded.contains("HOKAN_AUTO_START"));
         assert!(!upgraded.contains("old integration"));
-        assert!(target.with_extension("hokann.bak").exists());
+        assert!(target.with_extension("hokan.bak").exists());
         assert!(
             String::from_utf8(output)
                 .expect("output")
@@ -383,12 +437,12 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = directory.path().join(".zshrc");
         fs::write(&path, "export USER_VALUE=1\n").expect("fixture");
-        let first_backup = path.with_extension("hokann.bak");
+        let first_backup = path.with_extension("hokan.bak");
         let symlink_target = directory.path().join("must-not-be-created");
         std::os::unix::fs::symlink(&symlink_target, &first_backup)
             .expect("dangling backup symlink");
 
-        setup(&mut Vec::new(), Some(ShellKind::Zsh), Some(&path)).expect("setup");
+        setup(&mut Vec::new(), Some(ShellKind::Zsh), Some(&path), false).expect("setup");
 
         assert!(
             fs::symlink_metadata(&first_backup)
@@ -397,7 +451,7 @@ mod tests {
                 .is_symlink()
         );
         assert!(!symlink_target.exists());
-        assert!(path.with_extension("hokann.bak.1").is_file());
+        assert!(path.with_extension("hokan.bak.1").is_file());
     }
 
     #[test]
@@ -406,7 +460,128 @@ mod tests {
         let path = directory.path().join("config.fish");
         fs::write(&path, format!("{START}\nmissing end\n")).expect("fixture");
         let before = fs::read(&path).expect("before");
-        assert!(setup(&mut Vec::new(), Some(ShellKind::Fish), Some(&path)).is_err());
+        assert!(setup(&mut Vec::new(), Some(ShellKind::Fish), Some(&path), false).is_err());
         assert_eq!(fs::read(&path).expect("after"), before);
+    }
+
+    #[test]
+    fn uninstall_removes_legacy_hokann_marked_blocks() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join(".zshrc");
+        fs::write(
+            &path,
+            format!(
+                "export USER_VALUE=1\n\n{LEGACY_START}\n# protocol 1; managed by `hokann setup`\nold integration\n{LEGACY_END}\n"
+            ),
+        )
+        .expect("legacy integration fixture");
+
+        let mut output = Vec::new();
+        uninstall(&mut output, Some(ShellKind::Zsh), Some(&path)).expect("uninstall legacy");
+        assert_eq!(
+            fs::read_to_string(&path).expect("restored content"),
+            "export USER_VALUE=1\n"
+        );
+
+        // `setup` must also upgrade a legacy-marked block in place, replacing
+        // the old `hokann` markers with the current ones.
+        fs::write(
+            &path,
+            format!(
+                "export USER_VALUE=1\n\n{LEGACY_START}\n# protocol 1; managed by `hokann setup`\nold integration\n{LEGACY_END}\n"
+            ),
+        )
+        .expect("legacy integration fixture");
+        setup(&mut output, Some(ShellKind::Zsh), Some(&path), false).expect("setup over legacy");
+        let upgraded = fs::read_to_string(&path).expect("upgraded content");
+        assert!(upgraded.starts_with(START));
+        assert!(!upgraded.contains(LEGACY_START));
+        assert!(!upgraded.contains("old integration"));
+    }
+
+    #[test]
+    fn mixed_current_and_legacy_markers_are_rejected() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join(".zshrc");
+        fs::write(&path, format!("{LEGACY_START}\nblock\n{END}\n")).expect("fixture");
+        let before = fs::read(&path).expect("before");
+        assert!(uninstall(&mut Vec::new(), Some(ShellKind::Zsh), Some(&path)).is_err());
+        assert_eq!(fs::read(&path).expect("after"), before);
+    }
+
+    #[test]
+    fn on_demand_setup_installs_alias_only_block() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join(".zshrc");
+        fs::write(&path, "export USER_VALUE=1\n").expect("fixture");
+
+        let mut output = Vec::new();
+        setup(&mut output, Some(ShellKind::Zsh), Some(&path), true).expect("on-demand setup");
+        let installed = fs::read_to_string(&path).expect("installed file");
+        assert!(installed.starts_with(START));
+        let block = &installed[..installed.find(END).expect("end marker") + END.len()];
+        assert!(block.contains("(on-demand)"));
+        assert!(block.contains("alias hk='"));
+        assert!(block.contains(" --shell zsh'\n"));
+        assert!(!block.contains("exec"));
+        assert!(!block.contains("HOKAN_AUTO_START"));
+        // User content below the block is untouched.
+        assert!(installed.ends_with("export USER_VALUE=1\n"));
+        let output = String::from_utf8(output).expect("output");
+        assert!(output.contains("type `hk`"));
+
+        // Uninstall removes the on-demand block via the same markers.
+        uninstall(&mut Vec::new(), Some(ShellKind::Zsh), Some(&path)).expect("uninstall");
+        assert_eq!(
+            fs::read_to_string(&path).expect("restored content"),
+            "export USER_VALUE=1\n"
+        );
+    }
+
+    #[test]
+    fn setup_switches_between_auto_exec_and_on_demand_modes() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join(".zshrc");
+        fs::write(&path, "export USER_VALUE=1\n").expect("fixture");
+        let mut output = Vec::new();
+
+        setup(&mut output, Some(ShellKind::Zsh), Some(&path), false).expect("auto-exec setup");
+        let auto_exec = fs::read_to_string(&path).expect("auto-exec file");
+        assert!(auto_exec.contains(r#"exec "$__hokan_bin" --shell zsh"#));
+        assert!(!auto_exec.contains("alias hk="));
+
+        // Downgrade to on-demand: the managed block is replaced, user content kept.
+        setup(&mut output, Some(ShellKind::Zsh), Some(&path), true).expect("on-demand setup");
+        let on_demand = fs::read_to_string(&path).expect("on-demand file");
+        assert!(on_demand.contains("alias hk='"));
+        assert!(!on_demand.contains("exec \"$__hokan_bin\""));
+        assert!(on_demand.ends_with("export USER_VALUE=1\n"));
+
+        // Upgrade back to auto-exec.
+        setup(&mut output, Some(ShellKind::Zsh), Some(&path), false).expect("auto-exec again");
+        assert_eq!(
+            fs::read_to_string(&path).expect("auto-exec restored"),
+            auto_exec
+        );
+    }
+
+    #[test]
+    fn on_demand_setup_supports_bash_and_rejects_fish() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let bashrc = directory.path().join(".bashrc");
+        fs::write(&bashrc, "export USER_VALUE=1\n").expect("fixture");
+        setup(&mut Vec::new(), Some(ShellKind::Bash), Some(&bashrc), true)
+            .expect("bash on-demand setup");
+        let installed = fs::read_to_string(&bashrc).expect("installed bashrc");
+        assert!(installed.contains("alias hk='"));
+        assert!(installed.contains(" --shell bash'\n"));
+
+        let fishrc = directory.path().join("config.fish");
+        fs::write(&fishrc, "set USER_VALUE 1\n").expect("fixture");
+        let before = fs::read(&fishrc).expect("before");
+        let error = setup(&mut Vec::new(), Some(ShellKind::Fish), Some(&fishrc), true)
+            .expect_err("fish on-demand must be rejected");
+        assert!(error.to_string().contains("--on-demand"));
+        assert_eq!(fs::read(&fishrc).expect("after"), before);
     }
 }

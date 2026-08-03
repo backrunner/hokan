@@ -17,15 +17,15 @@ impl ConfigPaths {
         let config_root = env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".config"))
-            .join("hokann");
+            .join("hokan");
         let state_directory = env::var_os("XDG_STATE_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".local/state"))
-            .join("hokann");
+            .join("hokan");
         let cache_directory = env::var_os("XDG_CACHE_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".cache"))
-            .join("hokann");
+            .join("hokan");
         Ok(Self {
             config_file: config_root.join("config.toml"),
             credentials_file: config_root.join("credentials.toml"),

@@ -1,4 +1,4 @@
-# Hokann 交互设计
+# Hokan 交互设计
 
 ## 1. 体验原则
 
@@ -11,7 +11,7 @@
 
 ## 2. 默认外观
 
-Hokann 在输入行下方使用内联 overlay，不进入全屏：
+Hokan 在输入行下方使用内联 overlay，不进入全屏：
 
 ```text
 ~/project $ ls▌
@@ -24,13 +24,13 @@ Hokann 在输入行下方使用内联 overlay，不进入全屏：
 
 视觉约束：
 
-- 不使用外围大卡片或多层边框；选中箭头、类型标签和一条弱分隔线足够建立层级。
-- 默认最多 12 行，包括状态/分页行；不足空间时自动减少。
-- 默认宽度为当前终端宽度和 100 cells 的较小值，最小支持 40 cells。
+- 列表是一个紧凑圆角框（iris modern 风格）：单边框、选中箭头、Nerd Font 图标、来源标签和弱色描述建立层级；描述列跨行对齐，风险标记紧邻选中箭头，选中行主命令加粗。
+- 默认最多 8 行（6 行候选 + 上下边框）；分页计数内嵌顶边，键位提示或状态文字内嵌底边；不足空间时自动减少。
+- 默认宽度为当前终端宽度和 76 cells 的较小值，最小支持 40 cells；框左边缘跟随光标列，靠右时自动左移防溢出。
 - overlay 打开时一次确定专用 surface 的行数；连续键入、新 query 和 provider 增量只更新 surface 内 cells，不反复插入/删除终端行。
-- 主命令优先保留；描述在普通列表中单行截断，不挤压主命令到不可读。
-- ASCII 标签是可靠默认值：`CMD`、`USE`、`HIS`、`FILE`、`DIR`、`PROJ`、`AI`、`RISK`。Nerd Font 仅作为可选皮肤。
-- 颜色使用中性文本、青色来源、绿色低风险、琥珀色中风险、红色高风险；无颜色时依靠标签和文字表达，不只靠颜色。
+- 主命令优先保留；描述在普通列表中单行截断（`…`），不挤压主命令到不可读。
+- 命令图标使用 Nerd Font（`ui.nerd_fonts` 默认开启，按命令首词查表，fallback `❯`）；关闭后图标列消失，只剩 `CMD`、`USE`、`HIS`、`FILE`、`DIR`、`PROJ`、`AI`、`RISK` 等 ASCII 标签。
+- 颜色使用 ANSI 自适应调色板（边框/键位品红、选中与高亮绿、描述暗灰、状态黄），随终端主题变化；无颜色时依靠标签和文字表达，不只靠颜色。
 - 所有宽度按 terminal cell 计算；CJK、组合字符和 emoji 不得破坏列对齐。
 
 ## 3. 打开、关闭与刷新
@@ -71,7 +71,7 @@ Hokann 在输入行下方使用内联 overlay，不进入全屏：
 | --- | --- | --- |
 | `Up` / `Down` | 移动选中项 | 原样交给 shell |
 | `Tab` | 接受编辑，永不执行 | 原样交给 shell；若刚有候选可配置为打开并接受 |
-| `Enter` | 激活当前项，按动作规则处理 | 原样提交给 shell |
+| `Enter` | 无选中：关闭列表并提交当前输入；有选中：执行选中候选（High/Unknown 先二次确认） | 原样提交给 shell |
 | `Esc` | 关闭列表或取消 AI 请求 | 原样交给 shell |
 | `Ctrl-R` | Unified/HistoryOnly 切换 | 打开 HistoryOnly |
 | `Shift-Tab` | 关闭列表 | 打开列表 |
@@ -81,17 +81,17 @@ Hokann 在输入行下方使用内联 overlay，不进入全屏：
 
 ## 5. 候选动作
 
-### 5.1 `RunCurrent`
+### 5.1 `Enter` 语义
 
-只用于当前输入已经是完整、低风险命令的直接运行项：
+列表不默认选中，`Up`/`Down` 显式进入（不改变 buffer）。无选中时 `Enter` 把用户亲手输入的 buffer 原样提交给 shell：
 
 ```text
 $ df▌
-  > [CMD] df          直接运行 · 显示文件系统磁盘使用量
+    [CMD] df          显示文件系统磁盘使用量
     [USE] df -h       使用易读单位
 ```
 
-当且仅当用户没有切换选中项、buffer revision/hash 未改变且候选仍通过安全门时，`Enter` 才把当前 buffer 原样提交。它不会用列表文本替换输入。
+有选中时 `Enter` 执行选中候选的完整命令文本：≤ Medium 风险直接执行，High/Unknown 先显示红色 EXEC 确认行（`Enter` 确认、`Esc` 取消）。仍需参数的候选（InsertAndContinue）选中后 `Enter` 退化为回填。亲手输入的命令永不触发确认。
 
 ### 5.2 `Insert`
 
@@ -163,7 +163,7 @@ $ lsof▌
     [USE] lsof +D …        递归检查目录 · 可能较慢
 ```
 
-若输入只是前缀 `lso`，`lsof` 是 `Insert`，不能一步执行。只有用户实际输入已经等于 `lsof` 才存在 `RunCurrent`。
+输入只是前缀 `lso` 时，`lsof` 是 `Insert` 候选；`Enter` 只执行当前输入的 `lso`（shell 报 command not found），想用 `lsof` 需先 `Tab` 回填。
 
 ### 7.2 需要参数
 
@@ -177,7 +177,7 @@ $ kill ▌
     [RISK] kill -9 …                     强制终止 · 高风险
 ```
 
-选择进程只回填 `kill 4821`。`kill -9` 永远不能成为直接运行项。
+选择进程只回填 `kill 4821`（进程候选是 InsertAndContinue，Enter 不执行）。`kill -9` 标为高风险，选中执行必须先经二次确认。
 
 ### 7.3 平台差异
 
@@ -238,7 +238,7 @@ $ 查找当前目录 7 天内修改过的 rs 文件▌
 - AI 已启用、endpoint/model/key source 可用；
 - 同一输入只显示一个 AI 动作，不预先请求、不显示虚构命令。
 
-未配置时默认不显示 AI 动作；`hokann doctor` 和 `hokann config ai` 提供设置入口。
+未配置时默认不显示 AI 动作；`hokan doctor` 和 `hokan config ai` 提供设置入口。
 
 ### 10.2 Loading 与取消
 
@@ -266,13 +266,13 @@ $ 查找当前目录 7 天内修改过的 rs 文件▌
 - AI 结果视图允许每项使用最多三行，以便完整展示命令和解释；总 overlay 高度仍固定在上限内。
 - 本机不存在的首 token 默认降权或隐藏，并在可替代时说明。
 - 选中结果后只回填，退出 AI 结果视图；绝不直接执行。
-- 含危险结构的结果显示 `RISK` 和原因。Hokann 不替用户修改 AI 命令来“自动变安全”。
+- 含危险结构的结果显示 `RISK` 和原因。Hokan 不替用户修改 AI 命令来“自动变安全”。
 
 错误示例：
 
 ```text
   [AI] 请求超时              retry
-  [AI] 凭据被拒绝            run: hokann config ai
+  [AI] 凭据被拒绝            run: hokan config ai
   [AI] 响应不是有效命令列表  retry
 ```
 
@@ -295,7 +295,7 @@ $ rm -rf target/▌
   ! 已回填高风险命令：递归删除目录；再次 Enter 才会执行
 ```
 
-提示在用户继续编辑、关闭或提交后消失。Hokann 不阻止用户手工输入并执行同一命令，也不把风险分类宣传成安全保证。
+提示在用户继续编辑、关闭或提交后消失。Hokan 不阻止用户手工输入并执行同一命令，也不把风险分类宣传成安全保证。
 
 ## 12. 特殊终端状态
 
@@ -307,28 +307,28 @@ $ rm -rf target/▌
 
 ### 12.2 Resize
 
-收到 resize 后立即丢弃未提交 frame，并推进 screen epoch。只有旧 rect 坐标仍可靠时才把它 diff 到 blank；位置不可靠时不盲目 erase。Hokann 先同步 child PTY size，随后隐藏列表，等待新的 prompt boundary/CPR anchor，再按新尺寸 full paint。候选 id 和选中项保留，旧 row index 与 previous buffer 不保留。
+收到 resize 后立即丢弃未提交 frame，并推进 screen epoch。只有旧 rect 坐标仍可靠时才把它 diff 到 blank；位置不可靠时不盲目 erase。Hokan 先同步 child PTY size，随后隐藏列表，等待新的 prompt boundary/CPR anchor，再按新尺寸 full paint。候选 id 和选中项保留，旧 row index 与 previous buffer 不保留。
 
 resize storm 只处理最后一个尺寸；过程中不能反复清屏、追加空行或让光标逐次跳动。
 
 ### 12.3 原子呈现与 fallback
 
-Hokann 启动时异步查询 DEC private mode 2026：
+Hokan 启动时异步查询 DEC private mode 2026：
 
 - 明确支持且 mode 空闲时，一个 overlay 更新由 BSU/ESU 包围；用户只能看到旧完成态或新完成态，不能看到空白中间帧。
-- 不支持或 reply timeout 时走 fallback。fallback 直接覆盖发生变化的 cells，行缩短时只清 stale suffix；普通导航绝不先清空整块 surface。mode busy/externally owned 时延后或隐藏，不能把 Hokann frame 嵌入他人的 synchronized transaction。
+- 不支持或 reply timeout 时走 fallback。fallback 直接覆盖发生变化的 cells，行缩短时只清 stale suffix；普通导航绝不先清空整块 surface。mode busy/externally owned 时延后或隐藏，不能把 Hokan frame 嵌入他人的 synchronized transaction。
 - 两条路径都必须恢复 child 的 SGR、绝对光标和 cursor visibility；都不使用 `ESC 7/8`，不写最后一列，不清全屏或 scrollback。
 - 若 compositor 无法证明 anchor、screen epoch 或控制序列边界安全，预期行为是暂时隐藏列表，让 shell 保持可用，而不是尝试一次“可能正确”的绘制。
 - shell control event 先到而 PTY redisplay 尚未收敛时同样不画新 frame；等待 deadline 只会保留不可激活的旧完成态或隐藏，不以固定延迟后强行重画。
 
-无 mode 2026 的终端无法在协议层保证每个物理 present 都原子，但 Hokann 保证不主动制造 clear-before-paint 的空白帧。兼容验收会检查随机分片后的每个中间态，而不只检查最终截图。
+无 mode 2026 的终端无法在协议层保证每个物理 present 都原子，但 Hokan 保证不主动制造 clear-before-paint 的空白帧。兼容验收会检查随机分片后的每个中间态，而不只检查最终截图。
 
 ### 12.4 SSH/tmux
 
 - 只使用 TTY/VT 协议和运行时 capability probe，不依赖桌面 API，也不单凭 `$TERM` 判断 synchronized output。
 - tmux 3.7+ 才可能识别 pane 内应用发出的 mode 2026；tmux 3.6 及更早版本预期走 cell-diff fallback。最终决策仍以 DECRQM reply 为准。
 - probe/CPR 有 deadline，timeout 后安静降级；CPR 只在 prompt 建立或失步恢复时使用，绝不让每次按键等待 SSH RTT。
-- 网络延迟不会影响本地候选；Hokann 运行在哪台机器，history/files/AI 请求就发生在哪台机器。
+- 网络延迟不会影响本地候选；Hokan 运行在哪台机器，history/files/AI 请求就发生在哪台机器。
 
 ### 12.5 Shell/TUI 输出
 
@@ -349,18 +349,19 @@ child output 永远优先且不能因 overlay 丢失或延迟。`OutputActor` �
 
 ## 14. 关键交互验收用例
 
-1. 输入 `ls`：默认选中 `RunCurrent ls`；`Enter` 执行原输入，`Down + Enter` 只回填 recipe。
-2. 输入 `lso`：即使 `lsof` 是第一项，`Enter` 也只补齐，不能执行被改写的命令。
-3. 输入 `kill `：第一项是进程/补参，不存在直接运行；任何 PID 选择都只回填。
-4. 输入 `bash bootstrap\ s`：选择带空格文件后 shell 得到一个正确 argv。
-5. 输入 `pnpm run bu`：只替换当前 token，结果为 `pnpm run build`。
-6. 打开 history、上下导航后异步文件结果到达：选中项不跳动。
-7. 选择 AI action 后继续键入：请求取消，迟到响应不显示。
-8. AI 返回 `rm -rf ...`：显示高风险，只回填，并保留一次风险提示。
-9. 在列表可见时运行 `vim`：overlay 在 alternate screen 前被清除，退出后 prompt 正常。
-10. 任意阶段 `Ctrl-C`、resize、suspend/resume：无残留行、光标和 raw mode 问题。
-11. 在支持 mode 2026 的终端连续长按上下键：录制帧中只出现完整旧/新选中态，没有空列表、半帧或 cursor jump。
-12. 在不支持 mode 2026 的终端重复相同操作：随机 byte/chunk 中间态没有全空 surface、全屏清除或 prompt 覆盖。
-13. tmux 3.6 走 fallback，tmux 3.7+ 按 probe 结果选择路径；两者 resize、detach/attach 后都能重新建立 anchor。
-14. 列表可见时出现异步 child output 或未知 OSC/DCS：child bytes 完整有序，UI 要么可靠重绘，要么安静隐藏，不能污染输出。
-15. 人为交换 `BufferSnapshot`、PTY redisplay chunk、render marker 和 provider batch 的到达顺序：新候选在 readiness 前不可见/不可激活，收敛后一次替换且无闪白。
+1. 输入 `ls`：无默认选中，`Enter` 执行原输入；`Down` 选中 recipe 后 `Enter` 直接执行该 recipe，`Tab` 则只回填。
+2. 输入 `lso`：无选中时 `Enter` 执行 `lso`（shell 报 command not found）；`Down` 选中 `lsof` 后 `Enter` 执行 `lsof`。
+3. 输入 `kill `：进程候选是 `InsertAndContinue`，选中后 `Enter` 退化为回填，不执行。
+4. 选中 High/Unknown 风险候选（如 history 中的 `rm -rf …`）后 `Enter`：先出现红色 EXEC 确认行，`Enter` 确认执行，`Esc` 取消返回列表。
+5. 输入 `bash bootstrap\ s`：选择带空格文件后 shell 得到一个正确 argv。
+6. 输入 `pnpm run bu`：只替换当前 token，结果为 `pnpm run build`。
+7. 打开 history、上下导航后异步文件结果到达：选中项不跳动。
+8. 选择 AI action 后继续键入：请求取消，迟到响应不显示。
+9. AI 返回 `rm -rf ...`：显示高风险；AI 候选只能回填或触发 action，不作为命令直接执行。
+10. 在列表可见时运行 `vim`：overlay 在 alternate screen 前被清除，退出后 prompt 正常。
+11. 任意阶段 `Ctrl-C`、resize、suspend/resume：无残留行、光标和 raw mode 问题。
+12. 在支持 mode 2026 的终端连续长按上下键：录制帧中只出现完整旧/新选中态，没有空列表、半帧或 cursor jump。
+13. 在不支持 mode 2026 的终端重复相同操作：随机 byte/chunk 中间态没有全空 surface、全屏清除或 prompt 覆盖。
+14. tmux 3.6 走 fallback，tmux 3.7+ 按 probe 结果选择路径；两者 resize、detach/attach 后都能重新建立 anchor。
+15. 列表可见时出现异步 child output 或未知 OSC/DCS：child bytes 完整有序，UI 要么可靠重绘，要么安静隐藏，不能污染输出。
+16. 人为交换 `BufferSnapshot`、PTY redisplay chunk、render marker 和 provider batch 的到达顺序：新候选在 readiness 前不可见/不可激活，收敛后一次替换且无闪白。

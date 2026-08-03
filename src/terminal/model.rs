@@ -30,6 +30,10 @@ struct EffectObserver {
     sync_mode_change: Option<bool>,
 }
 
+// OSC sequences are intentionally tolerated: without an osc_dispatch override
+// they fall through to the vte::Perform default no-op. Hokan's own OSC 6973
+// markers never reach this observer — RenderBoundaryDecoder strips them from
+// the child stream before TerminalModel::process sees it.
 impl vte::Perform for EffectObserver {
     fn execute(&mut self, byte: u8) {
         if !matches!(byte, 0 | 7..=15 | 0x18 | 0x1a) {
@@ -57,15 +61,27 @@ impl vte::Perform for EffectObserver {
             (
                 [],
                 '@' | 'A' | 'B' | 'C' | 'D' | 'E' | 'F' | 'G' | 'H' | 'J' | 'K' | 'L' | 'M' | 'P'
-                | 'S' | 'T' | 'X' | 'd' | 'm' | 'r',
+                | 'S' | 'T' | 'X' | 'd' | 'f' | 'm' | 'r',
             ) => {}
             ([], 't') => self.unknown_screen_effect = true,
+            ([], 'h' | 'l') => {
+                for param in params {
+                    match param {
+                        [4] => {}
+                        _ => self.unknown_screen_effect = true,
+                    }
+                }
+            }
+            ([b' '], 'q') => {}
             ([b'?'], 'J' | 'K') => {}
             ([b'?'], 'h' | 'l') => {
                 for param in params {
                     match param {
                         [2026] => self.sync_mode_change = Some(action == 'h'),
-                        [1 | 6 | 9 | 25 | 47 | 1000 | 1002 | 1003 | 1005 | 1006 | 1049 | 2004] => {}
+                        [
+                            1 | 6 | 7 | 9 | 25 | 47 | 1000 | 1002 | 1003 | 1005 | 1006 | 1049
+                            | 2004,
+                        ] => {}
                         _ => self.unknown_screen_effect = true,
                     }
                 }
@@ -75,11 +91,16 @@ impl vte::Perform for EffectObserver {
     }
 
     fn esc_dispatch(&mut self, intermediates: &[u8], ignore: bool, byte: u8) {
-        if ignore
-            || !intermediates.is_empty()
-            || !matches!(byte, b'7' | b'8' | b'=' | b'>' | b'M' | b'c' | b'g')
-        {
+        if ignore {
             self.unknown_screen_effect = true;
+            return;
+        }
+        match intermediates {
+            [] if matches!(byte, b'7' | b'8' | b'=' | b'>' | b'M' | b'c' | b'g') => {}
+            // G0–G3 charset designation (e.g. ESC ( B): vt100 models charsets,
+            // and the final byte is constrained to the valid range by the parser.
+            [b'(' | b')' | b'*' | b'+'] => {}
+            _ => self.unknown_screen_effect = true,
         }
     }
 }
@@ -161,7 +182,7 @@ impl TerminalModel {
         self.invalidate()
     }
 
-    pub fn apply_hokann_frame(&mut self, bytes: &[u8]) {
+    pub fn apply_hokan_frame(&mut self, bytes: &[u8]) {
         self.parser.process(bytes);
     }
 
@@ -299,5 +320,54 @@ mod tests {
             .process(b"\x1b[?2026l")
             .expect("sync reset should parse");
         assert_eq!(model.sync_ownership(), SyncOwnership::None);
+    }
+
+    #[test]
+    fn powerline_theme_sequences_keep_the_epoch() {
+        let mut model = model();
+        model
+            .confirm_cursor(CellPos::new(0, 0))
+            .expect("CPR should apply");
+        let epoch = model.screen_epoch();
+        for bytes in [
+            b"\x1b[2 q".as_slice(),  // DECSCUSR: block cursor shape
+            b"\x1b[ q".as_slice(),   // DECSCUSR: default shape
+            b"\x1b[5;3f".as_slice(), // HVP: equivalent to CUP
+            b"\x1b[?7h".as_slice(),  // DECAWM: autowrap set
+            b"\x1b[?7l".as_slice(),  // DECAWM: autowrap reset
+            b"\x1b[4h".as_slice(),   // IRM: insert mode set
+            b"\x1b[4l".as_slice(),   // IRM: insert mode reset
+            b"\x1b(B".as_slice(),    // G0 charset: ASCII
+            b"\x1b)0".as_slice(),    // G1 charset: DEC graphics
+            b"\x1b*B".as_slice(),    // G2 charset: ASCII
+            b"\x1b+0".as_slice(),    // G3 charset: DEC graphics
+        ] {
+            let update = model.process(bytes).expect("theme sequence should parse");
+            assert!(
+                !update.epoch_changed,
+                "{bytes:?} must not invalidate the epoch"
+            );
+        }
+        assert_eq!(model.screen_epoch(), epoch);
+        assert_eq!(model.confidence(), AnchorConfidence::Derived);
+    }
+
+    #[test]
+    fn modes_outside_the_whitelist_still_invalidate_the_epoch() {
+        let mut model = model();
+        for bytes in [
+            b"\x1b[20h".as_slice(),   // LNM is not a no-op for line endings
+            b"\x1b[4;20h".as_slice(), // mixed mode batch keeps the unknown param visible
+            b"\x1b[?5h".as_slice(),   // DECSCNM repaints every cell
+            b"\x1b[!p".as_slice(),    // DECSTR resets terminal modes
+            b"\x1b[!q".as_slice(),    // only DECSCUSR (SP q) is whitelisted
+        ] {
+            let epoch = model.screen_epoch();
+            model.process(bytes).expect("sequence should parse");
+            assert!(
+                model.screen_epoch() > epoch,
+                "{bytes:?} must invalidate the epoch"
+            );
+        }
     }
 }

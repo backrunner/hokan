@@ -2,10 +2,10 @@
 
 use std::{env, path::PathBuf, process::Command};
 
-use hokann::{history::HistoryEventV1, shell::ShellKind};
+use hokan::{history::HistoryEventV1, shell::ShellKind};
 
-const DIRECTORY_ENV: &str = "HOKANN_TEST_HISTORY_DIRECTORY";
-const WORKER_ENV: &str = "HOKANN_TEST_HISTORY_WORKER";
+const DIRECTORY_ENV: &str = "HOKAN_TEST_HISTORY_DIRECTORY";
+const WORKER_ENV: &str = "HOKAN_TEST_HISTORY_WORKER";
 
 #[test]
 fn history_worker_process() {
@@ -16,7 +16,7 @@ fn history_worker_process() {
         .expect("worker id")
         .parse()
         .expect("numeric worker id");
-    let store = hokann::history::HistoryStore::open(&directory).expect("worker store");
+    let store = hokan::history::HistoryStore::open(&directory).expect("worker store");
     for batch in 0..50_u64 {
         let events: Vec<_> = (0..1_000_u64)
             .map(|offset| {
@@ -57,7 +57,7 @@ fn two_processes_append_one_hundred_thousand_events_without_loss() {
         assert!(status.success(), "history worker failed: {status}");
     }
 
-    let store = hokann::history::HistoryStore::open(directory.path()).expect("parent store");
+    let store = hokan::history::HistoryStore::open(directory.path()).expect("parent store");
     let stats = store.stats().expect("history stats");
     assert_eq!(stats.events, 100_000);
     assert_eq!(stats.records, 100_000);

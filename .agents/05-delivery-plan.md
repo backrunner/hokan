@@ -1,4 +1,4 @@
-# Hokann 实施与验证计划
+# Hokan 实施与验证计划
 
 ## 1. 实施原则
 
@@ -26,7 +26,7 @@
 ### 3.1 交付内容
 
 1. 初始化 Rust package、`rust-toolchain.toml`、格式化/lint/test 基线。
-2. `hokann --shell <...>` 创建 PTY 并启动 zsh/bash/fish。
+2. `hokan --shell <...>` 创建 PTY 并启动 zsh/bash/fish。
 3. 双向 byte pump、foreground process group 检测和窗口尺寸同步。
 4. `TerminalGuard`：raw mode、光标、signal、panic 和 child exit 恢复。
 5. 最小 `AppEvent -> Reducer -> Effect` 循环；`buffer/frame/screen` revision 全链路校验。
@@ -36,7 +36,7 @@
 9. 单 stdin reader + `TerminalReplyRouter`；实现 CPR anchor 和 mode 2026 DECRQM/DECRPM 探测、timeout/fallback。
 10. Ratatui 离屏 `Buffer` + 3 行固定 surface + cell diff compositor；不使用 alternate screen、DECSC/DECRC 或 clear-before-paint。
 11. BSU/ESU 原子路径和无 synchronized output 的非破坏性 fallback；每帧 staged write、latest-only scheduler。
-12. `hokann init zsh|bash|fish` 的协议 v1 草案，含 boundary id/marker 且阻止递归启动。
+12. `hokan init zsh|bash|fish` 的协议 v1 草案，含 boundary id/marker 且阻止递归启动。
 13. prompt/command/CWD 事件；zsh 真实 buffer snapshot。
 14. shell-native 回填 PoC：各 shell 将固定字符串精确设置到真实 buffer。
 15. 可重复的 PTY harness，记录输入 bytes、随机分片、输出 token、虚拟屏幕中间态和最终 termios。
@@ -66,7 +66,7 @@
 - 合法 shell marker 不进入最终 stdout；任意近似/错误 token/错误 phase 的 OSC/DCS byte-for-byte 透传，不能被误吞。
 - mode 2026 路径只在 ESU 呈现，录制和虚拟终端采样中没有半帧、空白帧或 cursor jump。
 - fallback 在所有固定与随机分片中没有整块空 surface、prompt 覆盖或 clear-before-paint；输出不含 `ED 2/3`、DECSC/DECRC、alternate-screen sequence 和最后一列 write。
-- 所有测试退出路径都配对或恢复 Hokann-owned BSU，并恢复 canonical、echo、SGR 和可见光标；不得结束启动前/child-owned synchronized update。
+- 所有测试退出路径都配对或恢复 Hokan-owned BSU，并恢复 canonical、echo、SGR 和可见光标；不得结束启动前/child-owned synchronized update。
 - 三种 shell 均能精确回填包含空格、单引号和 CJK 的单行命令。
 - `vim`/`less`/tmux 往返后能重新建立 prompt anchor。
 - buffer、safe boundary 或 anchor 不确定时 UI 会隐藏，而不是继续给出错误候选或猜坐标。
@@ -86,13 +86,13 @@
 - 在 shell `CommandEnd` 时记录 session command、CWD、exit code。
 - 实现 Unified 与 HistoryOnly、上下导航、分页和稳定选中。
 - 实现 history `Insert` 回填，不允许选择时执行。
-- 实现 `hokann history import|stats|prune|clear`。
+- 实现 `hokan history import|stats|prune|clear`。
 - 加入隐私排除、日志脱敏和最大命令长度。
 
 ### 4.2 验收
 
 - 100,000 条含重复/Unicode/长命令 fixture 的 p95 查询不超过 30 ms。
-- 两个 Hokann 进程并发追加 100,000 个事件，无损坏、死锁或丢失完整记录。
+- 两个 Hokan 进程并发追加 100,000 个事件，无损坏、死锁或丢失完整记录。
 - 模拟任意 byte offset 断电，reader 忽略 torn tail，repair 后保留之前完整记录。
 - shell history rotate/truncate/import 不造成指数重复。
 - 输入变化时选中项与迟到 batch 行为符合交互文档。
@@ -102,10 +102,10 @@
 ### 5.1 规格基础设施
 
 - 完成 schema model、TOML loader、compiler、validator、provenance 和用户 override。
-- 建立 `hokann spec list|show|validate`。
+- 建立 `hokan spec list|show|validate`。
 - 实现 `$PATH` capability cache 和平台 guard。
 - 建立 recipe/slot 到 `TextEdit` 的编译流程。
-- 实现集中 dedupe/ranking 和 `RunCurrent` reducer gate。
+- 实现集中 dedupe/ranking 和激活 reducer（回填 effect；执行只来自无选中的 Enter 透传或显式选中后的提交，High/Unknown 经二次确认）。
 
 ### 5.2 首批规格
 
@@ -128,7 +128,7 @@
 - 标注 required slot、repeatable、平台和风险。
 - direct candidate、prefix、已用 flag、缺参、错误平台均有 golden test。
 - 描述是使用场景，不是照抄难懂的 help 片段。
-- destructive/slow recipe 有准确标记，不能成为 `RunCurrent`。
+- destructive/slow recipe 有准确风险标记；所有候选（含默认项）都只是回填，不会直接执行。
 
 ### 5.3 文件与动态对象
 
@@ -169,7 +169,7 @@
 ### 7.1 工作项
 
 - 实现 deterministic natural-language detector 和 `??` 显式前缀。
-- 实现 `hokann config ai`、env secret 和可选 `0600` credentials 文件。
+- 实现 `hokan config ai`、env secret 和可选 `0600` credentials 文件。
 - 实现最小 AI context builder 和 prompt version。
 - 实现 OpenAI-compatible chat completions client：rustls、timeout、body limit、redirect policy、取消。
 - 实现严格 JSON response parser、command validator 和 risk classifier。
@@ -189,7 +189,7 @@
 
 - 测试 HTTP server 证明：只键入自然语言不会产生请求，激活 AI action 才有一次请求。
 - AI 未配置/失败时 history、spec、files、project 延迟和结果不变。
-- AI 候选不存在任何 `RunCurrent` 构造路径。
+- AI 候选不存在任何直接执行路径（与其他候选一样只能回填）。
 - 默认 payload snapshot 不含 history、环境变量值、完整 CWD、文件内容或 API key。
 - debug/error/panic fixture 中 secret 扫描结果为零。
 
@@ -197,7 +197,7 @@
 
 ### 8.1 产品化
 
-- `hokann doctor` 文本和 JSON 输出。
+- `hokan doctor` 文本和 JSON 输出。
 - 幂等 `init/setup/uninstall --integration-only`，带备份与协议版本检查。
 - 配置 last-known-good、热加载、错误定位和 migration。
 - shell/terminal capability fallback 与用户可读诊断。
@@ -224,12 +224,12 @@
 - 可复现的终端 raw mode/光标恢复失败。
 - 可复现的输入丢失、重排或候选错误执行。
 - 支持矩阵中可复现的空白帧、半帧、cursor jump、prompt 抖动、stale cell 或 overlay 残留。
-- 任一路径存在未恢复的 Hokann-owned BSU、错误结束 child/外层 synchronized update、向未结束 child control sequence 插入 bytes，或提交过期 screen revision/epoch frame。
+- 任一路径存在未恢复的 Hokan-owned BSU、错误结束 child/外层 synchronized update、向未结束 child control sequence 插入 bytes，或提交过期 screen revision/epoch frame。
 - 普通 overlay frame 使用全屏 clear、DECSC/DECRC、alternate screen、最后一列 write 或 clear-before-paint。
 - 除受限 restore 例外外存在第二个 stdout writer，或 overlay pending queue 可超过一帧。
 - AI 在未显式选择时请求网络。
 - secret 进入日志、history store 或 UI error。
-- high/unknown/AI/history candidate 可走 `RunCurrent`。
+- 候选在未经显式选中（且 High/Unknown 未经二次确认）的情况下被执行，或 AI 候选产生任何 shell 执行路径。
 - tmux/SSH/任一承诺 shell 的 P0 核心流程失败。
 - 性能基准较基线回退超过阈值且无批准记录。
 
@@ -353,7 +353,7 @@ SSH transport RTT/吞吐单独记录，不混入本地 compose/provider 指标�
 
 ## 14. 项目级 Definition of Done
 
-Hokann v1 完成不是“列表能显示”，而是同时满足：
+Hokan v1 完成不是“列表能显示”，而是同时满足：
 
 - 原始五项能力从真实按键到真实 shell buffer 全链路可用。
 - 用户能从候选的标签和释义理解它来自哪里、是否完整、风险如何。

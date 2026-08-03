@@ -4,7 +4,7 @@ use crc32fast::Hasher;
 
 use super::{BoundaryId, SafeBoundaryScanner};
 
-const MARKER_PREFIX: &[u8] = b"\x1b]6973;hokann;1;";
+const MARKER_PREFIX: &[u8] = b"\x1b]6973;hokan;1;";
 const MARKER_MAX_BYTES: usize = 256;
 
 #[derive(Clone, Eq, PartialEq)]
@@ -243,7 +243,7 @@ pub fn encode_marker(token: &SessionToken, event: RenderBoundaryEvent) -> Vec<u8
     };
     let checksum = marker_checksum(token, kind);
     format!(
-        "\x1b]6973;hokann;1;{};{kind};{id};{checksum:08x}\x1b\\",
+        "\x1b]6973;hokan;1;{};{kind};{id};{checksum:08x}\x1b\\",
         token.as_str()
     )
     .into_bytes()
@@ -314,7 +314,7 @@ mod tests {
         let mut altered = valid.clone();
         altered[wrong_token] = b'f';
 
-        for bytes in [&altered[..], b"\x1b]6973;hokann;1;broken\x1b\\"] {
+        for bytes in [&altered[..], b"\x1b]6973;hokan;1;broken\x1b\\"] {
             let mut decoder = RenderBoundaryDecoder::new(token());
             let output = decoder.feed(bytes);
             assert_eq!(output.passthrough, bytes);

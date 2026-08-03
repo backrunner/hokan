@@ -320,7 +320,7 @@ mod tests {
     #[test]
     fn synchronized_frame_is_staged_and_paired() {
         let (key, ticket, cursor, view) = fixture();
-        let renderer = OverlaySurfaceRenderer::new(3, SurfaceTheme::default());
+        let renderer = OverlaySurfaceRenderer::new(3, SurfaceTheme::default(), true);
         let size = crate::terminal::TerminalSize::new(24, 80).expect("fixture size is valid");
         let geometry = SurfaceGeometry::new(4, size, 3).expect("fixture geometry is valid");
         let compositor = OverlayCompositor::default();
@@ -348,7 +348,7 @@ mod tests {
     #[test]
     fn fallback_uses_no_transaction_and_commit_is_two_phase() {
         let (key, ticket, cursor, view) = fixture();
-        let renderer = OverlaySurfaceRenderer::new(3, SurfaceTheme::default());
+        let renderer = OverlaySurfaceRenderer::new(3, SurfaceTheme::default(), true);
         let size = crate::terminal::TerminalSize::new(24, 80).expect("fixture size is valid");
         let geometry = SurfaceGeometry::new(4, size, 3).expect("fixture geometry is valid");
         let mut compositor = OverlayCompositor::default();
@@ -399,9 +399,9 @@ mod tests {
     }
 
     #[test]
-    fn external_transaction_is_never_ended_by_hokann() {
+    fn external_transaction_is_never_ended_by_hokan() {
         let (key, ticket, cursor, view) = fixture();
-        let renderer = OverlaySurfaceRenderer::new(3, SurfaceTheme::default());
+        let renderer = OverlaySurfaceRenderer::new(3, SurfaceTheme::default(), true);
         let size = crate::terminal::TerminalSize::new(24, 80).expect("fixture size is valid");
         let geometry = SurfaceGeometry::new(4, size, 3).expect("fixture geometry is valid");
         let buffer = renderer.render(geometry, &view);

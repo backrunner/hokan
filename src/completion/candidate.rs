@@ -7,7 +7,7 @@ use std::{
 use crate::{
     completion::{BufferSnapshot, CompletionContext},
     parser::apply_edit,
-    terminal::{BufferRevision, QueryId, RiskLevel},
+    terminal::{QueryId, RiskLevel},
 };
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -124,13 +124,7 @@ pub struct TextEdit {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CandidateAction {
     Insert,
-    InsertAndContinue {
-        next_slot: SlotKind,
-    },
-    RunCurrent {
-        expected_revision: BufferRevision,
-        expected_hash: u32,
-    },
+    InsertAndContinue { next_slot: SlotKind },
     RequestAi,
     ConfigureAi,
     Retry,
@@ -144,6 +138,29 @@ pub enum Completeness {
     ActionOnly,
 }
 
+/// Additive ranking signals for one candidate. `total()` is
+///
+/// ```text
+/// match_quality + source_trust + spec_priority + cwd_affinity + frecency
+///     + transition + context - risk_penalty - incomplete_penalty - failed_penalty
+/// ```
+///
+/// Signal ranges:
+/// - `match_quality`: 0..=1000 (exact 1000, prefix 900-.., substring 700-..,
+///   subsequence 450, no-match 0; empty query 500) — set centrally by ranking.
+/// - `source_trust`: 0..=300 — set centrally from the candidate source.
+/// - `spec_priority`: 0..=200 — provider-set (command spec / filesystem).
+/// - `cwd_affinity`: 0 or 100 — provider-set (history recorded in this cwd).
+/// - `frecency`: 0..=200 — provider-set (history recency + frequency).
+/// - `transition`: 0..=200 — provider-set bigram boost: how often the
+///   candidate's skeleton followed the previous executed command.
+/// - `context`: 0..=100 (40 per matched workspace rule) — set centrally by
+///   ranking from the detected workspace markers (git, package.json,
+///   Cargo.toml, Makefile, justfile).
+/// - `risk_penalty`: 0..=300, subtracted — set centrally from the risk level.
+/// - `incomplete_penalty`: 0..=80, subtracted — set centrally from completeness.
+/// - `failed_penalty`: 0 or 150, subtracted — provider-set when the history
+///   record's last known run exited non-zero (excluding SIGINT 130).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ScoreSignals {
     pub match_quality: i16,
@@ -151,9 +168,11 @@ pub struct ScoreSignals {
     pub spec_priority: i16,
     pub cwd_affinity: i16,
     pub frecency: i16,
-    pub sequence: i16,
+    pub transition: i16,
+    pub context: i16,
     pub risk_penalty: i16,
     pub incomplete_penalty: i16,
+    pub failed_penalty: i16,
 }
 
 impl ScoreSignals {
@@ -164,9 +183,11 @@ impl ScoreSignals {
             + self.spec_priority as i32
             + self.cwd_affinity as i32
             + self.frecency as i32
-            + self.sequence as i32
+            + self.transition as i32
+            + self.context as i32
             - self.risk_penalty as i32
             - self.incomplete_penalty as i32
+            - self.failed_penalty as i32
     }
 }
 
@@ -233,7 +254,6 @@ impl Candidate {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Activation {
     ReplaceBuffer { text: String, cursor: usize },
-    SubmitCurrent,
     RequestAi,
     ConfigureAi,
     Retry,
@@ -275,26 +295,6 @@ pub fn activate_candidate(
             }
             Ok(Activation::ReplaceBuffer { text, cursor })
         }
-        CandidateAction::RunCurrent {
-            expected_revision,
-            expected_hash,
-        } => {
-            let safe_source = candidate.source == CandidateSource::CommandSpec;
-            let safe_risk = matches!(candidate.risk, RiskLevel::ReadOnly | RiskLevel::Low);
-            if expected_revision == current.revision
-                && expected_hash == current.hash
-                && safe_source
-                && safe_risk
-                && candidate.completeness == Completeness::Runnable
-                && candidate.edit.is_none()
-            {
-                Ok(Activation::SubmitCurrent)
-            } else {
-                Err(crate::Error::Completion(
-                    "direct execution safety gate rejected the candidate".into(),
-                ))
-            }
-        }
         CandidateAction::RequestAi => Ok(Activation::RequestAi),
         CandidateAction::ConfigureAi => Ok(Activation::ConfigureAi),
         CandidateAction::Retry => Ok(Activation::Retry),
@@ -307,10 +307,10 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::{completion::SyncQuality, shell::ShellKind};
+    use crate::{completion::SyncQuality, shell::ShellKind, terminal::BufferRevision};
 
     #[test]
-    fn history_can_insert_but_never_run_current() {
+    fn history_insert_activation_only_replaces_the_buffer() {
         let revision = BufferRevision::new(1);
         let buffer = BufferSnapshot::new("ec", 2, revision, SyncQuality::Exact)
             .expect("buffer should be valid");
@@ -337,6 +337,10 @@ mod tests {
             RiskLevel::Low,
             "history",
         );
+        // Every candidate — including a runnable history entry — activates as a
+        // buffer replacement (edit-back). The runtime decides what happens
+        // next: Tab stops at the fill, Enter on a selection executes runnable
+        // candidates (after confirmation when dangerous).
         assert_eq!(
             activate_candidate(&insert, &context, &buffer).expect("insert should activate"),
             Activation::ReplaceBuffer {
@@ -344,12 +348,5 @@ mod tests {
                 cursor: 7
             }
         );
-        let mut run = insert;
-        run.edit = None;
-        run.action = CandidateAction::RunCurrent {
-            expected_revision: revision,
-            expected_hash: buffer.hash,
-        };
-        assert!(activate_candidate(&run, &context, &buffer).is_err());
     }
 }

@@ -12,7 +12,7 @@ use crate::{app::SessionOptions, shell::ShellKind};
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "hokann",
+    name = "hokan",
     version,
     about = "Shell-aware terminal completion overlay"
 )]
@@ -41,9 +41,12 @@ enum Command {
     Setup {
         #[arg(long)]
         rc_file: Option<PathBuf>,
+        /// Install only an `hk` alias instead of auto-starting Hokan.
+        #[arg(long)]
+        on_demand: bool,
     },
 
-    /// Remove only Hokann's integration block, with a backup.
+    /// Remove only Hokan's integration block, with a backup.
     Uninstall {
         #[arg(long)]
         integration_only: bool,
@@ -51,7 +54,7 @@ enum Command {
         rc_file: Option<PathBuf>,
     },
 
-    /// Inspect whether the current process can host a Hokann terminal session.
+    /// Inspect whether the current process can host a Hokan terminal session.
     Doctor {
         /// Emit a stable JSON object for automation.
         #[arg(long)]
@@ -62,7 +65,7 @@ enum Command {
     #[command(subcommand)]
     Config(ConfigCommand),
 
-    /// Import and maintain Hokann's history store.
+    /// Import and maintain Hokan's history store.
     #[command(subcommand)]
     History(HistoryCommand),
 
@@ -120,7 +123,7 @@ enum HistoryCommand {
     /// Merge duplicate event records into an atomic snapshot.
     Compact,
     Clear {
-        /// Confirm that only Hokann's own history store should be cleared.
+        /// Confirm that only Hokan's own history store should be cleared.
         #[arg(long)]
         yes: bool,
     },
@@ -152,8 +155,8 @@ pub fn run<W: Write>(cli: Cli, output: &mut W) -> crate::Result<Option<SessionOp
             output.write_all(crate::shell::init_script(shell).as_bytes())?;
             Ok(None)
         }
-        Some(Command::Setup { rc_file }) => {
-            integration::setup(output, session.shell, rc_file.as_deref())?;
+        Some(Command::Setup { rc_file, on_demand }) => {
+            integration::setup(output, session.shell, rc_file.as_deref(), on_demand)?;
             Ok(None)
         }
         Some(Command::Uninstall {
@@ -200,7 +203,7 @@ mod tests {
 
     #[test]
     fn no_arguments_starts_a_session() {
-        let cli = Cli::try_parse_from(["hokann"]).expect("CLI should parse");
+        let cli = Cli::try_parse_from(["hokan"]).expect("CLI should parse");
         let mut output = Vec::new();
         let session = run(cli, &mut output)
             .expect("dispatch should succeed")
@@ -211,7 +214,7 @@ mod tests {
 
     #[test]
     fn init_outputs_versioned_shell_code() {
-        let cli = Cli::try_parse_from(["hokann", "init", "zsh"]).expect("CLI should parse");
+        let cli = Cli::try_parse_from(["hokan", "init", "zsh"]).expect("CLI should parse");
         let mut output = Vec::new();
         assert!(run(cli, &mut output).expect("init").is_none());
         let output = String::from_utf8(output).expect("UTF-8 script");
@@ -221,7 +224,7 @@ mod tests {
 
     #[test]
     fn doctor_json_is_machine_readable() {
-        let cli = Cli::try_parse_from(["hokann", "doctor", "--json"]).expect("CLI should parse");
+        let cli = Cli::try_parse_from(["hokan", "doctor", "--json"]).expect("CLI should parse");
         let mut output = Vec::new();
         run(cli, &mut output).expect("doctor should run");
         let value: serde_json::Value = serde_json::from_slice(&output).expect("valid JSON");

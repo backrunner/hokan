@@ -6,25 +6,25 @@ use std::{
 use clap::Parser;
 
 fn main() -> ExitCode {
-    let cli = hokann::cli::Cli::parse();
+    let cli = hokan::cli::Cli::parse();
     let mut output = Vec::new();
-    match hokann::cli::run(cli, &mut output) {
+    match hokan::cli::run(cli, &mut output) {
         Ok(Some(session)) => {
-            match run_with_session_panic_guard(|| hokann::app::run_session(session)) {
+            match run_with_session_panic_guard(|| hokan::app::run_session(session)) {
                 Ok(Ok(code)) => ExitCode::from(code),
                 Ok(Err(error)) => report_session_failure(&error.to_string()),
                 Err(()) => report_session_failure("internal panic during the terminal session"),
             }
         }
-        Ok(None) => match hokann::terminal::write_process_output(&output) {
+        Ok(None) => match hokan::terminal::write_process_output(&output) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
-                eprintln!("hokann: {error}");
+                eprintln!("hokan: {error}");
                 ExitCode::FAILURE
             }
         },
         Err(error) => {
-            eprintln!("hokann: {error}");
+            eprintln!("hokan: {error}");
             ExitCode::FAILURE
         }
     }
@@ -39,8 +39,8 @@ fn run_with_session_panic_guard<T>(operation: impl FnOnce() -> T) -> Result<T, (
 }
 
 fn report_session_failure(message: &str) -> ExitCode {
-    eprintln!("hokann: {message}");
-    eprintln!("hokann: if terminal input or echo is broken, run: stty sane");
+    eprintln!("hokan: {message}");
+    eprintln!("hokan: if terminal input or echo is broken, run: stty sane");
     ExitCode::FAILURE
 }
 

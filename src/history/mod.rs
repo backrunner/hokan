@@ -5,7 +5,9 @@ mod store;
 
 pub use checkpoint::{ImportCheckpoints, ImportSourceState};
 pub use import::{ImportedHistory, default_history_path, parse_history};
-pub use index::{HistoryIndex, HistoryMatch, HistoryPolicy, HistoryRecord};
+pub use index::{
+    HistoryIndex, HistoryMatch, HistoryPolicy, HistoryRecord, command_skeleton, is_failed_exit,
+};
 pub use store::{
     HistoryCompactionReport, HistoryCursor, HistoryDelta, HistoryEventV1, HistoryReadReport,
     HistoryStats, HistoryStore,

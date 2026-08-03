@@ -230,11 +230,11 @@ fn clear(output: &mut dyn Write, store: &HistoryStore, yes: bool) -> crate::Resu
     if existed {
         writeln!(
             output,
-            "moved Hokann history to {}",
+            "moved Hokan history to {}",
             original.with_extension("events.cleared").display()
         )?;
     } else {
-        writeln!(output, "Hokann history is already empty")?;
+        writeln!(output, "Hokan history is already empty")?;
     }
     Ok(())
 }

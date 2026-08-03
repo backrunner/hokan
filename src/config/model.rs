@@ -102,8 +102,10 @@ impl Config {
                 self.version
             )));
         }
-        if !(1..=50).contains(&self.ui.max_rows) {
-            return Err(crate::Error::Config("ui.max_rows must be 1..=50".into()));
+        if !(3..=50).contains(&self.ui.max_rows) {
+            return Err(crate::Error::Config(
+                "ui.max_rows must be 3..=50 (bordered overlay minimum)".into(),
+            ));
         }
         if !(40..=240).contains(&self.ui.max_width) {
             return Err(crate::Error::Config("ui.max_width must be 40..=240".into()));
@@ -230,10 +232,15 @@ pub struct CoreConfig {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct UiConfig {
+    /// Total overlay box height including the two border rows (3..=50).
     pub max_rows: usize,
     pub max_width: usize,
     pub color: String,
-    pub ascii_icons: bool,
+    /// Render the Nerd Font icon column (requires a Nerd Font in the terminal).
+    pub nerd_fonts: bool,
+    /// Removed in favor of `nerd_fonts`; accepted so old configs still load.
+    #[serde(skip_serializing)]
+    pub ascii_icons: Option<bool>,
     pub show_hidden: bool,
 }
 
@@ -280,6 +287,10 @@ impl KeyBinding {
 #[serde(default, deny_unknown_fields)]
 pub struct KeysConfig {
     pub accept: KeyBinding,
+    /// Enter is two-state: with no selection it executes the typed buffer
+    /// as-is (pass-through); with an explicit selection it activates the
+    /// selected candidate — executing runnable ones (after a confirmation
+    /// step when dangerous) and degrading to the Tab fill-back otherwise.
     pub activate: KeyBinding,
     pub up: KeyBinding,
     pub down: KeyBinding,
@@ -339,10 +350,11 @@ impl KeysConfig {
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
-            max_rows: 12,
-            max_width: 100,
+            max_rows: 8,
+            max_width: 76,
             color: "auto".into(),
-            ascii_icons: true,
+            nerd_fonts: true,
+            ascii_icons: None,
             show_hidden: false,
         }
     }
@@ -431,6 +443,29 @@ impl Default for AiConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_ascii_icons_field_is_accepted_and_ignored() {
+        let config: Config = toml::from_str("version = 1\n[ui]\nascii_icons = true\n")
+            .expect("legacy ascii_icons must still parse");
+        assert_eq!(config.ui.ascii_icons, Some(true));
+        assert!(config.ui.nerd_fonts, "nerd_fonts defaults to true");
+        assert_eq!(config.ui.max_rows, 8);
+        assert_eq!(config.ui.max_width, 76);
+        let rendered = toml::to_string(&config).expect("serialize config");
+        assert!(!rendered.contains("ascii_icons"));
+    }
+
+    #[test]
+    fn max_rows_range_requires_room_for_the_bordered_box() {
+        let mut config = Config::default();
+        config.ui.max_rows = 2;
+        assert!(config.validate().is_err());
+        config.ui.max_rows = 3;
+        assert!(config.validate().is_ok());
+        config.ui.max_rows = 51;
+        assert!(config.validate().is_err());
+    }
 
     #[test]
     fn rejects_unknown_fields_and_incomplete_ai() {

@@ -51,7 +51,38 @@ pub struct HistoryRecord {
     pub shell: ShellKind,
     pub last_cwd: Option<PathBuf>,
     pub multiline: bool,
+    /// Exit code of the most recent run with a known exit code; `None` when
+    /// the record came from an import or a shell that reported none.
+    pub last_exit_code: Option<i32>,
     search_key: String,
+}
+
+/// A run counts as failed when its exit code is known, non-zero, and not 130
+/// (SIGINT — the user aborted, which says nothing about the command).
+#[must_use]
+pub fn is_failed_exit(exit_code: Option<i32>) -> bool {
+    exit_code.is_some_and(|code| code != 0 && code != 130)
+}
+
+/// Reduce a command line to its transition skeleton: the first token, plus
+/// the second token when it is a plain lowercase word (a subcommand, not a
+/// flag or path). `git commit -m x` -> `git commit`, `ls -la` -> `ls`.
+#[must_use]
+pub fn command_skeleton(command: &str) -> String {
+    let mut tokens = command.split_whitespace();
+    let Some(first) = tokens.next() else {
+        return String::new();
+    };
+    let first = first.to_lowercase();
+    let Some(second) = tokens.next() else {
+        return first;
+    };
+    let second = second.to_lowercase();
+    if second.len() >= 2 && second.bytes().all(|byte| byte.is_ascii_lowercase()) {
+        format!("{first} {second}")
+    } else {
+        first
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -60,6 +91,7 @@ pub struct HistoryMatch {
     pub quality: i16,
     pub frecency: i16,
     pub cwd_affinity: i16,
+    pub failed_penalty: i16,
 }
 
 struct RankedRecord<'a> {
@@ -72,6 +104,10 @@ struct RankedRecord<'a> {
 #[derive(Clone, Debug, Default)]
 pub struct HistoryIndex {
     records: HashMap<String, HistoryRecord>,
+    /// Bigram of consecutive executed commands per shell stream:
+    /// previous skeleton -> next skeleton -> observed count.
+    transitions: HashMap<String, HashMap<String, u64>>,
+    last_skeleton: HashMap<ShellKind, String>,
 }
 
 impl HistoryIndex {
@@ -81,11 +117,13 @@ impl HistoryIndex {
         timestamp_ms: i64,
         shell: ShellKind,
         cwd: Option<&Path>,
+        exit_code: Option<i32>,
         policy: &HistoryPolicy,
     ) -> bool {
-        self.ingest_weighted(command, timestamp_ms, shell, cwd, 1, policy)
+        self.ingest_weighted(command, timestamp_ms, shell, cwd, 1, exit_code, policy)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn ingest_weighted(
         &mut self,
         command: &str,
@@ -93,6 +131,7 @@ impl HistoryIndex {
         shell: ShellKind,
         cwd: Option<&Path>,
         occurrences: u64,
+        exit_code: Option<i32>,
         policy: &HistoryPolicy,
     ) -> bool {
         if occurrences == 0 {
@@ -101,6 +140,7 @@ impl HistoryIndex {
         if !policy.allows(command) {
             return false;
         }
+        self.record_transition(shell, command);
         let normalized = normalize(command);
         let record = self
             .records
@@ -112,18 +152,59 @@ impl HistoryIndex {
                 shell,
                 last_cwd: cwd.map(Path::to_owned),
                 multiline: command.contains('\n'),
+                last_exit_code: exit_code,
                 search_key: command.trim().to_lowercase(),
             });
-        record.count = record.count.saturating_add(occurrences);
+        // Failed runs refresh recency but do not build frequency: a command
+        // that keeps failing is not a command worth recommending more.
+        if !is_failed_exit(exit_code) {
+            record.count = record.count.saturating_add(occurrences);
+        }
         if timestamp_ms >= record.last_used_ms {
             record.command = command.trim().to_owned();
             record.last_used_ms = timestamp_ms;
             record.shell = shell;
             record.last_cwd = cwd.map(Path::to_owned);
             record.multiline = command.contains('\n');
+            record.last_exit_code = exit_code;
             record.search_key = command.trim().to_lowercase();
         }
         true
+    }
+
+    fn record_transition(&mut self, shell: ShellKind, command: &str) {
+        let skeleton = command_skeleton(command);
+        if skeleton.is_empty() {
+            return;
+        }
+        if let Some(previous) = self.last_skeleton.insert(shell, skeleton.clone()) {
+            *self
+                .transitions
+                .entry(previous)
+                .or_default()
+                .entry(skeleton)
+                .or_insert(0) += 1;
+        }
+    }
+
+    /// Score how strongly `candidate` follows `previous` in the recorded
+    /// command streams: 0 when no bigram is known, otherwise
+    /// count/max_count_for_previous * 200 (capped at 200).
+    #[must_use]
+    pub fn transition_score(&self, previous: &str, candidate: &str) -> i16 {
+        let previous = command_skeleton(previous);
+        let candidate = command_skeleton(candidate);
+        if previous.is_empty() || candidate.is_empty() {
+            return 0;
+        }
+        let Some(successors) = self.transitions.get(&previous) else {
+            return 0;
+        };
+        let Some(&count) = successors.get(&candidate) else {
+            return 0;
+        };
+        let max = successors.values().copied().max().unwrap_or(1).max(1);
+        (count.saturating_mul(200) / max).min(200) as i16
     }
 
     pub fn merge_events_absolute(&mut self, events: &[HistoryEventV1], policy: &HistoryPolicy) {
@@ -135,6 +216,7 @@ impl HistoryIndex {
                 event.shell,
                 event.cwd.as_deref(),
                 event.occurrences,
+                event.exit_code,
                 policy,
             );
         }
@@ -152,6 +234,19 @@ impl HistoryIndex {
                     self.records.insert(normalized, incoming);
                 }
             }
+        }
+        // Transitions are additive, so an absolute merge must rebuild them
+        // from the event stream (chronological per shell) rather than merge,
+        // or replaying the same log would double-count every bigram.
+        let mut ordered: Vec<&HistoryEventV1> = events
+            .iter()
+            .filter(|event| policy.allows(&event.command))
+            .collect();
+        ordered.sort_by_key(|event| event.timestamp_ms);
+        self.transitions.clear();
+        self.last_skeleton.clear();
+        for event in ordered {
+            self.record_transition(event.shell, &event.command);
         }
     }
 
@@ -197,6 +292,11 @@ impl HistoryIndex {
                 quality: ranked.quality,
                 frecency: ranked.frecency,
                 cwd_affinity: ranked.cwd_affinity,
+                failed_penalty: if is_failed_exit(ranked.record.last_exit_code) {
+                    150
+                } else {
+                    0
+                },
             })
             .collect()
     }
@@ -276,6 +376,7 @@ mod tests {
             100,
             ShellKind::Zsh,
             Some(Path::new("/a")),
+            Some(0),
             &policy
         ));
         assert!(index.ingest(
@@ -283,16 +384,24 @@ mod tests {
             200,
             ShellKind::Bash,
             Some(Path::new("/a")),
+            Some(0),
             &policy
         ));
-        assert!(!index.ingest("curl --token secret", 300, ShellKind::Zsh, None, &policy));
+        assert!(!index.ingest(
+            "curl --token secret",
+            300,
+            ShellKind::Zsh,
+            None,
+            None,
+            &policy
+        ));
         for sensitive in [
             "PASSWORD=secret command",
             "export ACCESS_TOKEN=secret",
             "tool --header 'Cookie: session=secret'",
             "curl https://user:secret@example.test/path",
         ] {
-            assert!(!index.ingest(sensitive, 300, ShellKind::Zsh, None, &policy));
+            assert!(!index.ingest(sensitive, 300, ShellKind::Zsh, None, None, &policy));
         }
         assert_eq!(index.len(), 1);
         let matches = index.search("git", Path::new("/a"), 300, 10);
@@ -301,10 +410,189 @@ mod tests {
     }
 
     #[test]
+    fn failed_runs_refresh_recency_without_building_frequency() {
+        let policy = HistoryPolicy::new(1024, &[]).expect("policy");
+        let mut index = HistoryIndex::default();
+        let cwd = Path::new("/a");
+        index.ingest(
+            "make deploy",
+            100,
+            ShellKind::Zsh,
+            Some(cwd),
+            Some(0),
+            &policy,
+        );
+        index.ingest(
+            "make deploy",
+            200,
+            ShellKind::Zsh,
+            Some(cwd),
+            Some(0),
+            &policy,
+        );
+        index.ingest(
+            "make deploy",
+            300,
+            ShellKind::Zsh,
+            Some(cwd),
+            Some(1),
+            &policy,
+        );
+        let matched = index.search("make", cwd, 300, 1).pop().expect("match");
+        assert_eq!(matched.record.count, 2, "failure must not bump count");
+        assert_eq!(
+            matched.record.last_used_ms, 300,
+            "failure refreshes recency"
+        );
+        assert_eq!(matched.record.last_exit_code, Some(1));
+        assert_eq!(matched.failed_penalty, 150);
+
+        // A later success clears the penalty and resumes counting.
+        index.ingest(
+            "make deploy",
+            400,
+            ShellKind::Zsh,
+            Some(cwd),
+            Some(0),
+            &policy,
+        );
+        let matched = index.search("make", cwd, 400, 1).pop().expect("match");
+        assert_eq!(matched.record.count, 3);
+        assert_eq!(matched.record.last_exit_code, Some(0));
+        assert_eq!(matched.failed_penalty, 0);
+    }
+
+    #[test]
+    fn sigint_and_unknown_exit_codes_are_not_failures() {
+        let policy = HistoryPolicy::new(1024, &[]).expect("policy");
+        let mut index = HistoryIndex::default();
+        index.ingest("make build", 100, ShellKind::Zsh, None, Some(130), &policy);
+        index.ingest("make clean", 100, ShellKind::Zsh, None, None, &policy);
+        let build = index
+            .search("make build", Path::new("/"), 100, 1)
+            .pop()
+            .expect("build");
+        assert_eq!(build.record.count, 1, "SIGINT still counts as a run");
+        assert_eq!(build.record.last_exit_code, Some(130));
+        assert_eq!(build.failed_penalty, 0);
+        let clean = index
+            .search("make clean", Path::new("/"), 100, 1)
+            .pop()
+            .expect("clean");
+        assert_eq!(clean.record.count, 1, "imports count normally");
+        assert_eq!(clean.record.last_exit_code, None);
+        assert_eq!(clean.failed_penalty, 0);
+    }
+
+    #[test]
+    fn skeletons_keep_plain_word_subcommands_only() {
+        assert_eq!(command_skeleton("git commit -m x"), "git commit");
+        assert_eq!(command_skeleton("git commit"), "git commit");
+        assert_eq!(command_skeleton("Git COMMIT --amend"), "git commit");
+        assert_eq!(command_skeleton("ls -la"), "ls");
+        assert_eq!(command_skeleton("ls /tmp"), "ls");
+        assert_eq!(command_skeleton("npm run dev"), "npm run");
+        assert_eq!(command_skeleton("cargo build"), "cargo build");
+        assert_eq!(
+            command_skeleton("git x"),
+            "git",
+            "one-letter words are not subcommands"
+        );
+        assert_eq!(command_skeleton("gst"), "gst");
+        assert_eq!(command_skeleton("./script.sh run"), "./script.sh run");
+        assert_eq!(command_skeleton("   "), "");
+    }
+
+    #[test]
+    fn transitions_score_known_successors_in_proportion() {
+        let policy = HistoryPolicy::new(1024, &[]).expect("policy");
+        let mut index = HistoryIndex::default();
+        for round in 0..2 {
+            let base = 100 + round * 10;
+            index.ingest("git add x", base, ShellKind::Zsh, None, Some(0), &policy);
+            index.ingest(
+                "git commit -m y",
+                base + 1,
+                ShellKind::Zsh,
+                None,
+                Some(0),
+                &policy,
+            );
+        }
+        index.ingest("git add x", 200, ShellKind::Zsh, None, Some(0), &policy);
+        index.ingest(
+            "git checkout z",
+            201,
+            ShellKind::Zsh,
+            None,
+            Some(0),
+            &policy,
+        );
+
+        assert_eq!(index.transition_score("git add x", "git commit -m a"), 200);
+        assert_eq!(index.transition_score("git add .", "git checkout z"), 100);
+        assert_eq!(
+            index.transition_score("ls", "git commit"),
+            0,
+            "unknown previous"
+        );
+        assert_eq!(
+            index.transition_score("git add x", "git push"),
+            0,
+            "not a successor"
+        );
+        assert!(
+            index.transition_score("git add x", "git commit") <= 200,
+            "cap respected"
+        );
+    }
+
+    #[test]
+    fn transitions_are_tracked_per_shell_and_rebuilt_on_absolute_merge() {
+        let policy = HistoryPolicy::new(1024, &[]).expect("policy");
+        let event = |timestamp_ms, command: &str, shell| HistoryEventV1 {
+            event_id: None,
+            timestamp_ms,
+            command: command.into(),
+            cwd: None,
+            shell,
+            exit_code: Some(0),
+            imported: false,
+            occurrences: 1,
+        };
+        let mut index = HistoryIndex::default();
+        index.merge_events_absolute(
+            &[
+                // Deliberately unordered input: ordering comes from timestamps.
+                event(30, "git push", ShellKind::Zsh),
+                event(10, "git add x", ShellKind::Zsh),
+                event(20, "git commit -m y", ShellKind::Zsh),
+                // Interleaved bash stream must not pollute the zsh bigram.
+                event(15, "make build", ShellKind::Bash),
+            ],
+            &policy,
+        );
+        assert_eq!(index.transition_score("git add x", "git commit"), 200);
+        assert_eq!(index.transition_score("git commit", "git push"), 200);
+        assert_eq!(index.transition_score("git add x", "make build"), 0);
+
+        // A second absolute merge rebuilds rather than double-counting.
+        index.merge_events_absolute(
+            &[
+                event(10, "git add x", ShellKind::Zsh),
+                event(20, "git commit -m y", ShellKind::Zsh),
+            ],
+            &policy,
+        );
+        assert_eq!(index.transition_score("git add x", "git commit"), 200);
+        assert_eq!(index.transition_score("git commit", "git push"), 0);
+    }
+
+    #[test]
     fn absolute_merge_does_not_double_compacted_counts() {
         let policy = HistoryPolicy::new(1024, &[]).expect("policy");
         let mut index = HistoryIndex::default();
-        index.ingest_weighted("git status", 100, ShellKind::Zsh, None, 3, &policy);
+        index.ingest_weighted("git status", 100, ShellKind::Zsh, None, 3, Some(0), &policy);
         let event = HistoryEventV1 {
             event_id: None,
             timestamp_ms: 100,
@@ -331,6 +619,7 @@ mod tests {
                 &format!("git project-{number} status"),
                 number,
                 ShellKind::Zsh,
+                None,
                 None,
                 &policy,
             );

@@ -65,15 +65,20 @@ impl CandidateProvider for CommandSpecProvider {
         let exact_current = active_text(context).trim() == command_name;
         let mut candidates = Vec::new();
         if exact_current && command.default == "run_current" {
+            // The spec default "run_current" no longer executes anything: it is
+            // surfaced as an ordinary fill-back candidate for the bare command.
+            // Enter always submits the buffer exactly as typed; only Tab
+            // performs this edit-back.
             let mut direct = Candidate::new(
                 context.query_id,
                 command_name,
-                format!("直接运行：{}", command.description),
-                None,
-                CandidateAction::RunCurrent {
-                    expected_revision: context.buffer.revision,
-                    expected_hash: context.buffer.hash,
-                },
+                command.description.clone(),
+                Some(TextEdit {
+                    range: active_edit_range(context),
+                    replacement: command_name.to_owned(),
+                    cursor_after: CursorPlacement::End,
+                }),
+                CandidateAction::Insert,
                 CandidateSource::CommandSpec,
                 CandidateKind::Command,
                 Completeness::Runnable,
@@ -217,12 +222,20 @@ mod tests {
         let mut engine = CompletionEngine::new(100, 12);
         engine.register(CommandSpecProvider::new(specs, commands));
 
+        // The `run_current` spec default duplicates the typed buffer, so it is
+        // filtered out: no candidate may rewrite the buffer to itself. The
+        // remaining first candidate is an ordinary fill-back (Insert) row.
         for command in ["ls", "df", "lsof", "ifconfig", "ps"] {
             let output = engine.complete(&context(command));
-            assert!(matches!(
-                output.candidates[0].action,
-                CandidateAction::RunCurrent { .. }
-            ));
+            assert!(
+                !output
+                    .candidates
+                    .iter()
+                    .any(|candidate| candidate.display.primary == command),
+                "buffer-identical bare command was listed for {command}"
+            );
+            let first = &output.candidates[0];
+            assert!(matches!(first.action, CandidateAction::Insert));
         }
 
         let tar = context("tar");

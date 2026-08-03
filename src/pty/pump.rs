@@ -32,7 +32,7 @@ impl PtyReadPump {
         let (cancel, cancel_reader) = UnixStream::pair()?;
         let cancel_descriptor = cancel_reader.as_raw_fd();
         let join = thread::Builder::new()
-            .name("hokann-pty-read".into())
+            .name("hokan-pty-read".into())
             .spawn(move || {
                 let _cancel_reader = cancel_reader;
                 let mut batch_reader = NonblockingBatchReader::default();

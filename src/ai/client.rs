@@ -214,7 +214,7 @@ impl std::fmt::Display for AiClientError {
             Self::Configuration => "AI endpoint or client configuration is invalid",
             Self::MissingCredential => "AI credential environment variable is not set",
             Self::CredentialRejected => {
-                "AI credential file was rejected; run `hokann config ai` for diagnostics"
+                "AI credential file was rejected; run `hokan config ai` for diagnostics"
             }
             Self::Unauthorized => "AI endpoint rejected the credential",
             Self::RateLimited => "AI endpoint rate limit was reached",

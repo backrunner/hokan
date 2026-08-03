@@ -134,11 +134,13 @@ impl OutputHandle {
         max_height: u16,
         max_width: u16,
         color: bool,
+        nerd_fonts: bool,
     ) -> Result<(), OutputError> {
         self.mailbox.push_control(ControlCommand::ConfigureOverlay {
             max_height,
             max_width,
             color,
+            nerd_fonts,
         })
     }
 
@@ -224,6 +226,7 @@ enum ControlCommand {
         max_height: u16,
         max_width: u16,
         color: bool,
+        nerd_fonts: bool,
     },
     SetForeground(bool),
     Probe(Vec<u8>),
@@ -464,6 +467,7 @@ pub struct OutputActor<W: Write> {
     compositor: OverlayCompositor,
     renderer: OverlaySurfaceRenderer,
     surface_theme: SurfaceTheme,
+    nerd_fonts: bool,
     max_overlay_height: u16,
     max_overlay_width: u16,
     capability: SyncOutputCapability,
@@ -504,8 +508,9 @@ impl<W: Write> OutputActor<W> {
             scanner: SafeBoundaryScanner::default(),
             model: TerminalModel::new(size),
             compositor: OverlayCompositor::default(),
-            renderer: OverlaySurfaceRenderer::new(current_height, surface_theme),
+            renderer: OverlaySurfaceRenderer::new(current_height, surface_theme, true),
             surface_theme,
+            nerd_fonts: true,
             max_overlay_height: overlay_height.max(1),
             max_overlay_width: u16::MAX,
             capability: SyncOutputCapability::UnsupportedFallback,
@@ -612,7 +617,8 @@ impl<W: Write> OutputActor<W> {
                     .max_overlay_height
                     .min(size.rows.saturating_sub(1))
                     .max(1);
-                self.renderer = OverlaySurfaceRenderer::new(height, self.surface_theme);
+                self.renderer =
+                    OverlaySurfaceRenderer::new(height, self.surface_theme, self.nerd_fonts);
                 self.compositor.invalidate();
                 self.latest_frame = None;
                 self.readiness = RenderReadiness::Unknown;
@@ -623,6 +629,7 @@ impl<W: Write> OutputActor<W> {
                 max_height,
                 max_width,
                 color,
+                nerd_fonts,
             } => {
                 self.hide_overlay()?;
                 self.max_overlay_height = max_height.max(1);
@@ -632,11 +639,13 @@ impl<W: Write> OutputActor<W> {
                 } else {
                     SurfaceTheme::plain()
                 };
+                self.nerd_fonts = nerd_fonts;
                 let height = self
                     .max_overlay_height
                     .min(self.size.rows.saturating_sub(1))
                     .max(1);
-                self.renderer = OverlaySurfaceRenderer::new(height, self.surface_theme);
+                self.renderer =
+                    OverlaySurfaceRenderer::new(height, self.surface_theme, self.nerd_fonts);
                 self.compositor.invalidate();
                 self.latest_frame = None;
             }
@@ -770,14 +779,21 @@ impl<W: Write> OutputActor<W> {
                 b"\x1b[?25l"
             });
             self.guard.write_control(&bytes)?;
-            self.model.apply_hokann_frame(&bytes);
+            self.model.apply_hokan_frame(&bytes);
             self.compositor.invalidate();
         }
 
-        let origin = self.model.cursor().row.saturating_add(1);
-        SurfaceGeometry::new_with_width(origin, self.size, height, self.max_overlay_width)
-            .map(Some)
-            .map_err(OutputError::Terminal)
+        let cursor = self.model.cursor();
+        let origin = cursor.row.saturating_add(1);
+        SurfaceGeometry::new_anchored(
+            cursor.col,
+            origin,
+            self.size,
+            height,
+            self.max_overlay_width,
+        )
+        .map(Some)
+        .map_err(OutputError::Terminal)
     }
 
     fn arm_gate(&mut self, request: RenderGateRequest) {
@@ -983,7 +999,7 @@ impl<W: Write> OutputActor<W> {
             self.capability,
         )?;
         self.guard.write_staged(prepared.staged())?;
-        self.model.apply_hokann_frame(&prepared.staged().bytes);
+        self.model.apply_hokan_frame(&prepared.staged().bytes);
         self.compositor.commit(prepared)?;
         self.last_committed_ticket = Some(frame.ticket);
         self.report.committed_frames = self.report.committed_frames.saturating_add(1);
@@ -1021,7 +1037,7 @@ impl<W: Write> OutputActor<W> {
             self.capability,
         )?;
         self.guard.write_staged(prepared.staged())?;
-        self.model.apply_hokann_frame(&prepared.staged().bytes);
+        self.model.apply_hokan_frame(&prepared.staged().bytes);
         self.compositor.commit(prepared)?;
         Ok(())
     }
@@ -1046,7 +1062,7 @@ impl<W: Write> OutputActor<W> {
             .max_overlay_height
             .min(size.rows.saturating_sub(1))
             .max(1);
-        self.renderer = OverlaySurfaceRenderer::new(height, self.surface_theme);
+        self.renderer = OverlaySurfaceRenderer::new(height, self.surface_theme, self.nerd_fonts);
         self.model
             .resize(size)
             .map_err(|error| io::Error::other(error.to_string()))?;
@@ -1078,7 +1094,7 @@ where
 {
     let handle = actor.handle();
     let join = thread::Builder::new()
-        .name("hokann-output".into())
+        .name("hokan-output".into())
         .spawn(move || actor.run())?;
     Ok((handle, join))
 }
@@ -1183,6 +1199,7 @@ mod tests {
                 max_height: 5,
                 max_width: 60,
                 color: false,
+                nerd_fonts: true,
             })
             .expect("configure overlay");
         assert_eq!(actor.max_overlay_height, 5);
@@ -1407,7 +1424,7 @@ mod tests {
         let size = TerminalSize::new(24, 80).expect("fixture terminal size is valid");
         let (handle, join) = spawn_with_writer(Vec::new(), token(), size, 3)
             .expect("output actor thread should spawn");
-        let partial = b"visible\x1b]6973;hokann;1;";
+        let partial = b"visible\x1b]6973;hokan;1;";
         handle
             .child_output(ChildOutputBatch {
                 read_cycle: 1,

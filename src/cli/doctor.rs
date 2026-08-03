@@ -18,6 +18,7 @@ use crate::{
 #[serde(rename_all = "kebab-case")]
 enum CheckLevel {
     Ok,
+    Warn,
     Error,
     NotApplicable,
 }
@@ -26,6 +27,7 @@ impl CheckLevel {
     const fn label(self) -> &'static str {
         match self {
             Self::Ok => "ok",
+            Self::Warn => "warn",
             Self::Error => "error",
             Self::NotApplicable => "n/a",
         }
@@ -58,7 +60,7 @@ struct ShellIntegrationReport {
 
 #[derive(Debug, Serialize)]
 struct DoctorReport {
-    hokann_version: &'static str,
+    hokan_version: &'static str,
     protocol_version: u8,
     os: &'static str,
     architecture: &'static str,
@@ -77,6 +79,8 @@ struct DoctorReport {
     debug_logging: Check,
     ai: Check,
     shell_integration: ShellIntegrationReport,
+    zsh_setup_mode: Check,
+    zsh_plugin_conflicts: Vec<Check>,
 }
 
 pub fn write_report(output: &mut dyn Write, json: bool) -> crate::Result<()> {
@@ -89,8 +93,8 @@ pub fn write_report(output: &mut dyn Write, json: bool) -> crate::Result<()> {
 
     writeln!(
         output,
-        "Hokann {} (protocol v{})",
-        report.hokann_version, report.protocol_version
+        "Hokan {} (protocol v{})",
+        report.hokan_version, report.protocol_version
     )?;
     writeln!(output, "platform: {} / {}", report.os, report.architecture)?;
     writeln!(
@@ -154,6 +158,10 @@ pub fn write_report(output: &mut dyn Write, json: bool) -> crate::Result<()> {
         "control channel",
         &report.shell_integration.control_channel,
     )?;
+    write_check(output, "zsh setup mode", &report.zsh_setup_mode)?;
+    for check in &report.zsh_plugin_conflicts {
+        write_check(output, "zsh plugin conflicts", check)?;
+    }
     Ok(())
 }
 
@@ -179,8 +187,9 @@ fn collect() -> DoctorReport {
     let debug_logging = inspect_debug_logging(config.as_ref(), paths.as_ref());
     let ai = inspect_ai(config.as_ref(), paths.as_ref());
     let shell_integration = inspect_shell_integration();
+    let (zsh_setup_mode, zsh_plugin_conflicts) = inspect_zsh_rc_files();
     DoctorReport {
-        hokann_version: env!("CARGO_PKG_VERSION"),
+        hokan_version: env!("CARGO_PKG_VERSION"),
         protocol_version: PROTOCOL_VERSION,
         os: env::consts::OS,
         architecture: env::consts::ARCH,
@@ -202,6 +211,8 @@ fn collect() -> DoctorReport {
         debug_logging,
         ai,
         shell_integration,
+        zsh_setup_mode,
+        zsh_plugin_conflicts,
         shells,
         shell_capabilities,
     }
@@ -380,12 +391,12 @@ fn inspect_debug_logging(config: Option<&Config>, paths: Option<&ConfigPaths>) -
 }
 
 fn inspect_shell_integration() -> ShellIntegrationReport {
-    let active = env::var_os("HOKANN_ACTIVE").is_some();
+    let active = env::var_os("HOKAN_ACTIVE").is_some();
     if !active {
         let inactive = || {
             Check::new(
                 CheckLevel::NotApplicable,
-                "not inside a running Hokann child shell",
+                "not inside a running Hokan child shell",
             )
         };
         return ShellIntegrationReport {
@@ -397,12 +408,12 @@ fn inspect_shell_integration() -> ShellIntegrationReport {
         };
     }
 
-    let hook = if env::var_os("HOKANN_SESSION_TOKEN").is_some() {
+    let hook = if env::var_os("HOKAN_SESSION_TOKEN").is_some() {
         Check::new(CheckLevel::Ok, "session marker and token are present")
     } else {
-        Check::new(CheckLevel::Error, "HOKANN_SESSION_TOKEN is missing")
+        Check::new(CheckLevel::Error, "HOKAN_SESSION_TOKEN is missing")
     };
-    let protocol = match env::var("HOKANN_PROTOCOL_VERSION") {
+    let protocol = match env::var("HOKAN_PROTOCOL_VERSION") {
         Ok(value) if value == PROTOCOL_VERSION.to_string() => {
             Check::new(CheckLevel::Ok, format!("protocol v{PROTOCOL_VERSION}"))
         }
@@ -410,18 +421,18 @@ fn inspect_shell_integration() -> ShellIntegrationReport {
             CheckLevel::Error,
             format!("hook protocol {value:?} does not match v{PROTOCOL_VERSION}"),
         ),
-        Err(_) => Check::new(CheckLevel::Error, "HOKANN_PROTOCOL_VERSION is missing"),
+        Err(_) => Check::new(CheckLevel::Error, "HOKAN_PROTOCOL_VERSION is missing"),
     };
-    let session_path = env::var_os("HOKANN_SESSION_DIR").map(PathBuf::from);
+    let session_path = env::var_os("HOKAN_SESSION_DIR").map(PathBuf::from);
     let session_directory = session_path.as_ref().map_or_else(
-        || Check::new(CheckLevel::Error, "HOKANN_SESSION_DIR is missing"),
+        || Check::new(CheckLevel::Error, "HOKAN_SESSION_DIR is missing"),
         |path| inspect_directory(path, DirectoryPolicy::Private),
     );
     let control_channel = match (
         session_path.as_deref(),
-        env::var_os("HOKANN_CONTROL_FIFO").map(PathBuf::from),
+        env::var_os("HOKAN_CONTROL_FIFO").map(PathBuf::from),
     ) {
-        (_, None) => Check::new(CheckLevel::Error, "HOKANN_CONTROL_FIFO is missing"),
+        (_, None) => Check::new(CheckLevel::Error, "HOKAN_CONTROL_FIFO is missing"),
         (session, Some(path)) => inspect_control_channel(session, &path),
     };
     ShellIntegrationReport {
@@ -433,6 +444,132 @@ fn inspect_shell_integration() -> ShellIntegrationReport {
     }
 }
 
+/// Read the user's zsh rc files ($ZDOTDIR or $HOME: `.zshenv`, `.zshrc`) and
+/// report the installed setup mode plus any known-conflicting plugin
+/// integrations. Never fails: unreadable files degrade to an info note.
+fn inspect_zsh_rc_files() -> (Check, Vec<Check>) {
+    // An empty ZDOTDIR is treated as unset, matching zsh's behavior.
+    let base = env::var_os("ZDOTDIR")
+        .filter(|value| !value.is_empty())
+        .or_else(|| env::var_os("HOME"))
+        .map(PathBuf::from);
+    let Some(base) = base else {
+        return (
+            Check::new(
+                CheckLevel::NotApplicable,
+                "neither $ZDOTDIR nor $HOME is set",
+            ),
+            vec![Check::new(
+                CheckLevel::NotApplicable,
+                "cannot locate zsh rc files",
+            )],
+        );
+    };
+    let mut setup_mode = Check::new(
+        CheckLevel::NotApplicable,
+        "no Hokan integration block in .zshrc",
+    );
+    let mut conflicts = Vec::new();
+    let mut saw_file = false;
+    for name in [".zshenv", ".zshrc"] {
+        let path = base.join(name);
+        let contents = match fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                conflicts.push(Check::new(
+                    CheckLevel::NotApplicable,
+                    format!("{}: cannot read ({error}); skipped", path.display()),
+                ));
+                continue;
+            }
+        };
+        saw_file = true;
+        if name == ".zshrc"
+            && let Some(mode) = detect_setup_mode(&contents)
+        {
+            setup_mode = Check::new(CheckLevel::Ok, format!("{mode} in {}", path.display()));
+        }
+        conflicts.extend(scan_plugin_conflicts(&path, &contents));
+    }
+    if conflicts.is_empty() {
+        let detail = if saw_file {
+            "no known plugin conflicts in zsh rc files"
+        } else {
+            "no zsh rc files found"
+        };
+        conflicts.push(Check::new(CheckLevel::Ok, detail));
+    }
+    (setup_mode, conflicts)
+}
+
+/// Classify the managed integration block as auto-start or on-demand.
+fn detect_setup_mode(contents: &str) -> Option<&'static str> {
+    let start = contents.find(super::integration::START)?;
+    let end = contents.find(super::integration::END)?;
+    if end < start {
+        return None;
+    }
+    let block = &contents[start..end];
+    if block.contains("alias hk=") {
+        Some("on-demand (`hk` alias)")
+    } else if block.contains("exec \"$__hokan_bin\"") {
+        Some("auto-start (exec)")
+    } else {
+        None
+    }
+}
+
+/// Scan rc file contents for plugin integrations known to conflict with
+/// Hokan's overlay. Comment lines and lines already guarded with
+/// `HOKAN_ACTIVE` are ignored; each plugin is reported once.
+fn scan_plugin_conflicts(path: &Path, contents: &str) -> Vec<Check> {
+    let mut found: Vec<(&'static str, usize)> = Vec::new();
+    for (index, line) in contents.lines().enumerate() {
+        let line = line.trim_start();
+        if line.starts_with('#') || line.contains("HOKAN_ACTIVE") {
+            continue;
+        }
+        if let Some(plugin) = plugin_for_line(line)
+            && !found.iter().any(|(name, _)| *name == plugin)
+        {
+            found.push((plugin, index + 1));
+        }
+    }
+    found
+        .into_iter()
+        .map(|(plugin, line)| {
+            Check::new(
+                CheckLevel::Warn,
+                format!(
+                    "{plugin} detected at {}:{line}; guard it with `[[ -z $HOKAN_ACTIVE ]] && <plugin init line>` so it stays active in normal shells but inactive inside Hokan, or switch to on-demand mode (`hokan setup --shell zsh --on-demand`)",
+                    path.display()
+                ),
+            )
+        })
+        .collect()
+}
+
+fn plugin_for_line(line: &str) -> Option<&'static str> {
+    if line.contains("zsh-autosuggestions") {
+        Some("zsh-autosuggestions")
+    } else if line.contains("zsh-autocomplete") {
+        Some("zsh-autocomplete")
+    } else if line.contains("zsh-vi-mode") {
+        Some("zsh-vi-mode")
+    } else if line.contains("atuin init") {
+        Some("atuin")
+    } else if line.contains("fzf")
+        && ["--zsh", ".fzf.zsh", "/shell/", "key-bindings", "completion"]
+            .iter()
+            .any(|needle| line.contains(needle))
+    {
+        Some("fzf shell integration")
+    } else {
+        None
+    }
+}
+
 #[cfg(unix)]
 fn inspect_control_channel(session: Option<&Path>, path: &Path) -> Check {
     use std::os::unix::fs::FileTypeExt;
@@ -440,7 +577,7 @@ fn inspect_control_channel(session: Option<&Path>, path: &Path) -> Check {
     if session.is_none_or(|session| path.parent() != Some(session)) {
         return Check::new(
             CheckLevel::Error,
-            "control FIFO is outside HOKANN_SESSION_DIR",
+            "control FIFO is outside HOKAN_SESSION_DIR",
         );
     }
     match fs::symlink_metadata(path) {
@@ -573,5 +710,73 @@ mod tests {
         assert_eq!(enabled.level, CheckLevel::Ok);
         assert!(enabled.detail.contains("1048576 bytes per file"));
         assert!(enabled.detail.contains("exclude query text"));
+    }
+
+    #[test]
+    fn plugin_scan_flags_known_conflicts_once_each() {
+        let path = Path::new("/home/user/.zshrc");
+        let contents = "\
+# a comment mentioning zsh-autosuggestions is ignored
+source ~/.oh-my-zsh/custom/plugins/zsh-autosuggestions/zsh-autosuggestions.zsh
+source /opt/homebrew/share/zsh-autocomplete/zsh-autocomplete.plugin.zsh
+eval \"$(atuin init zsh)\"
+eval \"$(fzf --zsh)\"
+source ~/.fzf.zsh
+source ~/plugins/zsh-vi-mode/zsh-vi-mode.plugin.zsh
+alias fz=fzf
+";
+        let checks = scan_plugin_conflicts(path, contents);
+        assert_eq!(checks.len(), 5);
+        assert!(checks.iter().all(|check| check.level == CheckLevel::Warn));
+        for expected in [
+            "zsh-autosuggestions",
+            "zsh-autocomplete",
+            "atuin",
+            "fzf shell integration",
+            "zsh-vi-mode",
+        ] {
+            assert!(
+                checks.iter().any(|check| check.detail.contains(expected)),
+                "missing warning for {expected}"
+            );
+        }
+        assert!(
+            checks
+                .iter()
+                .all(|check| check.detail.contains("HOKAN_ACTIVE")
+                    && check.detail.contains("--on-demand"))
+        );
+    }
+
+    #[test]
+    fn plugin_scan_ignores_guarded_lines_comments_and_clean_files() {
+        let path = Path::new("/home/user/.zshrc");
+        let guarded = "\
+[[ -z $HOKAN_ACTIVE ]] && source ~/.zsh/zsh-autosuggestions/zsh-autosuggestions.zsh
+# eval \"$(atuin init zsh)\"
+export EDITOR=vim
+";
+        assert!(scan_plugin_conflicts(path, guarded).is_empty());
+        assert!(scan_plugin_conflicts(path, "export EDITOR=vim\n").is_empty());
+    }
+
+    #[test]
+    fn detect_setup_mode_classifies_managed_blocks() {
+        let auto_exec = format!(
+            "{}\n# protocol 2\nexec \"$__hokan_bin\" --shell zsh\n{}\n",
+            crate::cli::integration::START,
+            crate::cli::integration::END
+        );
+        assert_eq!(detect_setup_mode(&auto_exec), Some("auto-start (exec)"));
+        let on_demand = format!(
+            "{}\n# protocol 2 (on-demand)\nalias hk='/usr/local/bin/hokan --shell zsh'\n{}\n",
+            crate::cli::integration::START,
+            crate::cli::integration::END
+        );
+        assert_eq!(
+            detect_setup_mode(&on_demand),
+            Some("on-demand (`hk` alias)")
+        );
+        assert_eq!(detect_setup_mode("export EDITOR=vim\n"), None);
     }
 }

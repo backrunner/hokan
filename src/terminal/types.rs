@@ -167,7 +167,7 @@ pub enum SyncOwnership {
     #[default]
     None,
     External,
-    MayBeOpenByHokann,
+    MayBeOpenByHokan,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -1,4 +1,4 @@
-# Hokann v0.1 实现与验收状态
+# Hokan v0.1 实现与验收状态
 
 更新日期：2026-08-02。
 
@@ -12,14 +12,14 @@ candidate，不是已认证 beta：Fish、SSH、tmux 3.7+、Linux 实机和六�
 2026-08-02 的发布前复核又完成了以下加固：output actor 在 I/O/compositor 错误或 panic
 后会封闭 mailbox 并释放同步等待者；PTY child 的异常路径会关闭 writer、终止并回收子
 shell；zsh adapter 能跟随动态 `precmd` prompt 和用户 `.zshenv` 改写的 `ZDOTDIR`；setup
-块固定安装二进制路径，同时在 Hokann 子 shell 中优先使用当前 `HOKANN_BIN`。
+块固定安装二进制路径，同时在 Hokan 子 shell 中优先使用当前 `HOKAN_BIN`。
 
 同日最终 review 进一步完成：control channel 改为可取消的阻塞 poll，provider panic 被
 隔离，候选在排序和激活两处验证 edit/控制字符，history 满 256 MiB 时在写入前 compact，
 IPC/edit/config/backup 的特殊文件和容量边界均有回归测试。shell control protocol 升级为
 v2，以 `START`/`END` phase 配对保留含 Tab 的命令与 CWD；真实 zsh/bash PTY 已覆盖该路径。
-zsh setup 块固定在 `.zshrc` 顶部，外层在用户配置加载前进入 Hokann，用户 rc 只执行一次；
-`HOKANN_AUTO_START=0` 可临时旁路。
+zsh setup 块固定在 `.zshrc` 顶部，外层在用户配置加载前进入 Hokan，用户 rc 只执行一次；
+`HOKAN_AUTO_START=0` 可临时旁路。
 
 ## 功能闭环
 
@@ -57,7 +57,9 @@ zsh setup 块固定在 `.zshrc` 顶部，外层在用户配置加载前进入 Ho
 - 风险分类覆盖递归/强制删除、`find -delete/-exec`、递归 chmod/chown、download-to-shell、
   `dd`/redirect 写设备、mkfs、shred/truncate、signal、shell `-c`、命令替换和进程替换；
   不能证明安全的嵌套执行语法统一为 `Unknown`。
-- AI/history/high/unknown 候选没有 `RunCurrent` 路径；AI key 使用 zeroize、环境变量引用或
+- AI 候选只触发 action 或回填，永不作为命令执行；history/high/unknown 候选可经显式选中执行，
+  High/Unknown 必须先通过二次确认（`Enter` 确认、`Esc` 取消）；亲手输入的命令永不触发确认。
+  AI key 使用 zeroize、环境变量引用或
   owner-only 普通文件，错误和 panic 不输出 secret payload。
 - debug log 默认关闭；启用后只记录类型化 session/provider/AI/config 元数据，私有文件按
   配置上限轮转，并排除 query、history、CWD、HTTP body 和环境变量值。
@@ -76,14 +78,14 @@ zsh setup 块固定在 `.zshrc` 顶部，外层在用户配置加载前进入 Ho
   strict Clippy、cargo-audit 和 cargo-deny。
 - release workflow 交付 macOS/Linux 的 x86_64/aarch64 归档、SPDX JSON SBOM 和统一
   `SHA256SUMS`；tag 与 Cargo package version 不一致会失败。
-- `dist/` 中先前的 `hokann-0.1.0-aarch64-apple-darwin.tar.gz` 已被本轮 protocol/setup
+- `dist/` 中先前的 `hokan-0.1.0-aarch64-apple-darwin.tar.gz` 已被本轮 protocol/setup
   修复取代，不能作为当前源码的 release artifact；正式发布必须由 release workflow 重建。
 - 当前源码通过 `cargo package --locked` 的隔离重编译。本机开发二进制安装在
-  `~/.cargo/bin/hokann`，SHA-256 为
+  `~/.cargo/bin/hokan`，SHA-256 为
   `6116bffdc3e252879b7a062248e89c017fa2b34e9d160ff72e07f79bb6771a98`，并由
-  `/opt/homebrew/bin/hokann` 链入。
+  `/opt/homebrew/bin/hokan` 链入。
 - 安装后二进制通过完整 `terminal_session` 8/8 和正式 setup 自动启动用例；实际 `.zshrc`
-  语法有效，受管块二次 setup 保持幂等，`-c`/非 TTY 旁路与 `HOKANN_AUTO_START=0` 均验证。
+  语法有效，受管块二次 setup 保持幂等，`-c`/非 TTY 旁路与 `HOKAN_AUTO_START=0` 均验证。
 
 ## 2026-08-02 自动化结果
 

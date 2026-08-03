@@ -46,14 +46,14 @@ pub struct ShellSession {
 
 impl ShellSession {
     pub fn new(shell: ShellKind) -> crate::Result<Self> {
-        let directory = tempfile::Builder::new().prefix("hokann-").tempdir()?;
+        let directory = tempfile::Builder::new().prefix("hokan-").tempdir()?;
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))?;
         let fifo_path = directory.path().join("control.fifo");
         mkfifo(&fifo_path, Mode::S_IRUSR | Mode::S_IWUSR).map_err(nix_io)?;
         let init_path = directory.path().join(match shell {
-            ShellKind::Zsh => "hokann.zsh",
-            ShellKind::Bash => "hokann.bash",
-            ShellKind::Fish => "hokann.fish",
+            ShellKind::Zsh => "hokan.zsh",
+            ShellKind::Bash => "hokan.bash",
+            ShellKind::Fish => "hokan.fish",
         });
         write_private(&init_path, init_script(shell).as_bytes())?;
         let token = SessionToken::generate()?;
@@ -93,24 +93,24 @@ impl ShellSession {
     ) -> crate::Result<CommandBuilder> {
         let executable = configured_executable(self.shell);
         let mut command = CommandBuilder::new(executable);
-        command.env("HOKANN_ACTIVE", "1");
-        command.env("HOKANN_HOOK_OWNER_PID", "");
+        command.env("HOKAN_ACTIVE", "1");
+        command.env("HOKAN_HOOK_OWNER_PID", "");
         command.env(
-            "HOKANN_PROTOCOL_VERSION",
+            "HOKAN_PROTOCOL_VERSION",
             super::PROTOCOL_VERSION.to_string(),
         );
-        command.env("HOKANN_SESSION_TOKEN", self.token.as_str());
-        command.env("HOKANN_SESSION_DIR", self.directory.path());
-        command.env("HOKANN_CONTROL_FIFO", &self.fifo_path);
+        command.env("HOKAN_SESSION_TOKEN", self.token.as_str());
+        command.env("HOKAN_SESSION_DIR", self.directory.path());
+        command.env("HOKAN_CONTROL_FIFO", &self.fifo_path);
         command.env(
-            "HOKANN_PROMPT_CRC",
+            "HOKAN_PROMPT_CRC",
             format!("{:08x}", marker_checksum(&self.token, "prompt")),
         );
         command.env(
-            "HOKANN_REDISPLAY_CRC",
+            "HOKAN_REDISPLAY_CRC",
             format!("{:08x}", marker_checksum(&self.token, "redisplay")),
         );
-        command.env("HOKANN_BIN", env::current_exe()?);
+        command.env("HOKAN_BIN", env::current_exe()?);
         command.cwd(env::current_dir()?);
 
         match self.shell {
@@ -166,7 +166,7 @@ impl ShellSession {
         let mut zshrc = zsh_startup_loader(".zshrc", &zdotdir, source_user_config, false);
         zshrc.push_str(&source_if_readable(&self.init_path, "source"));
         zshrc.push_str(
-            "if [[ ! -o login ]]; then\n  export ZDOTDIR=\"$__hokann_user_zdotdir\"\nfi\n",
+            "if [[ ! -o login ]]; then\n  export ZDOTDIR=\"$__hokan_user_zdotdir\"\nfi\n",
         );
         write_private(&zdotdir.join(".zshrc"), zshrc.as_bytes())?;
         if login {
@@ -225,15 +225,15 @@ impl ShellSession {
     }
 
     pub fn take_edit_from_environment(session: &str) -> crate::Result<String> {
-        let expected = env::var("HOKANN_SESSION_TOKEN").map_err(|_| {
-            crate::Error::Shell("IPC is only available inside a Hokann session".into())
+        let expected = env::var("HOKAN_SESSION_TOKEN").map_err(|_| {
+            crate::Error::Shell("IPC is only available inside a Hokan session".into())
         })?;
         if session != expected {
             return Err(crate::Error::Shell(
                 "IPC session token does not match".into(),
             ));
         }
-        let directory = env::var_os("HOKANN_SESSION_DIR")
+        let directory = env::var_os("HOKAN_SESSION_DIR")
             .map(PathBuf::from)
             .ok_or_else(|| crate::Error::Shell("IPC session directory is missing".into()))?;
         let metadata = fs::symlink_metadata(&directory)?;
@@ -273,7 +273,7 @@ impl ControlReader {
         let (cancel, cancel_reader) = UnixStream::pair()?;
         let cancel_descriptor = cancel_reader.as_raw_fd();
         let join = thread::Builder::new()
-            .name("hokann-shell-control".into())
+            .name("hokan-shell-control".into())
             .spawn(move || {
                 let _cancel_reader = cancel_reader;
                 let mut file = fs::File::from(descriptor);
@@ -377,8 +377,8 @@ fn home_directory() -> Option<PathBuf> {
 
 fn zsh_environment_loader(original: &Path, wrapper: &Path, source_user_config: bool) -> String {
     let mut script = format!(
-        "typeset -gr __hokann_wrapper_zdotdir={}\n\
-         typeset -g __hokann_user_zdotdir={}\n",
+        "typeset -gr __hokan_wrapper_zdotdir={}\n\
+         typeset -g __hokan_user_zdotdir={}\n",
         quote_posix_path(wrapper),
         quote_posix_path(original)
     );
@@ -400,21 +400,21 @@ fn zsh_startup_loader(
     let mut script = String::new();
     if source_user_config {
         script.push_str(&format!(
-            "typeset -g __hokann_user_startup_path=\"${{__hokann_user_zdotdir}}/{name}\"\n\
-             export ZDOTDIR=\"$__hokann_user_zdotdir\"\n\
-             if [[ -r \"$__hokann_user_startup_path\" ]]; then\n\
-               builtin source -- \"$__hokann_user_startup_path\"\n\
+            "typeset -g __hokan_user_startup_path=\"${{__hokan_user_zdotdir}}/{name}\"\n\
+             export ZDOTDIR=\"$__hokan_user_zdotdir\"\n\
+             if [[ -r \"$__hokan_user_startup_path\" ]]; then\n\
+               builtin source -- \"$__hokan_user_startup_path\"\n\
              fi\n\
              if [[ -n ${{ZDOTDIR:-}} ]]; then\n\
-               typeset -g __hokann_user_zdotdir=\"$ZDOTDIR\"\n\
+               typeset -g __hokan_user_zdotdir=\"$ZDOTDIR\"\n\
              else\n\
-               typeset -g __hokann_user_zdotdir=\"$HOME\"\n\
+               typeset -g __hokan_user_zdotdir=\"$HOME\"\n\
              fi\n\
-             unset __hokann_user_startup_path\n"
+             unset __hokan_user_startup_path\n"
         ));
     }
     if restore_user_zdotdir {
-        script.push_str("export ZDOTDIR=\"$__hokann_user_zdotdir\"\n");
+        script.push_str("export ZDOTDIR=\"$__hokan_user_zdotdir\"\n");
     } else {
         script.push_str(&format!("export ZDOTDIR={}\n", quote_posix_path(wrapper)));
     }
@@ -492,7 +492,7 @@ mod tests {
                 .command_builder(false)
                 .expect("command should build");
             assert_eq!(
-                command.get_env("HOKANN_SESSION_TOKEN"),
+                command.get_env("HOKAN_SESSION_TOKEN"),
                 Some(session.token.as_str().as_ref())
             );
             assert!(command.get_argv().len() >= 2);
@@ -560,13 +560,13 @@ mod tests {
 
     #[test]
     fn zsh_loader_tracks_user_zdotdir_and_restores_it_after_startup() {
-        let wrapper = Path::new("/tmp/hokann wrapper");
+        let wrapper = Path::new("/tmp/hokan wrapper");
         let script = zsh_environment_loader(Path::new("/tmp/user config"), wrapper, true);
-        assert!(script.contains("${__hokann_user_zdotdir}/.zshenv"));
-        assert!(script.contains("typeset -g __hokann_user_zdotdir=\"$ZDOTDIR\""));
-        assert!(script.contains("export ZDOTDIR='/tmp/hokann wrapper'"));
+        assert!(script.contains("${__hokan_user_zdotdir}/.zshenv"));
+        assert!(script.contains("typeset -g __hokan_user_zdotdir=\"$ZDOTDIR\""));
+        assert!(script.contains("export ZDOTDIR='/tmp/hokan wrapper'"));
 
         let login = zsh_startup_loader(".zlogin", wrapper, true, true);
-        assert!(login.ends_with("export ZDOTDIR=\"$__hokann_user_zdotdir\"\n"));
+        assert!(login.ends_with("export ZDOTDIR=\"$__hokan_user_zdotdir\"\n"));
     }
 }

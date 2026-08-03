@@ -6,7 +6,7 @@ use std::{
 };
 
 use crossbeam_channel::Receiver;
-use hokann::{
+use hokan::{
     pty::PtyChild,
     shell::{ControlMessage, ShellEvent, ShellKind, ShellSession, replacement_sequence},
     terminal::TerminalSize,
@@ -39,7 +39,7 @@ fn exercise_shell(shell: ShellKind, expect_exact_snapshot: bool) {
     let mut command = session
         .command_builder_isolated(false)
         .expect("isolated command");
-    command.env("HOKANN_BIN", env!("CARGO_BIN_EXE_hokann"));
+    command.env("HOKAN_BIN", env!("CARGO_BIN_EXE_hokan"));
     command.env("TERM", "xterm-256color");
     command.env("PS1", "HK> ");
     command.cwd(&expected_cwd);

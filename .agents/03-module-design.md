@@ -1,11 +1,11 @@
-# Hokann 模块设计
+# Hokan 模块设计
 
 ## 1. 代码组织原则
 
 v1 从一个 Cargo package 开始，同时提供 library 和 binary target。模块边界先在进程内保持清晰，不为了形式拆成多个 crate；只有编译时间、独立复用或 feature 隔离出现实际需求时再拆 workspace。
 
 ```text
-hokann/
+hokan/
   Cargo.toml
   Cargo.lock
   src/
@@ -215,7 +215,6 @@ pub struct TextEdit {
 pub enum CandidateAction {
     Insert,
     InsertAndContinue { next_slot: SlotKind },
-    RunCurrent { expected_revision: Revision, expected_hash: BufferHash },
     RequestAi,
     ConfigureAi,
     RetryProvider(ProviderId),
@@ -240,8 +239,8 @@ pub enum RiskLevel {
 
 - `display.primary` 永远不能被当作执行文本；实际修改只读取 `TextEdit`。
 - `TextEdit.range` 必须在生成它的 revision 上有效，且起止位于 UTF-8/grapheme 边界。
-- `RunCurrent` 不携带替换文本。Reducer 只有在 revision/hash 未变、当前输入完整、风险不高于 `Low`、spec provenance 有效时才写入 Enter。
-- `AI`、`History`、`RiskLevel::High/Unknown` 和含未解槽位的候选不能构造 `RunCurrent`。
+- 候选只描述输入修改；执行永远来自用户自己按下的 `Enter`，reducer 不为任何候选构造执行 effect。
+- `AI`、`History`、`RiskLevel::High/Unknown` 和含未解槽位的候选只能回填，且必须带可见风险标记。
 - 文件名展示值与 shell escaped replacement 分开保存。
 
 ### 2.3 Provider 接口
@@ -343,8 +342,8 @@ pub enum AnchorConfidence {
 
 pub enum SyncOwnership {
     None,
-    External,            // 启动前或 child 持有，Hokann 不得 ESU
-    MayBeOpenByHokann,   // BSU 可能已写出，恢复路径必须 ESU
+    External,            // 启动前或 child 持有，Hokan 不得 ESU
+    MayBeOpenByHokan,   // BSU 可能已写出，恢复路径必须 ESU
 }
 
 pub enum RenderReadiness {
@@ -426,15 +425,14 @@ pub enum DrainState {
 2. buffer revision/hash 是否匹配？否则刷新。
 3. action = RequestAi/ConfigureAi/Retry？执行对应 effect，不触碰 PTY Enter。
 4. action = Insert/InsertAndContinue？校验 edit，交给 shell adapter 回填。
-5. action = RunCurrent？再次校验 provenance、risk、completeness、文本相等；仅写 Enter。
-6. 任一不确定条件都降级为 Insert 或拒绝，不能升级为执行。
+5. `Enter` 键的语义在激活门之外：无选中时直接透传给 shell；有选中且候选可执行时，对最终命令文本复核风险，≤ Medium 直接提交执行，High/Unknown 先进入二次确认态。任一不确定条件都降级为回填或拒绝。
 ```
 
 ## 4. `terminal` 与 `pty`
 
 ### 4.1 `terminal::guard`
 
-`TerminalGuard` 记录原 termios、光标可见性、SGR、raw mode 和 `SyncOwnership`。构造完成前不改变全局状态；启用后把 terminal lease 转移给 `OutputActor` 所在线程，使正常、channel close、panic unwind 和 I/O error 的恢复仍由唯一 writer 排序。`Drop` 只在 `SyncOwnership::MayBeOpenByHokann` 时补发 ESU，随后恢复 SGR/光标/termios；不能 reset 启动前或 child 持有的 mode。signal handler 不执行复杂 Rust 逻辑，而通过 self-pipe/signal bridge 通知主循环。
+`TerminalGuard` 记录原 termios、光标可见性、SGR、raw mode 和 `SyncOwnership`。构造完成前不改变全局状态；启用后把 terminal lease 转移给 `OutputActor` 所在线程，使正常、channel close、panic unwind 和 I/O error 的恢复仍由唯一 writer 排序。`Drop` 只在 `SyncOwnership::MayBeOpenByHokan` 时补发 ESU，随后恢复 SGR/光标/termios；不能 reset 启动前或 child 持有的 mode。signal handler 不执行复杂 Rust 逻辑，而通过 self-pipe/signal bridge 通知主循环。
 
 挂起流程：清 overlay -> 恢复 termios/光标 -> 将 `SIGTSTP` 重新交给自身。继续流程：重新获取尺寸 -> raw mode -> 等 prompt anchor -> redraw。
 
@@ -467,7 +465,7 @@ pub enum DrainState {
 
 ### 4.3 `terminal::render_boundary`、`safe_boundary` 与 `model`
 
-`RenderBoundaryDecoder` 是 child data plane 唯一允许消费 bytes 的窄例外。它只在 parser ground state、shell foreground/prompt phase 识别由 Hokann shell adapter 生成的版本化 marker：固定前缀、session token、`BoundaryId`、marker kind 和 checksum/terminator 全部匹配时产生 `PromptRendered` 或 `PostRedisplay` 事件；其他 bytes 必须 byte-for-byte 交给 child output pipeline。
+`RenderBoundaryDecoder` 是 child data plane 唯一允许消费 bytes 的窄例外。它只在 parser ground state、shell foreground/prompt phase 识别由 Hokan shell adapter 生成的版本化 marker：固定前缀、session token、`BoundaryId`、marker kind 和 checksum/terminator 全部匹配时产生 `PromptRendered` 或 `PostRedisplay` 事件；其他 bytes 必须 byte-for-byte 交给 child output pipeline。
 
 marker 使用有上限的私有 OSC/DCS envelope，并由 zsh `%{...%}`、Bash `\[...\]` 等 adapter-specific 非打印包装嵌入。确切 envelope 在 P0 transcript/terminal/shell-width 测试后锁定。它不能携带 buffer、CWD 或其他用户文本；session token 不写日志。decoder 必须支持任意分片、前缀回退、重复/迟到/伪造 marker 和 channel close。token 只用于降低意外碰撞，不是安全边界，因为 child process 可能继承它；phase/id/revision gate 仍必须独立成立。
 
@@ -478,7 +476,7 @@ control FD 的 `PromptBoundary/BufferSnapshot` 不是 render-ready 信号：
 - adapter 能提供可靠 post-redraw marker 时按同 id 解锁；否则由 `TerminalModel` 在后续 screen revision 上验证 expected cursor/layout、安全边界和 PTY nonblocking drain；
 - deadline 只把状态变为 `Unknown`/隐藏，不得把等待超时当作绘制许可。
 
-`SafeBoundaryScanner` 只回答“当前 child byte stream 后能否插入 Hokann 控制序列”。它跟踪任意分片的 UTF-8、ESC、CSI、OSC、DCS、SOS/PM/APC 和 string terminator，不解释屏幕布局。若 chunk 结束在控制序列中，child bytes 仍应立即原样转发，但 overlay frame 保留到下一个安全边界；超长或超时 control string 触发透明透传并把 anchor 置为 `Unknown`。
+`SafeBoundaryScanner` 只回答“当前 child byte stream 后能否插入 Hokan 控制序列”。它跟踪任意分片的 UTF-8、ESC、CSI、OSC、DCS、SOS/PM/APC 和 string terminator，不解释屏幕布局。若 chunk 结束在控制序列中，child bytes 仍应立即原样转发，但 overlay frame 保留到下一个安全边界；超长或超时 control string 触发透明透传并把 anchor 置为 `Unknown`。
 
 `TerminalModel` 首选封装 `vt100::Parser`，观察与真实终端完全相同的 child bytes，维护：
 
@@ -529,7 +527,7 @@ pub enum OutputCommand {
 
 处理优先级为 restore/signal > 不可丢弃的 child output > overlay hide/invalidate > 最新 overlay frame。提交前再次校验 `frame_revision`、`buffer_revision`、`screen_revision`、`screen_epoch`、anchor confidence 和 safe boundary；任一过期或不可证明条件都丢弃 frame/隐藏 UI，不能猜坐标。
 
-child output 到达时，actor 先经 `RenderBoundaryDecoder` 分离受信 marker，再用其余完全相同的 bytes 更新 scanner/model，最后把“必要的旧 surface 清理 + child bytes + 可用的最新 overlay repaint”组合成一个 transaction。支持 mode 2026 且当前 idle 时，整个 transaction 可由一对 Hokann-owned BSU/ESU 包围；child 或启动前状态持有 mode 时只透传/延后，不能嵌套或擅自 ESU。fallback 直接覆盖变化 cells，不能先清空列表再转发。child bytes 永不因 overlay backpressure 丢弃，overlay 队列也永不积压旧帧。
+child output 到达时，actor 先经 `RenderBoundaryDecoder` 分离受信 marker，再用其余完全相同的 bytes 更新 scanner/model，最后把“必要的旧 surface 清理 + child bytes + 可用的最新 overlay repaint”组合成一个 transaction。支持 mode 2026 且当前 idle 时，整个 transaction 可由一对 Hokan-owned BSU/ESU 包围；child 或启动前状态持有 mode 时只透传/延后，不能嵌套或擅自 ESU。fallback 直接覆盖变化 cells，不能先清空列表再转发。child bytes 永不因 overlay backpressure 丢弃，overlay 队列也永不积压旧帧。
 
 `RenderGateRequest` 带 buffer/boundary id、expected text/cursor、anchor snapshot 和 deadline。`OutputActor` 持有 gate，因为只有它同时知道最近 marker、`TerminalModel`、`screen_revision` 和 PTY drain cycle：gate 后到时可匹配已缓存 marker/当前模型，gate 先到时等待后续 batch；两种顺序都不能依赖 channel 到达先后猜测。
 
@@ -561,7 +559,7 @@ pub trait ShellAdapter: Send + Sync {
 
 `RenderBoundaryCapability` 为 `PostRedisplayMarker | ModelConvergence | Unsupported`。能力由实际 adapter PoC 与 compatibility test 决定，不能仅因某 shell 存在 pre-redraw hook 就标记为 post-redraw。
 
-### 5.2 子 shell 到 Hokann 的协议
+### 5.2 子 shell 到 Hokan 的协议
 
 控制 FD 使用 `NUL` 分帧，因为 shell 变量本身不能包含 NUL。v2 每帧以稳定 type 和字段
 前缀开始，最后一个字段保留原始 UTF-8 payload；parser 设置单帧 64 KiB 上限。命令只在
@@ -587,11 +585,11 @@ HKP2\tEND\t<exit_code>\t<cwd>\0
 - 固定字段从左侧解析，最后一个 CWD/buffer/command 字段保留 Tab 和换行；
 - 超长或畸形帧使当前 buffer 进入 `Uncertain`，但不终止 shell。
 
-### 5.3 Hokann 到子 shell 的回填
+### 5.3 Hokan 到子 shell 的回填
 
 1. Reducer 将 versioned `EditPlan` 放入 session queue。
 2. 向 PTY 写入 adapter 的保留键序列。
-3. shell widget 调用同一二进制的轻量 `hokann ipc take --session <token>`。
+3. shell widget 调用同一二进制的轻量 `hokan ipc take --session <token>`。
 4. widget 通过 shell 原生 API 原子更新 buffer/cursor。
 5. shell 发送新的 `BUFFER`；收到确认前不启动下一 query。
 
@@ -657,13 +655,15 @@ pub struct ScoreSignals {
     pub spec_priority: i16,       // -100..100
     pub cwd_affinity: i16,        // 0..100
     pub frecency: i16,            // 0..200
-    pub sequence: i16,            // 0..100
+    pub transition: i16,          // 0..200（上一条命令 skeleton 的 bigram 命中）
+    pub context: i16,             // 0..100（workspace 标记加成，集中计算）
+    pub failed_penalty: i16,      // 0|150（上次执行失败扣分）
     pub risk_penalty: i16,        // 0..300
     pub incomplete_penalty: i16,  // 0..100
 }
 ```
 
-不要让 provider 直接提供最终总分。Provider 只填自己有权知道的静态优先级；match/frecency/risk 由集中模块计算，防止来源间不可比较。
+不要让 provider 直接提供最终总分。Provider 只填自己有权知道的静态优先级；match/frecency/risk/context 由集中模块计算，防止来源间不可比较。transition 由 history provider 依据 `HistoryIndex` 的转移 bigram 给出；failed_penalty 来自记录的 `last_exit_code`。
 
 ## 8. Provider 设计
 
@@ -674,7 +674,7 @@ pub struct ScoreSignals {
 - 文件截断/rotate 后重新从头解析并靠 command hash 去重。
 - multiline history 还原为单条记录；含真实换行的命令可以搜索，但 v1 默认不作为一键回填候选。
 - 搜索分三层：exact/prefix/substring 先走索引，再用 fuzzy matcher 补齐剩余名额。
-- frecency 采用按时间衰减的 count；sequence 只存规范化 command skeleton，避免把 secret argument 复制到更多索引。
+- frecency 采用按时间衰减的 count；执行失败（exit code 非 0 且非 130）只刷新 last_used 不加 count，并在排序时施加 failed_penalty。index 同时维护上一条命令 skeleton 到后继 skeleton 的转移 bigram（只存规范化 skeleton，避免把 secret argument 复制到更多索引），命中时给出 transition 信号。workspace 标记（.git/package.json/Cargo.toml/Makefile/justfile）由 `WorkspaceProbe` 按 cwd 探测并缓存，context 加成在 ranking 集中计算。
 
 隐私过滤至少支持：正则、命令名前缀和 `HISTCONTROL=ignorespace` 语义。内置启发式标记包含明显 token/password flag 的命令，不写 debug log；是否排除存储由用户配置。
 
@@ -696,8 +696,8 @@ pub struct ScoreSignals {
 ### 8.4 `process` 与 `network_interface`
 
 - `kill` 的 process provider 使用平台原生 `/proc` 或有界 `ps` argv，显示 PID、owner、command。
-- 默认仅展示当前用户可操作进程，排除 Hokann/self 和当前 shell；用户查询精确 PID 时可显示更多。
-- 进程候选是 `InsertAndContinue/Insert`，永远不是 `RunCurrent`。
+- 默认仅展示当前用户可操作进程，排除 Hokan/self 和当前 shell；用户查询精确 PID 时可显示更多。
+- 进程候选是 `InsertAndContinue/Insert`，与所有候选一样只能回填。
 - 接口 provider 在 Linux 读取系统接口或调用固定 argv，在 macOS 使用系统 API/固定探测；结果按接口状态排序。
 
 ### 8.5 `project`
@@ -889,15 +889,14 @@ detected project kinds (node/rust/python/...)
 Policy 硬约束：
 
 ```text
-AI source                         -> never RunCurrent
-History source                    -> never RunCurrent
+AI source                         -> insert only
+History source                    -> insert only
 High / Unknown                    -> insert only + visible warning
 NeedsInput                        -> InsertAndContinue
-Spec direct + exact current text
-  + risk <= Low + current query   -> RunCurrent allowed
+所有候选（含 spec 默认项）           -> 只回填；执行只来自用户自己的 Enter
 ```
 
-风险标签是交互保护，不是安全保证。Hokann 不尝试 sandbox 用户最终执行的 shell。
+风险标签是交互保护，不是安全保证。Hokan 不尝试 sandbox 用户最终执行的 shell。
 
 ## 13. `config`
 
@@ -911,10 +910,10 @@ version = 1
 login_shell = false
 
 [ui]
-max_rows = 12
-max_width = 100
+max_rows = 8
+max_width = 76
 color = "auto"
-ascii_icons = true
+nerd_fonts = true
 show_hidden = false
 
 [keys]
@@ -952,22 +951,22 @@ trigger_prefix = "??"
 send_cwd_basename = true
 ```
 
-未知字段默认拒绝；错误 enum/越界值使配置验证失败并保留 last-known-good。`hokann config show` 对所有 secret 值显示 `<redacted>`。日志配置需要重启才生效；日志默认关闭，启用后只写入有界、轮转、脱敏的类型化事件，不记录 query、history、CWD、HTTP body 或环境变量值。
+未知字段默认拒绝；错误 enum/越界值使配置验证失败并保留 last-known-good。`hokan config show` 对所有 secret 值显示 `<redacted>`。日志配置需要重启才生效；日志默认关闭，启用后只写入有界、轮转、脱敏的类型化事件，不记录 query、history、CWD、HTTP body 或环境变量值。
 
 ## 14. CLI 表面
 
 ```text
-hokann [--shell zsh] [--login]
-hokann init <zsh|bash|fish>
-hokann setup [--shell ...]
-hokann uninstall --integration-only
-hokann doctor [--json]
-hokann config <path|show|validate|init>
-hokann config ai
-hokann history <import|stats|prune|clear>
-hokann spec <list|show|validate>
-hokann ipc <emit|take>            # internal, hidden from normal help
-hokann --version
+hokan [--shell zsh] [--login]
+hokan init <zsh|bash|fish>
+hokan setup [--shell ...]
+hokan uninstall --integration-only
+hokan doctor [--json]
+hokan config <path|show|validate|init>
+hokan config ai
+hokan history <import|stats|prune|clear>
+hokan spec <list|show|validate>
+hokan ipc <emit|take>            # internal, hidden from normal help
+hokan --version
 ```
 
 `setup`、`uninstall`、`history clear` 涉及写入或删除，必须精确显示目标并保持可恢复性。`uninstall --integration-only` 不删除 history/config。

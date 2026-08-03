@@ -1,6 +1,6 @@
 use crate::{parser::TokenKind, terminal::RiskLevel};
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RiskReason {
     DestructiveCommand,
     RecursiveOperation,
@@ -14,6 +14,26 @@ pub enum RiskReason {
     OverwriteRedirect,
     MultipleCommands,
     OpaqueSyntax,
+}
+
+impl RiskReason {
+    #[must_use]
+    pub const fn describe(&self) -> &'static str {
+        match self {
+            Self::DestructiveCommand => "destructive command",
+            Self::RecursiveOperation => "recursive operation",
+            Self::ForceFlag => "force flag",
+            Self::PermissionChange => "permission change",
+            Self::DeviceWrite => "device write",
+            Self::RemoteExecution => "remote execution",
+            Self::PrivilegeElevation => "privilege elevation",
+            Self::ProcessSignal => "process signal",
+            Self::ShellPipeline => "shell pipeline",
+            Self::OverwriteRedirect => "overwrite redirect",
+            Self::MultipleCommands => "multiple commands",
+            Self::OpaqueSyntax => "opaque syntax",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

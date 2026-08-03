@@ -136,7 +136,7 @@ fn write_ai_status(
     if !config.ai.enabled || config.ai.model.is_empty() || !key_available {
         writeln!(
             output,
-            "run `hokann config ai --help` to configure endpoint, model, and credentials"
+            "run `hokan config ai --help` to configure endpoint, model, and credentials"
         )?;
     }
     Ok(())

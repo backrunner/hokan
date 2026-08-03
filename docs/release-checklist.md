@@ -1,4 +1,4 @@
-# Hokann 发布清单
+# Hokan 发布清单
 
 本清单是 `.agents/05-delivery-plan.md` 的执行入口。自动化通过不能替代真实终端认证。
 
@@ -37,6 +37,10 @@ cargo package --locked
 | WezTerm + zsh/bash | 待认证 |
 | Alacritty + zsh/bash | 待认证 |
 | fish 3.6+ 默认模式 | 待认证 |
+| powerlevel10k 默认配置 + zsh | 待认证 |
+| powerlevel10k instant prompt 开/关 + zsh | 待认证 |
+| powerlevel10k transient prompt 开/关 + zsh | 待认证 |
+| oh-my-zsh + agnoster + zsh | 待认证 |
 | SSH 延迟/分片/断开 | 待认证 |
 | tmux 3.7+ runtime probe | 待认证 |
 | macOS x86_64、Linux x86_64/aarch64 实机 | 待认证 |
@@ -48,9 +52,9 @@ overlay、跨 control sequence 写入、AI 隐式联网或 secret 泄漏都会�
 
 1. tag 必须为 `v<package-version>`，workflow 会拒绝版本不一致。
 2. 在干净机器校验 `SHA256SUMS`，解压对应 target 归档。
-3. 运行 `bin/hokann --version`、`doctor --json`、`spec validate`。
+3. 运行 `bin/hokan --version`、`doctor --json`、`spec validate`。
 4. 用临时 rc 文件验证 `setup` 幂等、备份和 `uninstall --integration-only`。
-5. 检查归档包含 README、双许可证和 `share/man/man1/hokann.1`。
+5. 检查归档包含 README、双许可证和 `share/man/man1/hokan.1`。
 6. 检查每个 target 对应的 `.spdx.json` 可解析且与同一构建产物关联。
 
 ## Release profile

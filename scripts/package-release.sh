@@ -22,13 +22,13 @@ case "$version" in
     ;;
 esac
 
-binary="target/$target/release/hokann"
+binary="target/$target/release/hokan"
 if [[ ! -x "$binary" ]]; then
   echo "release binary is missing or not executable: $binary" >&2
   exit 1
 fi
 
-package="hokann-$version-$target"
+package="hokan-$version-$target"
 stage="dist/$package"
 archive="dist/$package.tar.gz"
 if [[ -e "$stage" || -e "$archive" ]]; then
@@ -37,9 +37,9 @@ if [[ -e "$stage" || -e "$archive" ]]; then
 fi
 
 install -d "$stage/bin" "$stage/share/man/man1"
-install -m 0755 "$binary" "$stage/bin/hokann"
+install -m 0755 "$binary" "$stage/bin/hokan"
 install -m 0644 README.md LICENSE-MIT LICENSE-APACHE "$stage/"
-install -m 0644 docs/hokann.1 "$stage/share/man/man1/hokann.1"
+install -m 0644 docs/hokan.1 "$stage/share/man/man1/hokan.1"
 
 COPYFILE_DISABLE=1 tar -C dist -cf - "$package" | gzip -n > "$archive"
 rm -r "$stage"

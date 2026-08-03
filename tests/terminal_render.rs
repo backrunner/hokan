@@ -1,5 +1,5 @@
 use avt::Vt;
-use hokann::terminal::{
+use hokan::terminal::{
     BufferRevision, CellPos, CursorRestore, FrameRevision, FrameTicket, OverlayCompositor,
     OverlayRow, OverlaySurfaceRenderer, OverlayView, RiskLevel, ScreenEpoch, ScreenRevision,
     SurfaceGeometry, SurfaceKey, SurfaceTheme, SyncOutputCapability, TerminalSize, WidthPolicy,
@@ -26,7 +26,7 @@ fn fallback_navigation_has_no_blank_intermediate_and_both_models_agree() {
         visible: true,
         sgr: b"\x1b[0m".to_vec(),
     };
-    let renderer = OverlaySurfaceRenderer::new(OVERLAY_HEIGHT, SurfaceTheme::default());
+    let renderer = OverlaySurfaceRenderer::new(OVERLAY_HEIGHT, SurfaceTheme::default(), true);
     let mut compositor = OverlayCompositor::default();
 
     let first_buffer = renderer.render(geometry, &view(1));
@@ -54,7 +54,9 @@ fn fallback_navigation_has_no_blank_intermediate_and_both_models_agree() {
             SyncOutputCapability::UnsupportedFallback,
         )
         .expect("navigation frame should compose");
-    assert_eq!(second.staged().changed_rows, vec![4, 5]);
+    // Only the single item row changes: the borders (pagination in the top
+    // edge, hints in the bottom edge) are identical between the two frames.
+    assert_eq!(second.staged().changed_rows, vec![5]);
     assert_forbidden_sequences_absent(&second.staged().bytes);
 
     let mut vt100 = vt100::Parser::new(ROWS, COLS, 0);
@@ -65,15 +67,28 @@ fn fallback_navigation_has_no_blank_intermediate_and_both_models_agree() {
     vt100.process(&first_bytes);
     avt.feed_str(std::str::from_utf8(&first_bytes).expect("frame transcript is UTF-8"));
 
+    // Feed avt only complete UTF-8 sequences: the overlay now contains
+    // multi-byte glyphs (box drawing, ▶, Nerd Font icons), and feeding single
+    // bytes as chars would mangle them into mojibake. vt100 handles partial
+    // sequences natively, so it keeps the per-byte cadence.
+    let mut pending: Vec<u8> = Vec::new();
     for &byte in &second.staged().bytes {
         vt100.process(std::slice::from_ref(&byte));
-        avt.feed(char::from(byte));
+        pending.push(byte);
+        if let Ok(chunk) = std::str::from_utf8(&pending) {
+            avt.feed_str(chunk);
+            pending.clear();
+        }
 
         assert!(!vt100_region_is_blank(vt100.screen()));
         assert!(!avt_region_is_blank(&avt));
         assert!(vt100_row(vt100.screen(), 3).starts_with("$ ls"));
         assert!(avt.line(3).chars().collect::<String>().starts_with("$ ls"));
     }
+    assert!(
+        pending.is_empty(),
+        "frame bytes must end on a UTF-8 boundary"
+    );
 
     assert_models_match(&vt100, &avt);
     assert_eq!(vt100.screen().cursor_position(), (3, 4));
@@ -118,11 +133,15 @@ fn avt_region_is_blank(terminal: &Vt) -> bool {
 
 fn vt100_row(screen: &vt100::Screen, row: u16) -> String {
     (0..COLS)
-        .map(|col| {
-            screen
-                .cell(row, col)
-                .and_then(|cell| cell.contents().chars().next())
-                .unwrap_or(' ')
+        .filter_map(|col| {
+            let cell = screen.cell(row, col)?;
+            // Skip the padding cell of wide glyphs (CJK hints in the border
+            // edges): avt's `line()` yields each glyph once, so continuation
+            // cells must not contribute a placeholder space either.
+            if cell.is_wide_continuation() {
+                return None;
+            }
+            Some(cell.contents().chars().next().unwrap_or(' '))
         })
         .collect()
 }

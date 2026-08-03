@@ -125,6 +125,7 @@ fn lex(text: &str) -> Vec<Token> {
         }
         let (kind, width) = match bytes[index..] {
             [b'&', b'&', ..] => (Some(TokenKind::AndIf), 2),
+            [b'&', ..] => (Some(TokenKind::Separator), 1),
             [b'|', b'|', ..] => (Some(TokenKind::OrIf), 2),
             [b'|', ..] => (Some(TokenKind::Pipe), 1),
             [b';', ..] => (Some(TokenKind::Separator), 1),
@@ -384,5 +385,23 @@ mod tests {
                 "missing opaque token for {text:?}"
             );
         }
+    }
+
+    #[test]
+    fn bare_background_operator_terminates_the_word() {
+        // A lone `&` (background operator) must not wedge the lexer: it is a
+        // separator, so `sleep 1 &` and a trailing `&` both tokenize.
+        for text in ["sleep 1 &", "sleep 1 & wait", "echo &"] {
+            let parsed = parse_line(text, text.len()).expect("line should parse");
+            assert!(
+                parsed
+                    .tokens
+                    .iter()
+                    .any(|token| token.kind == TokenKind::Separator),
+                "missing separator for {text:?}"
+            );
+        }
+        let parsed = parse_line("sleep 1 & wait", 13).expect("line should parse");
+        assert_eq!(parsed.command.as_deref(), Some("wait"));
     }
 }

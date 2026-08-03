@@ -1,13 +1,13 @@
-# Hokann 产品需求文档
+# Hokan 产品需求文档
 
 > 文档版本：0.1  
 > 产品阶段：Greenfield / v1 规划
 
 ## 1. 产品定义
 
-Hokann 在用户输入命令时，以低延迟内联列表提供可解释、可回填的候选。候选来自本机 history、内置命令规格、当前文件系统、项目清单以及用户主动触发的 OpenAI 兼容接口。
+Hokan 在用户输入命令时，以低延迟内联列表提供可解释、可回填的候选。候选来自本机 history、内置命令规格、当前文件系统、项目清单以及用户主动触发的 OpenAI 兼容接口。
 
-产品价值不是替代 shell，而是减少三类成本：回忆过去命令、查阅常用参数、手工输入上下文对象。Hokann 必须保留真实 shell、PTY、作业控制、SSH 和全屏 TUI 的行为。
+产品价值不是替代 shell，而是减少三类成本：回忆过去命令、查阅常用参数、手工输入上下文对象。Hokan 必须保留真实 shell、PTY、作业控制、SSH 和全屏 TUI 的行为。
 
 ## 2. 目标与非目标
 
@@ -15,12 +15,12 @@ Hokann 在用户输入命令时，以低延迟内联列表提供可解释、可�
 
 - 在 macOS/Linux 的常见 ANSI 终端、SSH 和 tmux 中稳定运行。
 - 自动展示多条相关 history，并支持快速搜索、选择和回填。
-- 为首批常用命令提供经过人工校验的“直接运行项、推荐配方、释义和动态参数”。
+- 为首批常用命令提供经过人工校验的“默认项、推荐配方、释义和动态参数”。
 - 根据命令上下文补齐当前目录中的文件、目录和可执行文件，并正确处理空格和引号。
 - 对 `pnpm run` 读取最近项目的 `package.json` 并列出 scripts。
 - 本地判断自然语言；用户显式选择 AI 项后调用 OpenAI Chat Completions 兼容接口，展示多个命令结果。
 - 单一 Rust 二进制运行；无后台 daemon、无账号、无默认遥测。
-- shell 或 Hokann 异常退出后，终端必须恢复到可输入、可回显状态。
+- shell 或 Hokan 异常退出后，终端必须恢复到可输入、可回显状态。
 
 ### 2.2 v1 非目标
 
@@ -48,7 +48,7 @@ Hokann 在用户输入命令时，以低延迟内联列表提供可解释、可�
 1. 用户输入命令片段，例如 `docker comp`。
 2. 列表在本地候选预算内出现多条匹配 history。
 3. 用户用上下键选择，按 `Tab` 或 `Enter` 回填。
-4. Hokann 不执行被回填的 history；用户再次按 `Enter` 后才由 shell 执行。
+4. Hokan 不执行被回填的 history；用户再次按 `Enter` 后才由 shell 执行。
 
 #### 流程 B：常用命令配方
 
@@ -60,14 +60,14 @@ Hokann 在用户输入命令时，以低延迟内联列表提供可解释、可�
 #### 流程 C：文件补齐
 
 1. 用户输入 `bash `。
-2. Hokann 识别当前参数期望脚本或文件。
+2. Hokan 识别当前参数期望脚本或文件。
 3. 列表优先展示当前目录的可执行文件、`.sh` 文件，再展示目录。
-4. 选择包含空格的文件时，Hokann 按当前 shell 和引号上下文正确转义。
+4. 选择包含空格的文件时，Hokan 按当前 shell 和引号上下文正确转义。
 
 #### 流程 D：项目脚本
 
 1. 用户在项目任意子目录输入 `pnpm run `。
-2. Hokann 向上查找最近的 `package.json`，只读取 `scripts` 对象。
+2. Hokan 向上查找最近的 `package.json`，只读取 `scripts` 对象。
 3. 列表展示脚本名、完整插入文本和脚本内容摘要。
 4. 选择 `build` 后回填 `pnpm run build`，不立即执行。
 
@@ -83,16 +83,16 @@ Hokann 在用户输入命令时，以低延迟内联列表提供可解释、可�
 
 ### 4.1 TTY、PTY 与 shell 生命周期
 
-- **FR-TTY-001**：`hokann` 必须能够启动配置的交互式子 shell，并在真实终端与该 shell 的 PTY 之间双向代理字节。
+- **FR-TTY-001**：`hokan` 必须能够启动配置的交互式子 shell，并在真实终端与该 shell 的 PTY 之间双向代理字节。
 - **FR-TTY-002**：v1 必须支持 zsh、bash、fish；未识别 shell 时给出明确诊断，不静默假定兼容。
-- **FR-TTY-003**：shell 正在执行前台命令时，Hokann 必须隐藏列表并原样转发输入输出，包括控制字符。
+- **FR-TTY-003**：shell 正在执行前台命令时，Hokan 必须隐藏列表并原样转发输入输出，包括控制字符。
 - **FR-TTY-004**：子进程进入 alternate screen 或前台进程组改变时，不得绘制候选层；退出后恢复提示符状态。
 - **FR-TTY-005**：必须处理 `SIGWINCH`、`SIGINT`、`SIGTERM`、`SIGHUP`、`SIGTSTP` 和 `SIGCONT`，并以 RAII 守卫恢复 termios、光标和可见性。
 - **FR-TTY-006**：正常退出、panic、子 shell 崩溃和可处理信号路径都必须恢复终端；无法恢复时输出一条可直接运行的 `stty sane` 恢复提示。
 - **FR-TTY-007**：必须识别 bracketed paste；粘贴期间不逐字符触发 provider，请求在粘贴结束后合并执行。
 - **FR-TTY-008**：shell hook 至少同步命令开始、命令结束、退出码和 CWD；能读取真实编辑缓冲区的 shell 应同步文本与光标。
-- **FR-TTY-009**：通过 `hokann init <shell>` 输出适配代码；递归启动必须由 session 环境标志阻止。
-- **FR-TTY-010**：child output、overlay、terminal probe 和 restore 必须由唯一 stdout writer 排序；不得在未结束的 UTF-8/CSI/OSC/DCS/control string 中插入 Hokann bytes。
+- **FR-TTY-009**：通过 `hokan init <shell>` 输出适配代码；递归启动必须由 session 环境标志阻止。
+- **FR-TTY-010**：child output、overlay、terminal probe 和 restore 必须由唯一 stdout writer 排序；不得在未结束的 UTF-8/CSI/OSC/DCS/control string 中插入 Hokan bytes。
 - **FR-TTY-011**：control FD 的 prompt/buffer event 不得直接视为 terminal 已完成 redisplay。frame 必须等待同一 revision 的 PTY render marker 或经过验证的 terminal-model convergence；超时只能隐藏，不能强制绘制。
 
 ### 4.2 History
@@ -104,7 +104,7 @@ Hokann 在用户输入命令时，以低延迟内联列表提供可解释、可�
 - **FR-HIS-005**：默认按规范化后的完整命令去重，但保留次数、最近时间、来源 shell 和可选 CWD 统计。
 - **FR-HIS-006**：history 候选必须展示来源标签；选择只回填，不自动执行。
 - **FR-HIS-007**：不得索引包含 NUL、超过配置长度或匹配用户隐私排除规则的条目。
-- **FR-HIS-008**：提供 `hokann history import|stats|prune|clear`；`clear` 必须二次确认且只清除 Hokann 自身 history store，不修改 shell 原 history。
+- **FR-HIS-008**：提供 `hokan history import|stats|prune|clear`；`clear` 必须二次确认且只清除 Hokan 自身 history store，不修改 shell 原 history。
 
 ### 4.3 常用命令规格与参数配方
 
@@ -114,8 +114,8 @@ Hokann 在用户输入命令时，以低延迟内联列表提供可解释、可�
 - **FR-SPEC-004**：每个配方必须有不超过一行的中文或本地化释义；仅列裸 flag 不算合格配方。
 - **FR-SPEC-005**：首批必须覆盖 `ls`、`df`、`tar`、`lsof`、`ifconfig`、`ps`、`kill`，并区分 GNU/Linux 与 BSD/macOS 差异。
 - **FR-SPEC-006**：仅展示本机可用命令或有明确替代说明的命令；可执行文件探测结果必须缓存，不能每次按键扫描 `$PATH`。
-- **FR-SPEC-007**：危险配方（例如 `kill -9`、递归删除、覆盖写入）必须有风险标签，只允许回填，不得成为直接运行项。
-- **FR-SPEC-008**：用户可在配置目录增加或覆盖规格；启动或 `hokann spec validate` 时必须验证 schema、重复 ID、槽位和风险约束。
+- **FR-SPEC-007**：危险配方（例如 `kill -9`、递归删除、覆盖写入）必须有风险标签；规格默认项（`default = "run_current"`）仅限 ReadOnly/Low 的无参命令，选中执行 High/Unknown 候选必须二次确认。
+- **FR-SPEC-008**：用户可在配置目录增加或覆盖规格；启动或 `hokan spec validate` 时必须验证 schema、重复 ID、槽位和风险约束。
 - **FR-SPEC-009**：规格加载失败不得阻止 shell 启动；禁用错误规格并记录可定位诊断。
 
 首批行为基线：
@@ -168,11 +168,11 @@ Hokann 在用户输入命令时，以低延迟内联列表提供可解释、可�
 
 - **FR-UI-001**：候选列表绘制在当前提示符下方，不进入 alternate screen，不永久污染 scrollback。
 - **FR-UI-002**：每行至少包含候选主体、来源或类型、简短释义；风险和“仍需参数”状态必须可见。
-- **FR-UI-003**：默认键位为：上下键导航、`Tab` 补齐、`Enter` 激活、`Esc` 关闭、`Ctrl-R` history 专注视图、`Shift-Tab` 切换列表显示。
-- **FR-UI-004**：`Tab` 永不执行；普通候选的 `Enter` 先回填。只有 `RunCurrent` 直接运行项可将当前未修改缓冲区提交给 shell。
-- **FR-UI-005**：列表关闭时，除 Hokann 明确拥有的全局键位外，按键必须原样交给 shell；键位均可配置或禁用。
+- **FR-UI-003**：默认键位为：上下键导航、`Tab` 回填候选、`Enter` 执行（无选中=当前输入，有选中=选中候选）、`Esc` 关闭、`Ctrl-R` history 专注视图、`Shift-Tab` 切换列表显示。
+- **FR-UI-004**：列表不默认选中；`Up`/`Down` 显式进入列表且不改变 buffer。无选中时 `Enter` 把用户亲手输入的 buffer 原样提交给 shell；有选中时 `Enter` 执行选中候选的完整命令文本，High/Unknown 风险先经二次确认（`Enter` 确认、`Esc` 取消）。亲手输入的命令永不触发确认；`Tab` 只做候选回填，永不执行。
+- **FR-UI-005**：列表关闭时，除 Hokan 明确拥有的全局键位外，按键必须原样交给 shell；键位均可配置或禁用。
 - **FR-UI-006**：宽度适配 40 至 240 列；Unicode 宽度按 grapheme/cell 计算；过长文本截断而不换行破坏提示符。
-- **FR-UI-007**：颜色不可作为唯一状态信息；无 Nerd Font 时使用纯 ASCII 标签。
+- **FR-UI-007**：颜色不可作为唯一状态信息；命令图标是可选 Nerd Font 皮肤（`ui.nerd_fonts` 默认开启），关闭后退回纯文本标签。
 - **FR-UI-008**：窗口 resize、终端滚动和 child output 到达时必须使旧 screen epoch/frame 失效；只有锚点和控制序列边界可靠时才重绘，否则隐藏列表，不能与 shell 输出交叠或猜测坐标。
 - **FR-UI-009**：overlay session 使用固定高度的专用 surface；异步候选、选中态和状态文字变化不得反复增删终端行或推动 prompt/layout 跳动。
 - **FR-UI-010**：运行时必须通过 DECRQM 探测 synchronized output。明确支持且 mode 空闲时使用 BSU/ESU 提交完整帧；unsupported 或 timeout 时使用不先清空 surface 的 cell-diff fallback；mode busy/externally owned 时延后或隐藏，不能嵌套/结束他人的 transaction。
@@ -182,12 +182,12 @@ Hokann 在用户输入命令时，以低延迟内联列表提供可解释、可�
 
 ### 4.8 配置、诊断与维护
 
-- **FR-CFG-001**：配置使用 TOML，默认路径遵循 XDG；`hokann config path|show|validate` 可发现和验证配置。
+- **FR-CFG-001**：配置使用 TOML，默认路径遵循 XDG；`hokan config path|show|validate` 可发现和验证配置。
 - **FR-CFG-002**：API key 默认通过环境变量引用；若用户选择文件保存，独立 credentials 文件必须以 `0600` 创建并在权限过宽时拒绝使用。
-- **FR-CFG-003**：`hokann doctor` 检查 TTY、`TERM`、shell、hook、控制 FD、数据目录权限、AI 配置和已知键位冲突。
+- **FR-CFG-003**：`hokan doctor` 检查 TTY、`TERM`、shell、hook、控制 FD、数据目录权限、AI 配置和已知键位冲突。
 - **FR-CFG-004**：日志默认关闭；debug 日志写入状态目录，自动脱敏，并可配置轮转上限。
 - **FR-CFG-005**：配置热加载只更新安全的 UI/provider 参数；shell、存储路径等结构性变化提示重启会话。
-- **FR-CFG-006**：提供 `hokann spec list|show|validate` 方便检查内置和用户规格。
+- **FR-CFG-006**：提供 `hokan spec list|show|validate` 方便检查内置和用户规格。
 
 ## 5. 排序与去重需求
 
@@ -221,11 +221,11 @@ Hokann 在用户输入命令时，以低延迟内联列表提供可解释、可�
 
 - 1 MiB bracketed paste 不丢字节、不触发请求风暴。
 - 文件名包含空格、单双引号、反斜杠、CJK 和 emoji 时能生成可逆插入文本。
-- PTY 高吞吐输出时不出现 Hokann UI 字节混入命令输出。
+- PTY 高吞吐输出时不出现 Hokan UI 字节混入命令输出。
 - `BufferSnapshot`、PTY redisplay 和 provider batch 任意交错时，readiness 前不提交新 frame；旧 surface 即使暂时保留也不得再激活旧候选。
 - mode 2026 路径的 presented screen 不出现半帧/空白帧；fallback 在任意 byte/chunk 分片中不出现整块空 surface、prompt 覆盖或 clear-before-paint。
 - resize、scroll、alternate-screen 往返和未知控制序列后，过期 screen epoch frame 必须被拒绝；无法证明安全时列表必须隐藏。
-- Hokann 发出的 BSU/ESU 必须配对；正常/异常恢复只结束 Hokann 自己可能开启但未完成的 synchronized update，不能 reset child/外层持有的 mode，并恢复 SGR、绝对光标和 cursor visibility。
+- Hokan 发出的 BSU/ESU 必须配对；正常/异常恢复只结束 Hokan 自己可能开启但未完成的 synchronized update，不能 reset child/外层持有的 mode，并恢复 SGR、绝对光标和 cursor visibility。
 - 任何候选不得跨越解析器给出的可编辑范围改写管道前序命令。
 - 崩溃恢复测试必须验证 canonical/echo 模式和光标可见性。
 

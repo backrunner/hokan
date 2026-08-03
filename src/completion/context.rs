@@ -2,6 +2,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use crate::{
     parser::{ParsedLine, parse_line},
+    project::WorkspaceMarkers,
     shell::ShellKind,
     terminal::{BufferRevision, QueryId},
 };
@@ -54,6 +55,11 @@ pub struct CompletionContext {
     pub cwd: Arc<PathBuf>,
     pub buffer: BufferSnapshot,
     pub parsed: ParsedLine,
+    /// Last command executed in this session, when known. Session memory
+    /// only — used for the transition bigram signal, never persisted.
+    pub previous_command: Option<String>,
+    /// Workspace markers detected for `cwd`; drives the context bonus.
+    pub workspace: WorkspaceMarkers,
 }
 
 impl CompletionContext {
@@ -71,7 +77,21 @@ impl CompletionContext {
             cwd: Arc::new(cwd),
             buffer,
             parsed,
+            previous_command: None,
+            workspace: WorkspaceMarkers::default(),
         })
+    }
+
+    #[must_use]
+    pub fn with_previous_command(mut self, previous_command: Option<String>) -> Self {
+        self.previous_command = previous_command;
+        self
+    }
+
+    #[must_use]
+    pub fn with_workspace(mut self, workspace: WorkspaceMarkers) -> Self {
+        self.workspace = workspace;
+        self
     }
 
     #[must_use]

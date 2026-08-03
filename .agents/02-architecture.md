@@ -1,14 +1,14 @@
-# Hokann 总体架构
+# Hokan 总体架构
 
 ## 1. 架构目标
 
-Hokann 最难的部分是保持终端和 shell 行编辑器一致，而不是生成候选。架构优先保证以下不变量：
+Hokan 最难的部分是保持终端和 shell 行编辑器一致，而不是生成候选。架构优先保证以下不变量：
 
-1. **shell 是执行真相源**：Hokann 不解释或执行用户命令，只向 shell 提交最终字节。
+1. **shell 是执行真相源**：Hokan 不解释或执行用户命令，只向 shell 提交最终字节。
 2. **单一状态所有者**：输入缓冲区、选中项、query revision 和 overlay 状态只由 reducer 修改。
 3. **单一终端写入序列**：child output、surface 清理、probe 和 overlay frame 必须经过同一 `OutputActor` 排序，不能并发写 stdout。
 4. **候选有版本**：任何异步结果都携带 query id；过期结果被丢弃。
-5. **选择不等于执行**：只有满足严格条件的 `RunCurrent` 才能提交当前缓冲区，其余动作最多修改输入。
+5. **执行需显式意图**：`Enter` 无选中时只提交用户亲手输入的 buffer；执行候选改写文本必须先由用户显式选中（必要时经二次确认），其余动作最多修改输入。
 6. **本地功能不依赖网络**：AI 超时、断网或配置错误不会阻塞 history/spec/files/project。
 7. **终端可恢复优先**：所有退出和挂起路径先恢复 termios 与光标，再处理日志或错误输出。
 
@@ -23,7 +23,7 @@ Hokann 最难的部分是保持终端和 shell 行编辑器一致，而不是生
                         |                              ^
                         v                              |
 +----------+ raw I/O  +--------------------------------------+  PTY  +-----------+
-| terminal |<-------->|                hokann                |<----->| child     |
+| terminal |<-------->|                hokan                |<----->| child     |
 | / SSH    |          | input + reducer + providers + render |       | shell     |
 +----------+          +------------------+-------------------+       +-----+-----+
                                            ^                              |
@@ -31,7 +31,7 @@ Hokann 最难的部分是保持终端和 shell 行编辑器一致，而不是生
                                            +------------------------------+
 ```
 
-`hokann` 是前台父进程。它创建 PTY、启动用户 shell、将真实终端切到 raw mode，并根据 shell 状态决定“拦截用于候选的输入”还是“完全透传给前台程序”。不使用常驻 daemon。
+`hokan` 是前台父进程。它创建 PTY、启动用户 shell、将真实终端切到 raw mode，并根据 shell 状态决定“拦截用于候选的输入”还是“完全透传给前台程序”。不使用常驻 daemon。
 
 ## 3. 进程与 I/O 模型
 
@@ -39,8 +39,8 @@ Hokann 最难的部分是保持终端和 shell 行编辑器一致，而不是生
 
 1. CLI 解析配置并运行 preflight：stdin/stdout 是否为 TTY、`TERM`、shell 路径、数据目录权限。
 2. 创建 session id、双向控制通道和 child PTY。
-3. 为子 shell 设置 `HOKANN_ACTIVE=1`、session token、控制 FD 等环境。
-4. 启动 shell。用户 shell 配置再次执行 `hokann init <shell>` 时，因 `HOKANN_ACTIVE` 已存在，只安装内层 hook，不递归 `exec hokann`。
+3. 为子 shell 设置 `HOKAN_ACTIVE=1`、session token、控制 FD 等环境。
+4. 启动 shell。用户 shell 配置再次执行 `hokan init <shell>` 时，因 `HOKAN_ACTIVE` 已存在，只安装内层 hook，不递归 `exec hokan`。
 5. 收到 control prompt event、对应 PTY render marker 并建立 anchor 后，进入 `Editing`；单独的 control event 不能证明 prompt 已经呈现在 terminal，在此之前所有 I/O 透明转发。
 6. 安装终端恢复守卫和 signal handler 后才启用 overlay。
 
@@ -48,20 +48,20 @@ Hokann 最难的部分是保持终端和 shell 行编辑器一致，而不是生
 
 ```sh
 # zsh / bash 的配置文件中
-eval "$(hokann init zsh)"
+eval "$(hokan init zsh)"
 
 # fish
-hokann init fish | source
+hokan init fish | source
 ```
 
-`hokann init` 输出的脚本必须幂等、可读、带版本号；`hokann doctor` 检查脚本协议版本。自动修改 rc 文件只由显式的 `hokann setup` 执行，并在修改前展示目标路径和创建备份。
+`hokan init` 输出的脚本必须幂等、可读、带版本号；`hokan doctor` 检查脚本协议版本。自动修改 rc 文件只由显式的 `hokan setup` 执行，并在修改前展示目标路径和创建备份。
 
 ### 3.2 数据面和控制面
 
 - **数据面**：真实终端 stdin/stdout 与 child PTY 之间的原始字节。命令运行期间不得经过命令 parser。
 - **控制面**：shell hook 发送结构化事件，至少包括 `PromptBoundary`、`BufferSnapshot`、`CommandStart`、`CommandEnd`、`CwdChanged`。
 - **呈现边界**：adapter 在能力允许时把带 session token 和 boundary id 的零宽 marker 写入 child PTY。`OutputActor` 在转发前只消费严格匹配的 marker，用它建立 control event 与 PTY bytes 的全序；其他 child bytes 保持原样。
-- **回填面**：Hokann 将待回填文本放入 session-scoped 队列，然后向 shell 发送保留键序列；shell widget 从 `hokann ipc take <session>` 读取文本，并通过 `BUFFER/CURSOR`、`READLINE_LINE/READLINE_POINT` 或 `commandline` 原语设置真实缓冲区。
+- **回填面**：Hokan 将待回填文本放入 session-scoped 队列，然后向 shell 发送保留键序列；shell widget 从 `hokan ipc take <session>` 读取文本，并通过 `BUFFER/CURSOR`、`READLINE_LINE/READLINE_POINT` 或 `commandline` 原语设置真实缓冲区。
 
 回填不依赖 `Ctrl-U`。保留键序列由适配器选择并可配置；安装时检测明显冲突。IPC token 至少 128 bit、只通过继承环境传递，socket/临时目录权限为 `0700`。
 
@@ -126,7 +126,7 @@ Editing <-----------------------------+
    | candidates                       | dismiss / apply
    v                                  |
 MenuOpen ---- select AI ----> AiLoading ----> AiResults
-   | RunCurrent                       | cancel/error        |
+   | Enter (执行输入或选中项)   | cancel/error        |
    +--------------+-------------------+---------------------+
                   v
               Executing ---- command end + prompt ----> Editing
@@ -231,17 +231,17 @@ score = match_quality
 
 规格解析后编译为不可变 command tree，并建立 command/alias 索引。编译阶段验证槽位、template、风险和 action：
 
-- `RunCurrent` 只能用于无未解槽位、文本等于当前命令、风险不高于 `low` 的命令。
+- `default = "run_current"` 表示默认候选是裸命令回填项，只允许用于无未解槽位、风险不高于 `low` 的命令；它与其他候选一样只回填，不直接执行。
 - 包含破坏性 flag 的 recipe 不能标记为直接运行。
 - template 中每个 `${slot}` 必须有且仅有一个 slot 定义。
-- 用户规格覆盖内置项时记录 provenance，便于 `hokann spec show` 诊断。
+- 用户规格覆盖内置项时记录 provenance，便于 `hokan spec show` 诊断。
 
 ## 8. History 与本地状态
 
 为保持全 Rust、无 daemon 且支持多个并行终端，v1 使用带锁的 append-only event store，而不是要求单进程独占的嵌入式数据库：
 
 ```text
-$XDG_STATE_HOME/hokann/
+$XDG_STATE_HOME/hokan/
   history.snapshot       # 版本化压缩快照
   history.events         # 长度 + checksum + payload 的追加记录
   history.lock           # 短时 advisory lock
@@ -260,7 +260,7 @@ Credentials 永不进入 history store。默认配置文件只记录 `api_key_en
 
 ## 9. 终端渲染
 
-Hokann 不使用 alternate screen。Ratatui 只作为离屏 UI 库：widgets 渲染到 current `Buffer`，再与 previous `Buffer` 做 cell diff；它不持有真实 stdout，也不长期使用 `Terminal<Viewport::Inline>`。child shell 会在 Ratatui render pass 外改写屏幕，只有自建 compositor 才知道 previous buffer 何时仍可信。
+Hokan 不使用 alternate screen。Ratatui 只作为离屏 UI 库：widgets 渲染到 current `Buffer`，再与 previous `Buffer` 做 cell diff；它不持有真实 stdout，也不长期使用 `Terminal<Viewport::Inline>`。child shell 会在 Ratatui render pass 外改写屏幕，只有自建 compositor 才知道 previous buffer 何时仍可信。
 
 渲染链路为：
 
@@ -277,7 +277,7 @@ terminal replies --> TerminalReplyRouter -------+      | owns
 
 1. `OutputActor` 是唯一真实 stdout writer；child bytes、overlay、探测和恢复序列都由它排序。
 2. `TerminalModel` 首选基于 `vt100` 观察 child output，跟踪 absolute cursor、SGR、scroll、wrap、cursor visibility 和 alternate screen；未知 cursor-affecting 序列使锚点失效。
-3. `RenderBoundaryDecoder` 只消费严格匹配 session/boundary id 的 adapter marker；其余 child bytes 原样进入 `SafeBoundaryScanner`/`TerminalModel`，防止在半个 UTF-8、CSI、OSC、DCS 或其他 control string 中插入 Hokann bytes。
+3. `RenderBoundaryDecoder` 只消费严格匹配 session/boundary id 的 adapter marker；其余 child bytes 原样进入 `SafeBoundaryScanner`/`TerminalModel`，防止在半个 UTF-8、CSI、OSC、DCS 或其他 control string 中插入 Hokan bytes。
 4. anchor 携带 `screen_revision`、`screen_epoch` 和 `Exact | Derived | Unknown` 置信度。任意影响 terminal model 的 child output 推进 revision；resize、scroll、prompt boundary、未知序列和 alternate-screen 往返推进 epoch。旧 revision/epoch frame 不得提交。
 5. overlay session 使用固定高度的专用 surface；首次打开或受控 layout 切换时只预留一次行。连续 query、候选减少和状态变化以 blank cells 填充，不让 prompt/layout 跳动。
 6. surface 从 column 0 开始，宽度不超过 `terminal_cols - 1`，避免最后一列触发 deferred autowrap。
@@ -317,19 +317,19 @@ HTTP client 使用 rustls，支持自定义 base URL，但不自动跟随跨 ori
 - 覆盖重定向、递归操作、通配符作用域；
 - 多命令连接和 command substitution。
 
-任一高风险或解析不确定结果只能回填并显示警告，不能进入 `RunCurrent`。
+任一高风险或解析不确定结果默认只能回填并显示警告；经显式选中执行时，High/Unknown 必须先通过二次确认。
 
 ## 11. 配置和路径
 
 采用 XDG 语义；macOS 也保持一致，便于 SSH/跨机器文档统一：
 
 ```text
-$XDG_CONFIG_HOME/hokann/config.toml       # fallback ~/.config/hokann
-$XDG_CONFIG_HOME/hokann/specs/*.toml      # 用户规格
-$XDG_CONFIG_HOME/hokann/credentials.toml  # 可选，0600
-$XDG_STATE_HOME/hokann/                   # fallback ~/.local/state/hokann
-$XDG_CACHE_HOME/hokann/                   # PATH/project/capability cache
-$XDG_RUNTIME_DIR/hokann/<session>/        # socket；无 XDG_RUNTIME_DIR 时用 0700 临时目录
+$XDG_CONFIG_HOME/hokan/config.toml       # fallback ~/.config/hokan
+$XDG_CONFIG_HOME/hokan/specs/*.toml      # 用户规格
+$XDG_CONFIG_HOME/hokan/credentials.toml  # 可选，0600
+$XDG_STATE_HOME/hokan/                   # fallback ~/.local/state/hokan
+$XDG_CACHE_HOME/hokan/                   # PATH/project/capability cache
+$XDG_RUNTIME_DIR/hokan/<session>/        # socket；无 XDG_RUNTIME_DIR 时用 0700 临时目录
 ```
 
 配置由一个 `Arc<ConfigSnapshot>` 原子替换。热加载失败保留上一个有效快照，并生成非阻塞诊断。
@@ -360,7 +360,7 @@ $XDG_RUNTIME_DIR/hokann/<session>/        # socket；无 XDG_RUNTIME_DIR 时用 
 - provider panic/error：隔离为该来源失败，保留其他候选。
 - compositor 失去锚点：只清除能可靠定位的专用区域、推进 epoch、隐藏 UI，等待新 prompt boundary/CPR；禁止猜测坐标。
 - shell control channel 断开：进入透明 passthrough，提示一次 `doctor` 信息，不终止 shell。
-- child shell 退出：恢复终端，以 child exit status 退出 Hokann。
+- child shell 退出：恢复终端，以 child exit status 退出 Hokan。
 - storage 锁竞争：命令事件先进入进程内队列，在后续 prompt 重试；不得阻塞提交命令。
 - 配置/规格损坏：保留 last-known-good，输出路径和错误位置。
 - panic：panic hook 只写最小脱敏日志；恢复动作必须在 panic hook 之外也由 guard 执行。
@@ -389,4 +389,4 @@ PTY wrapper 才能在 SSH、tmux 和多个 shell 中提供一致内联 UI。代�
 
 ### ADR-006：Ratatui 离屏 Buffer + 自建 compositor
 
-完整 Ratatui `Terminal` 适合应用独占屏幕，但 Hokann 必须与 child shell 共享主屏。离屏 Buffer 保留成熟 layout、style、widget 和 Unicode diff；自建 compositor 则负责 anchor epoch、child output 排序、synchronized output 和恢复协议。代价是需要自行维护小型 frame encoder/scheduler，但其职责远小于自研整个 TUI 或 VT emulator。
+完整 Ratatui `Terminal` 适合应用独占屏幕，但 Hokan 必须与 child shell 共享主屏。离屏 Buffer 保留成熟 layout、style、widget 和 Unicode diff；自建 compositor 则负责 anchor epoch、child output 排序、synchronized output 和恢复协议。代价是需要自行维护小型 frame encoder/scheduler，但其职责远小于自研整个 TUI 或 VT emulator。
