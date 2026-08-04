@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.96"
 description = "A shell-aware terminal completion overlay"
-license = "MIT OR Apache-2.0"
+license = "BSD-3-Clause"
 readme = "README.md"
 documentation = "https://docs.rs/hokan"
 keywords = ["completion", "pty", "shell", "terminal", "tui"]
@@ -17,8 +17,7 @@ include = [
     "/tests/**",
     "/Cargo.lock",
     "/Cargo.toml",
-    "/LICENSE-APACHE",
-    "/LICENSE-MIT",
+    "/LICENSE",
     "/README.md",
 ]
 
@@ -40,6 +39,7 @@ regex = "1.11.1"
 reqwest = { version = "0.12.22", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
+sha2 = "0.10"
 signal-hook = "0.3.18"
 tempfile = "3.20.0"
 thiserror = "2.0.18"

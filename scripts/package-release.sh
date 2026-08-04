@@ -38,7 +38,7 @@ fi
 
 install -d "$stage/bin" "$stage/share/man/man1"
 install -m 0755 "$binary" "$stage/bin/hokan"
-install -m 0644 README.md LICENSE-MIT LICENSE-APACHE "$stage/"
+install -m 0644 README.md LICENSE "$stage/"
 install -m 0644 docs/hokan.1 "$stage/share/man/man1/hokan.1"
 
 COPYFILE_DISABLE=1 tar -C dist -cf - "$package" | gzip -n > "$archive"
