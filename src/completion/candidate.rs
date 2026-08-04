@@ -23,6 +23,7 @@ pub struct DisplayText {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum CandidateSource {
     CommandSpec,
+    CommandHelp,
     History,
     Filesystem,
     Project,
@@ -39,6 +40,7 @@ impl CandidateSource {
     pub const fn label(self) -> &'static str {
         match self {
             Self::CommandSpec => "SPEC",
+            Self::CommandHelp => "HELP",
             Self::History => "HIS",
             Self::Filesystem => "FILE",
             Self::Project => "PROJ",
@@ -55,6 +57,7 @@ impl CandidateSource {
         match self {
             Self::CommandSpec => 300,
             Self::Project => 270,
+            Self::CommandHelp => 250,
             Self::Filesystem | Self::PathCommand => 240,
             Self::History => 220,
             Self::Process | Self::NetworkInterface => 210,
@@ -67,15 +70,16 @@ impl CandidateSource {
     pub(crate) const fn order(self) -> u8 {
         match self {
             Self::CommandSpec => 0,
-            Self::History => 1,
-            Self::Project => 2,
-            Self::Filesystem => 3,
-            Self::PathCommand => 4,
-            Self::Process => 5,
-            Self::NetworkInterface => 6,
-            Self::Action => 7,
-            Self::Ai => 8,
-            Self::Diagnostic => 9,
+            Self::CommandHelp => 1,
+            Self::History => 2,
+            Self::Project => 3,
+            Self::Filesystem => 4,
+            Self::PathCommand => 5,
+            Self::Process => 6,
+            Self::NetworkInterface => 7,
+            Self::Action => 8,
+            Self::Ai => 9,
+            Self::Diagnostic => 10,
         }
     }
 }

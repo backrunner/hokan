@@ -37,6 +37,7 @@ fn fallback_navigation_has_no_blank_intermediate_and_both_models_agree() {
             ticket(1),
             &cursor,
             SyncOutputCapability::UnsupportedFallback,
+            None,
         )
         .expect("initial frame should compose");
     let first_bytes = first.staged().bytes.clone();
@@ -52,6 +53,7 @@ fn fallback_navigation_has_no_blank_intermediate_and_both_models_agree() {
             ticket(2),
             &cursor,
             SyncOutputCapability::UnsupportedFallback,
+            None,
         )
         .expect("navigation frame should compose");
     // Only the single item row changes: the borders (pagination in the top
@@ -94,6 +96,106 @@ fn fallback_navigation_has_no_blank_intermediate_and_both_models_agree() {
     assert_eq!(vt100.screen().cursor_position(), (3, 4));
     assert_eq!(avt.cursor(), (4, 3));
     assert!(avt.cursor().visible);
+}
+
+#[test]
+fn moved_overlay_blanks_vacated_cells_and_both_models_agree() {
+    let size = TerminalSize::new(ROWS, COLS).expect("test terminal size is valid");
+    let geometry_a = SurfaceGeometry::new_anchored(0, OVERLAY_TOP, size, OVERLAY_HEIGHT, 40)
+        .expect("surface A fits terminal");
+    let geometry_b = SurfaceGeometry::new_anchored(6, OVERLAY_TOP, size, OVERLAY_HEIGHT, 40)
+        .expect("surface B fits terminal");
+    assert_eq!(geometry_a.rect.x, 0);
+    assert_eq!(geometry_b.rect.x, 6);
+    let key = |rect| SurfaceKey {
+        screen_epoch: ScreenEpoch::new(1),
+        rect,
+        theme_revision: 1,
+        width_policy: WidthPolicy::Auto,
+    };
+    let cursor = CursorRestore {
+        position: CellPos::new(3, 4),
+        visible: true,
+        sgr: b"\x1b[0m".to_vec(),
+    };
+    let renderer = OverlaySurfaceRenderer::new(OVERLAY_HEIGHT, SurfaceTheme::default(), true);
+    let mut compositor = OverlayCompositor::default();
+
+    let first = compositor
+        .prepare(
+            key(geometry_a.rect),
+            renderer.render(geometry_a, &view(1)),
+            ticket(1),
+            &cursor,
+            SyncOutputCapability::UnsupportedFallback,
+            None,
+        )
+        .expect("initial frame should compose");
+    let first_bytes = first.staged().bytes.clone();
+    compositor
+        .commit(first)
+        .expect("initial frame should commit");
+    let second = compositor
+        .prepare(
+            key(geometry_b.rect),
+            renderer.render(geometry_b, &view(1)),
+            ticket(2),
+            &cursor,
+            SyncOutputCapability::UnsupportedFallback,
+            None,
+        )
+        .expect("moved frame should compose");
+    assert_forbidden_sequences_absent(&second.staged().bytes);
+
+    let mut vt100 = vt100::Parser::new(ROWS, COLS, 0);
+    let mut avt = Vt::new(COLS as usize, ROWS as usize);
+    vt100.process(&first_bytes);
+    avt.feed_str(std::str::from_utf8(&first_bytes).expect("frame transcript is UTF-8"));
+    assert_eq!(
+        vt100
+            .screen()
+            .cell(OVERLAY_TOP, 0)
+            .expect("cell")
+            .contents(),
+        "╭"
+    );
+
+    let mut pending: Vec<u8> = Vec::new();
+    for &byte in &second.staged().bytes {
+        vt100.process(std::slice::from_ref(&byte));
+        pending.push(byte);
+        if let Ok(chunk) = std::str::from_utf8(&pending) {
+            avt.feed_str(chunk);
+            pending.clear();
+        }
+    }
+    assert!(
+        pending.is_empty(),
+        "frame bytes must end on a UTF-8 boundary"
+    );
+
+    // The vacated left edge of the old box is blank in both models…
+    for row in OVERLAY_TOP..OVERLAY_TOP + OVERLAY_HEIGHT {
+        for col in 0..6 {
+            let contents = vt100.screen().cell(row, col).expect("cell").contents();
+            assert!(
+                contents.is_empty() || contents == " ",
+                "vacated cell ({row}, {col}) still holds {contents:?}"
+            );
+        }
+    }
+    // …and the box now sits at its new column in both models.
+    assert_eq!(
+        vt100
+            .screen()
+            .cell(OVERLAY_TOP, 6)
+            .expect("cell")
+            .contents(),
+        "╭"
+    );
+    assert_models_match(&vt100, &avt);
+    assert_eq!(vt100.screen().cursor_position(), (3, 4));
+    assert_eq!(avt.cursor(), (4, 3));
 }
 
 fn view(selected: u64) -> OverlayView {

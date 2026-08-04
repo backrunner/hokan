@@ -218,6 +218,14 @@ impl TerminalModel {
     }
 
     #[must_use]
+    pub fn cell_contents(&self, row: u16, col: u16) -> Option<String> {
+        self.parser
+            .screen()
+            .cell(row, col)
+            .map(|cell| cell.contents().to_string())
+    }
+
+    #[must_use]
     pub fn cursor_restore(&self) -> CursorRestore {
         CursorRestore {
             position: self.cursor(),

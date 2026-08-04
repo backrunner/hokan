@@ -112,6 +112,28 @@ pub fn lookup_icon(word: &str) -> &'static str {
     }
 }
 
+/// Nerd Font glyph for a candidate source label (`SPEC`, `HIS`, …), rendered
+/// in place of the ASCII tag when icons are enabled. `HIS` reuses iris's
+/// history clock; `AI` reuses iris's robot.
+#[must_use]
+pub fn source_glyph(kind: &str) -> &'static str {
+    match kind {
+        "SPEC" => "\u{f02d}", // nf-fa-book
+        "HELP" => "\u{f059}", // nf-fa-question_circle
+        "HIS" => "\u{f1da}",  // nf-fa-history (iris)
+        "FILE" => "\u{f15b}", // nf-fa-file
+        "PROJ" => "\u{f487}", // nf-oct-package
+        "PID" => "\u{f085}",  // nf-fa-gears
+        "NET" => "\u{f0ac}",  // nf-fa-globe
+        "CMD" => "\u{f120}",  // nf-fa-terminal
+        "AI" => "󰫢",          // iris's AI glyph
+        "EXEC" => "\u{f071}", // nf-fa-warning
+        "ACT" => "\u{f0e7}",  // nf-fa-bolt
+        "INFO" => "\u{f05a}", // nf-fa-info_circle
+        _ => FALLBACK_GLYPH,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,6 +143,17 @@ mod tests {
         assert_eq!(lookup_icon("git"), "\u{f02a2}");
         assert_ne!(lookup_icon("Cargo"), FALLBACK_GLYPH);
         assert_ne!(lookup_icon("/usr/bin/kubectl"), FALLBACK_GLYPH);
+    }
+
+    #[test]
+    fn source_labels_have_distinct_glyphs() {
+        for kind in [
+            "SPEC", "HELP", "HIS", "FILE", "PROJ", "PID", "NET", "CMD", "AI", "EXEC", "ACT", "INFO",
+        ] {
+            assert_ne!(source_glyph(kind), FALLBACK_GLYPH, "{kind}");
+        }
+        assert_eq!(source_glyph("HIS"), "\u{f1da}");
+        assert_eq!(source_glyph("NOPE"), FALLBACK_GLYPH);
     }
 
     #[test]

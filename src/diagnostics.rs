@@ -87,6 +87,16 @@ impl DebugLog {
         self.record("ai-request", [("outcome", Value::String(outcome.into()))]);
     }
 
+    /// Records that `hide_overlay` refused to erase the overlay because a
+    /// safety guard rejected the write. Carries only the guard name — never
+    /// buffer or screen content.
+    pub fn overlay_hide_rejected(&self, guard: &'static str) {
+        self.record(
+            "overlay-hide-rejected",
+            [("guard", Value::String(guard.into()))],
+        );
+    }
+
     pub fn config_reload(&self, outcome: &'static str, detail: Option<&str>) {
         let mut fields = vec![("outcome", Value::String(outcome.into()))];
         if let Some(detail) = detail {

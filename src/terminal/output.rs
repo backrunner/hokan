@@ -13,12 +13,14 @@ use ratatui::buffer::Buffer;
 use thiserror::Error;
 
 use super::{
-    AnchorConfidence, BoundaryId, BufferRevision, ChildOutputBatch, CompositorError, DrainState,
-    FrameRevision, FrameTicket, OverlayCompositor, OverlaySurfaceRenderer, OverlayView,
-    RenderBoundaryDecoder, RenderBoundaryEvent, RenderReadiness, SafeBoundaryScanner, ScreenEpoch,
-    ScreenRevision, SessionToken, SurfaceGeometry, SurfaceKey, SurfaceTheme, SyncOutputCapability,
-    SyncOwnership, TerminalGuard, TerminalModel, TerminalSize,
+    AnchorConfidence, BoundaryId, BufferRevision, CellPos, ChildOutputBatch, CompositorError,
+    CursorRestore, DrainState, FrameRevision, FrameTicket, OverlayCompositor,
+    OverlaySurfaceRenderer, OverlayView, RenderBoundaryDecoder, RenderBoundaryEvent,
+    RenderReadiness, SafeBoundaryScanner, ScreenEpoch, ScreenRevision, SessionToken,
+    SurfaceGeometry, SurfaceKey, SurfaceTheme, SyncOutputCapability, SyncOwnership, TerminalGuard,
+    TerminalModel, TerminalSize,
 };
+use crate::diagnostics::DebugLog;
 
 const RECENT_BOUNDARY_LIMIT: usize = 8;
 const MAX_PENDING_CHILD_BYTES: usize = 8 * 1024 * 1024;
@@ -149,6 +151,10 @@ impl OutputHandle {
             .push_control(ControlCommand::SetForeground(foreground))
     }
 
+    pub fn set_debug_log(&self, log: Option<DebugLog>) -> Result<(), OutputError> {
+        self.mailbox.push_control(ControlCommand::SetDebugLog(log))
+    }
+
     pub fn set_foreground_and_wait(&self, foreground: bool) -> Result<(), OutputError> {
         self.set_foreground(foreground)?;
         self.barrier()
@@ -229,6 +235,7 @@ enum ControlCommand {
         nerd_fonts: bool,
     },
     SetForeground(bool),
+    SetDebugLog(Option<DebugLog>),
     Probe(Vec<u8>),
     UnlockMirrored(BufferRevision),
     Snapshot(SyncSender<OutputState>),
@@ -485,6 +492,7 @@ pub struct OutputActor<W: Write> {
     foreground: bool,
     size: TerminalSize,
     report: OutputReport,
+    debug_log: Option<DebugLog>,
 }
 
 impl<W: Write> OutputActor<W> {
@@ -528,6 +536,7 @@ impl<W: Write> OutputActor<W> {
             foreground: false,
             size,
             report: OutputReport::default(),
+            debug_log: None,
         }
     }
 
@@ -660,6 +669,7 @@ impl<W: Write> OutputActor<W> {
                     self.cursor_probe_revision = None;
                 }
             }
+            ControlCommand::SetDebugLog(log) => self.debug_log = log,
             ControlCommand::UnlockMirrored(buffer_revision) => {
                 self.buffer_revision = buffer_revision;
                 self.readiness = if !self.foreground
@@ -764,23 +774,13 @@ impl<W: Write> OutputActor<W> {
         let required_bottom = cursor.row.saturating_add(1).saturating_add(height);
         let scroll = required_bottom.saturating_sub(self.size.rows);
         if scroll > 0 {
-            let restored_row = cursor.row.saturating_sub(scroll);
             let restore = self.model.cursor_restore();
-            let mut bytes = Vec::with_capacity(scroll as usize + 64 + restore.sgr.len());
-            bytes.extend_from_slice(b"\x1b[?25l\x1b[0m");
-            bytes.extend(std::iter::repeat_n(b'\n', scroll as usize));
-            bytes.extend_from_slice(&restore.sgr);
-            bytes.extend_from_slice(
-                format!("\x1b[{};{}H", restored_row + 1, cursor.col + 1).as_bytes(),
-            );
-            bytes.extend_from_slice(if restore.visible {
-                b"\x1b[?25h"
-            } else {
-                b"\x1b[?25l"
-            });
+            let synchronized = self.capability == SyncOutputCapability::AvailableIdle
+                && self.model.sync_ownership() != SyncOwnership::External;
+            let bytes = scroll_room_bytes(self.size.rows, cursor, scroll, &restore, synchronized);
             self.guard.write_control(&bytes)?;
             self.model.apply_hokan_frame(&bytes);
-            self.compositor.invalidate();
+            self.compositor.shift_up(scroll);
         }
 
         let cursor = self.model.cursor();
@@ -840,7 +840,7 @@ impl<W: Write> OutputActor<W> {
             .as_ref()
             .is_some_and(|snapshot| self.model.region_changed(snapshot))
         {
-            self.compositor.invalidate();
+            self.compositor.invalidate_diff_base();
         }
 
         self.guard.write_child(&decoded.passthrough)?;
@@ -997,6 +997,7 @@ impl<W: Write> OutputActor<W> {
             frame.ticket,
             &self.model.cursor_restore(),
             self.capability,
+            Some(&self.model),
         )?;
         self.guard.write_staged(prepared.staged())?;
         self.model.apply_hokan_frame(&prepared.staged().bytes);
@@ -1015,12 +1016,24 @@ impl<W: Write> OutputActor<W> {
             self.compositor.invalidate();
             return Ok(());
         };
-        if !self.scanner.is_safe()
-            || self.model.confidence() == AnchorConfidence::Unknown
-            || key.screen_epoch != self.model.screen_epoch()
-            || self.model.sync_ownership() == SyncOwnership::External
-        {
-            self.compositor.invalidate();
+        let rejected_guard = if !self.scanner.is_safe() {
+            Some("scanner-unsafe")
+        } else if self.model.confidence() == AnchorConfidence::Unknown {
+            Some("confidence-unknown")
+        } else if key.screen_epoch != self.model.screen_epoch() {
+            Some("epoch-mismatch")
+        } else if self.model.sync_ownership() == SyncOwnership::External {
+            Some("external-sync")
+        } else {
+            None
+        };
+        if let Some(guard) = rejected_guard {
+            if let Some(log) = &self.debug_log {
+                log.overlay_hide_rejected(guard);
+            }
+            // The committed overlay is still on screen: keep the footprint so
+            // a later frame can still blank whatever its rect vacates.
+            self.compositor.invalidate_diff_base();
             return Ok(());
         }
         let ticket = FrameTicket {
@@ -1035,6 +1048,7 @@ impl<W: Write> OutputActor<W> {
             ticket,
             &self.model.cursor_restore(),
             self.capability,
+            Some(&self.model),
         )?;
         self.guard.write_staged(prepared.staged())?;
         self.model.apply_hokan_frame(&prepared.staged().bytes);
@@ -1073,6 +1087,45 @@ impl<W: Write> OutputActor<W> {
         self.cursor_probe_revision = None;
         Ok(())
     }
+}
+
+/// Bytes that scroll the screen up by `scroll` lines so the overlay fits
+/// below the edit line, then restore the cursor where the shell left it.
+///
+/// `\n` only scrolls at the bottom row of the scroll region; anywhere else it
+/// merely moves the cursor down. Moving to the last row first turns every
+/// newline into a guaranteed real scroll, so the shell's edit line — which
+/// travels up with the rest of the screen — is exactly at
+/// `cursor.row - scroll` when the restore CUP lands there. When synchronized
+/// output is available the whole injection rides one mode-2026 transaction so
+/// it cannot tear into the shell's in-flight redisplay; otherwise it stays a
+/// single atomic write.
+fn scroll_room_bytes(
+    rows: u16,
+    cursor: CellPos,
+    scroll: u16,
+    restore: &CursorRestore,
+    synchronized: bool,
+) -> Vec<u8> {
+    let restored_row = cursor.row.saturating_sub(scroll);
+    let mut bytes = Vec::with_capacity(scroll as usize + 96 + restore.sgr.len());
+    if synchronized {
+        bytes.extend_from_slice(b"\x1b[?2026h");
+    }
+    bytes.extend_from_slice(b"\x1b[?25l\x1b[0m");
+    bytes.extend_from_slice(format!("\x1b[{rows};1H").as_bytes());
+    bytes.extend(std::iter::repeat_n(b'\n', scroll as usize));
+    bytes.extend_from_slice(&restore.sgr);
+    bytes.extend_from_slice(format!("\x1b[{};{}H", restored_row + 1, cursor.col + 1).as_bytes());
+    bytes.extend_from_slice(if restore.visible {
+        b"\x1b[?25h"
+    } else {
+        b"\x1b[?25l"
+    });
+    if synchronized {
+        bytes.extend_from_slice(b"\x1b[?2026l");
+    }
+    bytes
 }
 
 pub fn spawn_with_writer<W>(
@@ -1128,6 +1181,210 @@ mod tests {
 
     fn token() -> SessionToken {
         SessionToken::parse("0123456789abcdef0123456789abcdef").expect("fixture token is valid")
+    }
+
+    fn cell_row(parser: &vt100::Parser, row: u16, cols: u16) -> String {
+        (0..cols)
+            .map(|col| {
+                parser
+                    .screen()
+                    .cell(row, col)
+                    .map_or_else(|| " ".to_string(), |cell| cell.contents().to_string())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn scroll_room_bytes_scroll_from_the_last_row() {
+        let restore = CursorRestore {
+            position: CellPos::new(20, 13),
+            visible: true,
+            sgr: b"\x1b[0m".to_vec(),
+        };
+        let cursor = CellPos::new(22, 13);
+        let plain = scroll_room_bytes(24, cursor, 2, &restore, false);
+        assert_eq!(
+            plain,
+            b"\x1b[?25l\x1b[0m\x1b[24;1H\n\n\x1b[0m\x1b[21;14H\x1b[?25h".to_vec()
+        );
+        let synchronized = scroll_room_bytes(24, cursor, 2, &restore, true);
+        assert_eq!(
+            synchronized,
+            b"\x1b[?2026h\x1b[?25l\x1b[0m\x1b[24;1H\n\n\x1b[0m\x1b[21;14H\x1b[?25h\x1b[?2026l"
+                .to_vec()
+        );
+        for bytes in [&plain, &synchronized] {
+            assert!(!bytes.windows(4).any(|window| window == b"\x1b[2J"));
+            assert!(
+                !bytes
+                    .windows(8)
+                    .any(|window| window == b"\x1b[?1049h" || window == b"\x1b[?1049l")
+            );
+        }
+    }
+
+    #[test]
+    fn scroll_room_bytes_perform_real_scrolls_for_a_mid_screen_cursor() {
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        parser.process(b"\x1b[21;1HROW_A");
+        parser.process(b"\x1b[23;1HHK> echo LONG");
+        assert_eq!(parser.screen().cursor_position(), (22, 13));
+        let restore = CursorRestore {
+            position: CellPos::new(22, 13),
+            visible: true,
+            sgr: b"\x1b[0m".to_vec(),
+        };
+        // The injection rides a mode-2026 transaction: the vt100 model must
+        // tolerate the wrapper and still apply the same screen effect.
+        let bytes = scroll_room_bytes(24, CellPos::new(22, 13), 2, &restore, true);
+        parser.process(&bytes);
+        // Two real scrolls: every row moved up by two, and the restore CUP
+        // landed exactly where the shell's edit line is now — not two rows
+        // above it, which is where a mid-screen `\n` would have left it.
+        assert_eq!(parser.screen().cursor_position(), (20, 13));
+        assert!(cell_row(&parser, 20, 13).starts_with("HK> echo LONG"));
+        assert!(cell_row(&parser, 18, 5).starts_with("ROW_A"));
+        assert!(cell_row(&parser, 22, 13).trim().is_empty());
+    }
+
+    #[test]
+    fn prepare_surface_scroll_keeps_the_actor_model_consistent() {
+        let size = TerminalSize::new(24, 80).expect("fixture terminal size is valid");
+        let mut actor = OutputActor::new(Vec::new(), token(), size, 3);
+        actor
+            .model
+            .process(b"\x1b[21;1HROW_A")
+            .expect("marker row should parse");
+        actor
+            .model
+            .process(b"\x1b[23;1HHK> echo LONG")
+            .expect("edit line should parse");
+        actor.model.establish_anchor();
+        assert_eq!(actor.model.cursor(), CellPos::new(22, 13));
+        let edit_line_before = actor
+            .model
+            .snapshot_region(ratatui::layout::Rect::new(0, 22, 80, 1));
+
+        let geometry = actor
+            .prepare_surface_geometry()
+            .expect("geometry should prepare")
+            .expect("overlay fits after scrolling");
+        assert_eq!(geometry.rect, ratatui::layout::Rect::new(0, 21, 79, 3));
+
+        // The model applied the same bytes the terminal received: the cursor
+        // sits on the scrolled edit line and the old edit-line row changed.
+        assert_eq!(actor.model.cursor(), CellPos::new(20, 13));
+        assert!(actor.model.region_changed(&edit_line_before));
+
+        let writer = actor.guard.finish().expect("guard should finish");
+        let bottom_cup = b"\x1b[24;1H";
+        let scrolls = b"\n\n";
+        let restore_cup = b"\x1b[21;14H";
+        let bottom_at = writer
+            .windows(bottom_cup.len())
+            .position(|window| window == bottom_cup)
+            .expect("injection must first move to the last row");
+        let scrolls_at = writer
+            .windows(scrolls.len())
+            .position(|window| window == scrolls)
+            .expect("injection must emit the scroll newlines");
+        let restore_at = writer
+            .windows(restore_cup.len())
+            .position(|window| window == restore_cup)
+            .expect("injection must restore the cursor");
+        assert!(bottom_at < scrolls_at && scrolls_at < restore_at);
+        // Fallback capability: no synchronized transaction is opened.
+        assert!(
+            !writer
+                .windows(b"\x1b[?2026h".len())
+                .any(|window| window == b"\x1b[?2026h")
+        );
+    }
+
+    #[test]
+    fn prepare_surface_scroll_is_wrapped_in_a_transaction_when_2026_is_available() {
+        let size = TerminalSize::new(24, 80).expect("fixture terminal size is valid");
+        let mut actor = OutputActor::new(Vec::new(), token(), size, 3);
+        actor
+            .model
+            .process(b"\x1b[23;1HHK> echo LONG")
+            .expect("edit line should parse");
+        actor.model.establish_anchor();
+        actor.capability = SyncOutputCapability::AvailableIdle;
+
+        let geometry = actor
+            .prepare_surface_geometry()
+            .expect("geometry should prepare")
+            .expect("overlay fits after scrolling");
+        assert_eq!(geometry.rect, ratatui::layout::Rect::new(0, 21, 79, 3));
+        assert_eq!(actor.model.cursor(), CellPos::new(20, 13));
+
+        let writer = actor.guard.finish().expect("guard should finish");
+        assert!(writer.starts_with(b"\x1b[?2026h"));
+        let end_sync = b"\x1b[?2026l";
+        let end_at = writer
+            .windows(end_sync.len())
+            .position(|window| window == end_sync)
+            .expect("injection must close its own transaction");
+        // Exactly one transaction: the restore presentation written by
+        // finish() must come after the injection's closing sequence.
+        assert_eq!(
+            writer
+                .windows(end_sync.len())
+                .filter(|window| window == end_sync)
+                .count(),
+            1
+        );
+        assert!(writer[end_at + end_sync.len()..].starts_with(b"\x18\x1b[0m\x1b[?25h"));
+    }
+
+    #[test]
+    fn hide_overlay_guard_rejection_writes_a_debug_log_event() {
+        let directory = tempfile::tempdir().expect("temporary state directory");
+        let log = DebugLog::from_config(
+            directory.path(),
+            &crate::config::LoggingConfig {
+                enabled: true,
+                max_bytes: 64 * 1024,
+                rotations: 1,
+            },
+        )
+        .expect("logger should build")
+        .expect("logger should be enabled");
+        let size = TerminalSize::new(24, 80).expect("fixture terminal size is valid");
+        let mut actor = OutputActor::new(Vec::new(), token(), size, 3);
+        actor.debug_log = Some(log);
+
+        let frame = frame_request();
+        let buffer = actor.renderer.render(frame.geometry, &frame.view);
+        let cursor = actor.model.cursor_restore();
+        let prepared = actor
+            .compositor
+            .prepare(
+                frame.key,
+                buffer,
+                frame.ticket,
+                &cursor,
+                SyncOutputCapability::UnsupportedFallback,
+                None,
+            )
+            .expect("frame should compose");
+        actor
+            .compositor
+            .commit(prepared)
+            .expect("frame should commit");
+        actor.last_committed_ticket = Some(frame.ticket);
+        // The model anchor is still Unknown: the guard must reject the hide
+        // without touching the terminal, and record which guard fired.
+        actor.hide_overlay().expect("hide should not error");
+
+        let text = std::fs::read_to_string(directory.path().join("debug.log")).expect("debug log");
+        let line = text
+            .lines()
+            .find(|line| line.contains("overlay-hide-rejected"))
+            .expect("rejection event should be recorded");
+        assert!(line.contains("confidence-unknown"), "event line: {line}");
+        assert!(actor.compositor.current_key().is_none());
     }
 
     fn frame_request() -> FrameRequest {

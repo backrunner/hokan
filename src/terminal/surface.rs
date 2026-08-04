@@ -8,7 +8,7 @@ use ratatui::{
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use super::{TerminalSize, icons::FALLBACK_GLYPH};
+use super::{TerminalSize, icons, icons::FALLBACK_GLYPH};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SanitizedText(String);
@@ -285,6 +285,7 @@ impl SurfaceTheme {
         }
         let color = match kind {
             "SPEC" => Color::Magenta,
+            "HELP" => Color::Blue,
             "HIS" => Color::Green,
             "FILE" => Color::Blue,
             "PROJ" => Color::Cyan,
@@ -433,8 +434,7 @@ impl OverlaySurfaceRenderer {
 
         let icons_w = if self.icons { ICON_SECTION } else { 0 };
         let left_w = SIDE_PAD + MARKER_WIDTH + 1 + RISK_SLOT + icons_w;
-        let tag = truncate_to_width(row.kind.as_str(), MAX_TAG_WIDTH);
-        let tag_w = UnicodeWidthStr::width(tag.as_str());
+        let (tag, tag_w) = self.tag_display(row.kind.as_str());
         // +1 keeps a visible gap between the description and the source tag.
         let right_w = SIDE_PAD + tag_w + 1;
         let avail = inner.saturating_sub(left_w + right_w);
@@ -531,7 +531,25 @@ impl OverlaySurfaceRenderer {
         }
 
         let tag_x = x + (width - 1 - SIDE_PAD - tag_w) as u16;
-        buffer.set_stringn(tag_x, y, tag, tag_w, self.theme.tag(row.kind.as_str()));
+        buffer.set_stringn(
+            tag_x,
+            y,
+            tag.as_str(),
+            tag_w,
+            self.theme.tag(row.kind.as_str()),
+        );
+    }
+
+    /// Source tag text and its display width: a Nerd Font glyph when icons
+    /// are enabled, the ASCII label otherwise.
+    fn tag_display(&self, kind: &str) -> (String, usize) {
+        if self.icons {
+            (icons::source_glyph(kind).to_owned(), 1)
+        } else {
+            let tag = truncate_to_width(kind, MAX_TAG_WIDTH);
+            let width = UnicodeWidthStr::width(tag.as_str());
+            (tag, width)
+        }
     }
 
     /// Shared primary column width for rows that show a description, so the
@@ -552,9 +570,7 @@ impl OverlaySurfaceRenderer {
             if !has_description {
                 continue;
             }
-            let tag_w = UnicodeWidthStr::width(
-                truncate_to_width(row.kind.as_str(), MAX_TAG_WIDTH).as_str(),
-            );
+            let (_, tag_w) = self.tag_display(row.kind.as_str());
             let avail = inner.saturating_sub(left_w + SIDE_PAD + tag_w + 1);
             if avail < MIN_PRIMARY_WIDTH + GAP + MIN_DESC_VISIBLE {
                 continue;
@@ -749,7 +765,7 @@ mod tests {
         assert!(first.starts_with('│'), "{first}");
         assert!(first.contains('▶'), "{first}");
         assert!(first.contains("git checkout"), "{first}");
-        assert!(first.trim_end().ends_with("SPEC │"), "{first}");
+        assert!(first.trim_end().ends_with("\u{f02d} │"), "{first}");
         let bottom = row_text(&buffer, 13);
         assert!(bottom.starts_with('╰'), "{bottom}");
         assert!(bottom.contains("Tab"), "{bottom}");
@@ -803,7 +819,7 @@ mod tests {
         let buffer = renderer.render(geometry, &view);
         let row = row_text(&buffer, 11);
         assert!(row.starts_with("│ ▶ ! "), "{row}");
-        assert!(row.trim_end().ends_with("CMD │"), "{row}");
+        assert!(row.trim_end().ends_with("\u{f120} │"), "{row}");
     }
 
     #[test]
@@ -1010,7 +1026,7 @@ mod tests {
         let text = row_text(&buffer, 11);
         assert!(text.contains("rm -rf /tmp/x"), "{text}");
         assert!(text.contains("! ❯ rm -rf /tmp/x"), "{text}");
-        assert!(text.trim_end().ends_with("EXEC │"), "{text}");
+        assert!(text.trim_end().ends_with("\u{f071} │"), "{text}");
         let area = buffer.area();
         let byte_offset = text.find("rm -rf").expect("primary text");
         let offset = row_text(&buffer, 11)[..byte_offset].chars().count() as u16;

@@ -2,11 +2,12 @@ use std::fmt;
 
 use ratatui::{
     backend::{Backend, CrosstermBackend},
-    buffer::{Buffer, CellDiffOption},
+    buffer::{Buffer, Cell, CellDiffOption},
+    layout::{Position, Rect},
 };
 use thiserror::Error;
 
-use super::{FrameTicket, SurfaceKey, SyncOutputCapability, model::CursorRestore};
+use super::{FrameTicket, SurfaceKey, SyncOutputCapability, TerminalModel, model::CursorRestore};
 
 #[derive(Debug, Error)]
 pub enum CompositorError {
@@ -76,7 +77,16 @@ impl PreparedFrame {
 
 #[derive(Debug, Default)]
 pub struct OverlayCompositor {
+    /// Diff base: the last committed frame, dropped whenever the shell may
+    /// have written into the overlay region or the content moved.
     previous: Option<(SurfaceKey, Buffer)>,
+    /// Footprint: the last committed frame as the screen still shows it.
+    /// Survives diff-base invalidation (shell overwrites are filtered out
+    /// against the terminal model at prepare time) and is translated by
+    /// `shift_up` when hokan scrolls the screen, so the cells a moved box
+    /// vacates can still be blanked. Dropped by `invalidate`, because an
+    /// epoch change makes the coordinates meaningless.
+    footprint: Option<(SurfaceKey, Buffer)>,
     generation: u64,
 }
 
@@ -88,6 +98,7 @@ impl OverlayCompositor {
         ticket: FrameTicket,
         cursor: &CursorRestore,
         capability: SyncOutputCapability,
+        model: Option<&TerminalModel>,
     ) -> Result<PreparedFrame, CompositorError> {
         if current.area != key.rect {
             return Err(CompositorError::AreaMismatch);
@@ -121,7 +132,27 @@ impl OverlayCompositor {
         } else {
             &encoded_current
         };
-        let changes: Vec<_> = previous.diff_iter(diff_target).collect();
+        let mut changes: Vec<(u16, u16, Cell)> = previous
+            .diff_iter(diff_target)
+            .map(|(x, y, cell)| (x, y, cell.clone()))
+            .collect();
+        // A moved box leaves the cells its old rect no longer covers on
+        // screen: the diff above only spans the new rect. Blank the vacated
+        // cells in the same staged frame so the stale border is erased inside
+        // the same transaction. An epoch mismatch means the footprint's
+        // coordinates no longer describe the screen, so blanking is skipped
+        // rather than erasing live shell content.
+        if let Some((footprint_key, footprint_buffer)) = self.footprint.as_ref()
+            && footprint_key.screen_epoch == key.screen_epoch
+            && footprint_key.rect != key.rect
+        {
+            changes.extend(vacated_blanks(
+                footprint_key.rect,
+                key.rect,
+                footprint_buffer,
+                model,
+            ));
+        }
         let changed_cells = changes.len();
         let mut changed_rows: Vec<u16> = changes.iter().map(|(_, y, _)| *y).collect();
         changed_rows.sort_unstable();
@@ -151,7 +182,7 @@ impl OverlayCompositor {
         }
         {
             let mut backend = CrosstermBackend::new(&mut bytes);
-            backend.draw(changes.into_iter())?;
+            backend.draw(changes.iter().map(|(x, y, cell)| (*x, *y, cell)))?;
         }
         bytes.extend_from_slice(b"\x1b[0m");
         bytes.extend_from_slice(&cursor.sgr);
@@ -191,13 +222,42 @@ impl OverlayCompositor {
         if prepared.base_generation != self.generation {
             return Err(CompositorError::StalePreparedFrame);
         }
+        self.footprint = Some((prepared.staged.key, prepared.target.clone()));
         self.previous = Some((prepared.staged.key, prepared.target));
         self.generation = self.generation.saturating_add(1);
         Ok(())
     }
 
+    /// The screen no longer matches anything hokan painted (epoch change,
+    /// resize, suspend, foreground app): drop both the diff base and the
+    /// footprint.
     pub fn invalidate(&mut self) {
         self.previous = None;
+        self.footprint = None;
+        self.generation = self.generation.saturating_add(1);
+    }
+
+    /// The shell wrote into the overlay region: the committed buffer can no
+    /// longer serve as a diff base, but the cells the shell did not touch
+    /// still show the footprint, so it is kept for vacated-cell blanking.
+    pub fn invalidate_diff_base(&mut self) {
+        self.previous = None;
+        self.generation = self.generation.saturating_add(1);
+    }
+
+    /// Hokan scrolled the screen up by `scroll` rows: the committed content
+    /// moved with it. The footprint is translated so the next frame can blank
+    /// whatever its new rect does not cover; the diff base is dropped.
+    pub fn shift_up(&mut self, scroll: u16) {
+        self.previous = None;
+        if let Some((key, buffer)) = &mut self.footprint {
+            if key.rect.y >= scroll {
+                key.rect.y = key.rect.y.saturating_sub(scroll);
+                buffer.area = key.rect;
+            } else {
+                self.footprint = None;
+            }
+        }
         self.generation = self.generation.saturating_add(1);
     }
 
@@ -210,6 +270,53 @@ impl OverlayCompositor {
     pub fn current_key(&self) -> Option<SurfaceKey> {
         self.previous.as_ref().map(|(key, _)| *key)
     }
+}
+
+/// Default-styled blank cells for the region the footprint rect vacated:
+/// every footprint cell outside the new rect that still holds visible
+/// content. Cells already blank need no write, and the blank target is always
+/// `Cell::default()` so a vacated selected-row background cannot survive as a
+/// painted block. When the terminal model is available, a cell is only
+/// blanked while the screen still shows the footprint glyph there — cells the
+/// shell overwrote since the commit belong to the shell. (Empty and space
+/// symbols are treated as equivalent: a space written over a space is
+/// invisible either way.)
+fn vacated_blanks(
+    old: Rect,
+    new: Rect,
+    old_buffer: &Buffer,
+    model: Option<&TerminalModel>,
+) -> Vec<(u16, u16, Cell)> {
+    let mut blanks = Vec::new();
+    for y in old.y..old.bottom() {
+        for x in old.x..old.right() {
+            if new.contains(Position { x, y }) {
+                continue;
+            }
+            let cell = &old_buffer[(x, y)];
+            if *cell == Cell::default() {
+                continue;
+            }
+            if let Some(model) = model {
+                let on_screen = model.cell_contents(y, x).unwrap_or_default();
+                let on_screen = if on_screen.is_empty() {
+                    " "
+                } else {
+                    on_screen.as_str()
+                };
+                let symbol = if cell.symbol().is_empty() {
+                    " "
+                } else {
+                    cell.symbol()
+                };
+                if on_screen != symbol {
+                    continue;
+                }
+            }
+            blanks.push((x, y, Cell::default()));
+        }
+    }
+    blanks
 }
 
 fn validate_buffer(buffer: &Buffer) -> Result<(), CompositorError> {
@@ -318,6 +425,284 @@ mod tests {
     }
 
     #[test]
+    fn rect_move_blanks_vacated_cells_in_the_same_transaction() {
+        let (_, ticket, cursor, view) = fixture();
+        let size = crate::terminal::TerminalSize::new(24, 80).expect("fixture size is valid");
+        let geometry_a = SurfaceGeometry::new_anchored(0, 4, size, 3, 40).expect("geometry A");
+        let geometry_b = SurfaceGeometry::new_anchored(6, 4, size, 3, 40).expect("geometry B");
+        assert_eq!(geometry_a.rect.x, 0);
+        assert_eq!(geometry_b.rect.x, 6);
+        let key_a = crate::terminal::SurfaceKey {
+            screen_epoch: ScreenEpoch::new(1),
+            rect: geometry_a.rect,
+            theme_revision: 1,
+            width_policy: crate::terminal::WidthPolicy::Auto,
+        };
+        let key_b = crate::terminal::SurfaceKey {
+            rect: geometry_b.rect,
+            ..key_a
+        };
+        let renderer = OverlaySurfaceRenderer::new(3, SurfaceTheme::default(), true);
+        let mut compositor = OverlayCompositor::default();
+        let first = compositor
+            .prepare(
+                key_a,
+                renderer.render(geometry_a, &view),
+                ticket,
+                &cursor,
+                SyncOutputCapability::AvailableIdle,
+                None,
+            )
+            .expect("first frame should compose");
+        let first_bytes = first.staged().bytes.clone();
+        compositor.commit(first).expect("first frame should commit");
+
+        let second = compositor
+            .prepare(
+                key_b,
+                renderer.render(geometry_b, &view),
+                crate::terminal::FrameTicket {
+                    frame_revision: crate::terminal::FrameRevision::new(2),
+                    ..ticket
+                },
+                &cursor,
+                SyncOutputCapability::AvailableIdle,
+                None,
+            )
+            .expect("moved frame should compose");
+        let bytes = &second.staged().bytes;
+        // The blanking rides the same single transaction as the repaint.
+        assert!(bytes.starts_with(b"\x1b[?2026h"));
+        assert!(bytes.ends_with(b"\x1b[?2026l"));
+        assert_eq!(
+            bytes
+                .windows(b"\x1b[?2026h".len())
+                .filter(|window| window == b"\x1b[?2026h")
+                .count(),
+            1
+        );
+        assert_eq!(second.staged().changed_rows, vec![4, 5, 6]);
+
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        parser.process(&first_bytes);
+        assert_eq!(parser.screen().cell(4, 0).expect("cell").contents(), "╭");
+        parser.process(bytes);
+        // The vacated left border column (and the selected row's styled
+        // interior cells) are blank after the move…
+        for row in 4..7 {
+            for col in 0..6 {
+                let contents = parser.screen().cell(row, col).expect("cell").contents();
+                assert!(
+                    contents.is_empty() || contents == " ",
+                    "vacated cell ({row}, {col}) still holds {contents:?}"
+                );
+            }
+        }
+        // …and the box now sits at its new column.
+        assert_eq!(parser.screen().cell(4, 6).expect("cell").contents(), "╭");
+        assert_eq!(parser.screen().cell(5, 6).expect("cell").contents(), "│");
+        assert_eq!(parser.screen().cell(6, 6).expect("cell").contents(), "╰");
+    }
+
+    #[test]
+    fn shell_overwritten_vacated_cells_are_never_blanked() {
+        let (_, ticket, cursor, view) = fixture();
+        let size = crate::terminal::TerminalSize::new(24, 80).expect("fixture size is valid");
+        let geometry_a = SurfaceGeometry::new_anchored(0, 4, size, 3, 40).expect("geometry A");
+        let geometry_b = SurfaceGeometry::new_anchored(6, 4, size, 3, 40).expect("geometry B");
+        let key_a = crate::terminal::SurfaceKey {
+            screen_epoch: ScreenEpoch::new(1),
+            rect: geometry_a.rect,
+            theme_revision: 1,
+            width_policy: crate::terminal::WidthPolicy::Auto,
+        };
+        let key_b = crate::terminal::SurfaceKey {
+            rect: geometry_b.rect,
+            ..key_a
+        };
+        let renderer = OverlaySurfaceRenderer::new(3, SurfaceTheme::default(), true);
+        let mut compositor = OverlayCompositor::default();
+        let mut model = TerminalModel::new(size);
+        let first = compositor
+            .prepare(
+                key_a,
+                renderer.render(geometry_a, &view),
+                ticket,
+                &cursor,
+                SyncOutputCapability::UnsupportedFallback,
+                None,
+            )
+            .expect("first frame should compose");
+        let first_bytes = first.staged().bytes.clone();
+        compositor.commit(first).expect("first frame should commit");
+        model.apply_hokan_frame(&first_bytes);
+
+        // The shell writes into the overlay region: the diff base is dropped
+        // but the footprint survives, and the shell's cells are filtered out
+        // of the blanking set against the model.
+        model
+            .process(b"\x1b[6;1Hfg")
+            .expect("shell write should parse");
+        compositor.invalidate_diff_base();
+
+        let second = compositor
+            .prepare(
+                key_b,
+                renderer.render(geometry_b, &view),
+                crate::terminal::FrameTicket {
+                    frame_revision: crate::terminal::FrameRevision::new(2),
+                    ..ticket
+                },
+                &cursor,
+                SyncOutputCapability::UnsupportedFallback,
+                Some(&model),
+            )
+            .expect("moved frame should compose");
+
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        parser.process(&first_bytes);
+        parser.process(b"\x1b[6;1Hfg");
+        parser.process(&second.staged().bytes);
+        // The shell's text inside the vacated region is untouched…
+        assert_eq!(parser.screen().cell(5, 0).expect("cell").contents(), "f");
+        assert_eq!(parser.screen().cell(5, 1).expect("cell").contents(), "g");
+        // …while the stale border cells the shell never wrote are blanked.
+        for row in [4, 6] {
+            let contents = parser.screen().cell(row, 0).expect("cell").contents();
+            assert!(
+                contents.is_empty() || contents == " ",
+                "vacated cell ({row}, 0) still holds {contents:?}"
+            );
+        }
+        assert_eq!(parser.screen().cell(4, 6).expect("cell").contents(), "╭");
+    }
+
+    #[test]
+    fn shifted_footprint_blanks_scrolled_border_cells() {
+        let (_, ticket, cursor, view) = fixture();
+        let size = crate::terminal::TerminalSize::new(24, 80).expect("fixture size is valid");
+        let geometry_a = SurfaceGeometry::new_anchored(0, 4, size, 3, 40).expect("geometry A");
+        let geometry_b = SurfaceGeometry::new_anchored(6, 4, size, 3, 40).expect("geometry B");
+        let key_a = crate::terminal::SurfaceKey {
+            screen_epoch: ScreenEpoch::new(1),
+            rect: geometry_a.rect,
+            theme_revision: 1,
+            width_policy: crate::terminal::WidthPolicy::Auto,
+        };
+        let key_b = crate::terminal::SurfaceKey {
+            rect: geometry_b.rect,
+            ..key_a
+        };
+        let renderer = OverlaySurfaceRenderer::new(3, SurfaceTheme::default(), true);
+        let mut compositor = OverlayCompositor::default();
+        let mut model = TerminalModel::new(size);
+        let first = compositor
+            .prepare(
+                key_a,
+                renderer.render(geometry_a, &view),
+                ticket,
+                &cursor,
+                SyncOutputCapability::UnsupportedFallback,
+                None,
+            )
+            .expect("first frame should compose");
+        let first_bytes = first.staged().bytes.clone();
+        compositor.commit(first).expect("first frame should commit");
+        model.apply_hokan_frame(&first_bytes);
+
+        // Hokan scrolls the screen up one row to make room below the edit
+        // line: the footprint follows the shifted content.
+        model.apply_hokan_frame(b"\x1b[24;1H\n");
+        compositor.shift_up(1);
+
+        let second = compositor
+            .prepare(
+                key_b,
+                renderer.render(geometry_b, &view),
+                crate::terminal::FrameTicket {
+                    frame_revision: crate::terminal::FrameRevision::new(2),
+                    ..ticket
+                },
+                &cursor,
+                SyncOutputCapability::UnsupportedFallback,
+                Some(&model),
+            )
+            .expect("moved frame should compose");
+
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        parser.process(&first_bytes);
+        parser.process(b"\x1b[24;1H\n");
+        parser.process(&second.staged().bytes);
+        // The shifted old box (rows 3..=5 at x=0) is blanked everywhere the
+        // new rect does not cover it.
+        for row in 3..=5 {
+            for col in 0..6 {
+                let contents = parser.screen().cell(row, col).expect("cell").contents();
+                assert!(
+                    contents.is_empty() || contents == " ",
+                    "vacated cell ({row}, {col}) still holds {contents:?}"
+                );
+            }
+        }
+        assert_eq!(parser.screen().cell(4, 6).expect("cell").contents(), "╭");
+    }
+
+    #[test]
+    fn epoch_mismatch_skips_vacated_blanking() {
+        let (_, ticket, cursor, view) = fixture();
+        let size = crate::terminal::TerminalSize::new(24, 80).expect("fixture size is valid");
+        let geometry_a = SurfaceGeometry::new_anchored(0, 4, size, 3, 40).expect("geometry A");
+        let geometry_b = SurfaceGeometry::new_anchored(6, 4, size, 3, 40).expect("geometry B");
+        let key_a = crate::terminal::SurfaceKey {
+            screen_epoch: ScreenEpoch::new(1),
+            rect: geometry_a.rect,
+            theme_revision: 1,
+            width_policy: crate::terminal::WidthPolicy::Auto,
+        };
+        let key_b = crate::terminal::SurfaceKey {
+            screen_epoch: ScreenEpoch::new(2),
+            rect: geometry_b.rect,
+            ..key_a
+        };
+        let renderer = OverlaySurfaceRenderer::new(3, SurfaceTheme::default(), true);
+        let mut compositor = OverlayCompositor::default();
+        let first = compositor
+            .prepare(
+                key_a,
+                renderer.render(geometry_a, &view),
+                ticket,
+                &cursor,
+                SyncOutputCapability::UnsupportedFallback,
+                None,
+            )
+            .expect("first frame should compose");
+        let first_bytes = first.staged().bytes.clone();
+        compositor.commit(first).expect("first frame should commit");
+
+        let second = compositor
+            .prepare(
+                key_b,
+                renderer.render(geometry_b, &view),
+                crate::terminal::FrameTicket {
+                    frame_revision: crate::terminal::FrameRevision::new(2),
+                    screen_epoch: ScreenEpoch::new(2),
+                    ..ticket
+                },
+                &cursor,
+                SyncOutputCapability::UnsupportedFallback,
+                None,
+            )
+            .expect("moved frame should compose");
+        // The old buffer no longer describes the screen, so the vacated cells
+        // are left alone rather than blanking live shell content.
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        parser.process(&first_bytes);
+        parser.process(&second.staged().bytes);
+        assert_eq!(parser.screen().cell(4, 0).expect("cell").contents(), "╭");
+        assert_eq!(parser.screen().cell(4, 6).expect("cell").contents(), "╭");
+    }
+
+    #[test]
     fn synchronized_frame_is_staged_and_paired() {
         let (key, ticket, cursor, view) = fixture();
         let renderer = OverlaySurfaceRenderer::new(3, SurfaceTheme::default(), true);
@@ -332,6 +717,7 @@ mod tests {
                 ticket,
                 &cursor,
                 SyncOutputCapability::AvailableIdle,
+                None,
             )
             .expect("frame should compose");
         let bytes = &prepared.staged().bytes;
@@ -360,6 +746,7 @@ mod tests {
                 ticket,
                 &cursor,
                 SyncOutputCapability::UnsupportedFallback,
+                None,
             )
             .expect("fallback frame should compose");
         assert!(!prepared.staged().synchronized);
@@ -376,6 +763,7 @@ mod tests {
                 ticket,
                 &cursor,
                 SyncOutputCapability::UnsupportedFallback,
+                None,
             )
             .expect("stale fixture should prepare");
         let newer_buffer = renderer.render(geometry, &view);
@@ -389,6 +777,7 @@ mod tests {
                 },
                 &cursor,
                 SyncOutputCapability::UnsupportedFallback,
+                None,
             )
             .expect("new fixture should prepare");
         compositor.commit(newer).expect("newer frame should commit");
@@ -411,6 +800,7 @@ mod tests {
             ticket,
             &cursor,
             SyncOutputCapability::BusyExternal,
+            None,
         );
         assert!(matches!(
             result,

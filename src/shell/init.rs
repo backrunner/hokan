@@ -39,7 +39,13 @@ if [[ -n ${HOKAN_ACTIVE:-} && -n ${HOKAN_CONTROL_FIFO:-} && -z ${__HOKAN_ZSH_LOA
     if [[ "$PROMPT" != "$__hokan_wrapped_prompt" ]]; then
       __hokan_prompt_base="$PROMPT"
     fi
-    __hokan_wrapped_prompt='${__hokan_prompt_base}%{$(__hokan_prompt_marker)%}'
+    # Embed the marker literally: themes like oh-my-posh unset PROMPT_SUBST in
+    # their own precmd, so a deferred `$(...)` would render as literal text.
+    # The id only advances per precmd, so repeated prints on redisplay are
+    # identical to what deferred evaluation produced.
+    local __hokan_marker
+    __hokan_marker="$(__hokan_prompt_marker)"
+    __hokan_wrapped_prompt="${__hokan_prompt_base}%{${__hokan_marker}%}"
     PROMPT="$__hokan_wrapped_prompt"
   }
 
@@ -63,6 +69,11 @@ if [[ -n ${HOKAN_ACTIVE:-} && -n ${HOKAN_CONTROL_FIFO:-} && -z ${__HOKAN_ZSH_LOA
   }
 
   function __hokan_line_pre_redraw() {
+    # Themes with async rendering (oh-my-posh) can overwrite PROMPT after the
+    # precmd chain; re-assert the wrapper. The guard keeps this recursion-free.
+    if [[ "$PROMPT" != "$__hokan_wrapped_prompt" ]]; then
+      __hokan_refresh_prompt
+    fi
     (( __hokan_redisplay_id++ ))
     printf 'HKP2\tBUFFER\t%d\t%d\t%s\0' "$__hokan_redisplay_id" "$CURSOR" \
       "$BUFFER" >&$__hokan_control_fd

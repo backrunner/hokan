@@ -1,4 +1,4 @@
-use std::{fs, os::unix::fs::PermissionsExt, time::Instant};
+use std::{fs, os::unix::fs::PermissionsExt, sync::Arc, time::Instant};
 
 use crate::{
     completion::{
@@ -7,6 +7,8 @@ use crate::{
         SlotKind, TextEdit,
     },
     parser::escape_for_shell,
+    providers::{CommandHelpCache, argument_progress},
+    specs::SpecRegistry,
     terminal::RiskLevel,
 };
 
@@ -15,12 +17,18 @@ const DIRECTORY_BUDGET_MS: u128 = 80;
 
 pub struct FilesystemProvider {
     show_hidden: bool,
+    specs: Arc<SpecRegistry>,
+    help: Arc<CommandHelpCache>,
 }
 
 impl FilesystemProvider {
     #[must_use]
-    pub const fn new(show_hidden: bool) -> Self {
-        Self { show_hidden }
+    pub fn new(show_hidden: bool, specs: Arc<SpecRegistry>, help: Arc<CommandHelpCache>) -> Self {
+        Self {
+            show_hidden,
+            specs,
+            help,
+        }
     }
 }
 
@@ -30,11 +38,11 @@ impl CandidateProvider for FilesystemProvider {
     }
 
     fn applies(&self, context: &CompletionContext) -> bool {
-        infer_slot(context).is_some()
+        self.infer_slot(context).is_some()
     }
 
     fn complete(&self, context: &CompletionContext) -> ProviderOutput {
-        let Some(slot) = infer_slot(context) else {
+        let Some(slot) = self.infer_slot(context) else {
             return ProviderOutput::default();
         };
         let prefix = context.parsed.current_prefix.as_str();
@@ -87,10 +95,13 @@ impl CandidateProvider for FilesystemProvider {
                 continue;
             }
             let mut logical = format!("{directory_prefix}{name}");
+            // A leading dash makes the path look like a flag (`cd -foo/`);
+            // prefix `./` for directories and files alike.
+            if directory_prefix.is_empty() && logical.starts_with('-') {
+                logical.insert_str(0, "./");
+            }
             if directory {
                 logical.push('/');
-            } else if directory_prefix.is_empty() && logical.starts_with('-') {
-                logical.insert_str(0, "./");
             }
             // The edit replaces the complete raw token, including any open quote.
             let replacement = escape_for_shell(
@@ -168,46 +179,46 @@ impl CandidateProvider for FilesystemProvider {
     }
 }
 
-fn infer_slot(context: &CompletionContext) -> Option<SlotKind> {
-    let command = context.command()?;
-    let command_token = context.parsed.tokens.iter().find(|token| {
-        token.kind == crate::parser::TokenKind::Word
-            && token.range.start >= context.parsed.active_segment.start
-    })?;
-    if context.buffer.cursor <= command_token.range.end
-        && !context.buffer.text[..context.buffer.cursor].ends_with(char::is_whitespace)
-    {
-        return None;
-    }
-    let words: Vec<_> = context
-        .parsed
-        .tokens
-        .iter()
-        .filter(|token| {
-            token.kind == crate::parser::TokenKind::Word
-                && token.range.start >= context.parsed.active_segment.start
-                && token.range.start <= context.buffer.cursor
-        })
-        .map(|token| token.cooked_prefix.as_str())
-        .collect();
-    let trailing_space = context.buffer.text[..context.buffer.cursor]
-        .chars()
-        .next_back()
-        .is_some_and(char::is_whitespace);
-    let argument_position = if trailing_space {
-        words.len().saturating_sub(1)
-    } else {
-        words.len().saturating_sub(2)
-    };
-    match command {
-        "cd" => Some(SlotKind::Directory),
-        "bash" | "zsh" | "sh" => Some(SlotKind::Executable),
-        "df" => Some(SlotKind::Path),
-        "tar" => tar_slot(&words, argument_position),
-        "lsof" if words.contains(&"+D") => Some(SlotKind::Directory),
-        "lsof" => None,
-        "kill" | "ifconfig" | "ip" | "ps" => None,
-        _ => Some(SlotKind::Path),
+impl FilesystemProvider {
+    fn infer_slot(&self, context: &CompletionContext) -> Option<SlotKind> {
+        let command = context.command()?;
+        let (words, argument_position) = argument_progress(context)?;
+        // Flags belong to the spec/help providers: a dashed active word never
+        // completes to filesystem entries.
+        if context.parsed.current_prefix.starts_with('-') {
+            return None;
+        }
+        match command {
+            "cd" => Some(SlotKind::Directory),
+            "bash" | "zsh" | "sh" => Some(SlotKind::Executable),
+            "df" => Some(SlotKind::Path),
+            "tar" => tar_slot(&words, argument_position),
+            "lsof" if words.contains(&"+D") => Some(SlotKind::Directory),
+            "lsof" => None,
+            "kill" | "ifconfig" | "ip" | "ps" => None,
+            _ => {
+                // Spec-covered commands own their arguments.
+                if self.specs.get(command).is_some() {
+                    return None;
+                }
+                // At the first-argument position a command whose man page
+                // documents subcommands (git-style) takes subcommand rows
+                // instead of a raw directory scan. Past the first argument —
+                // and whenever help has no subcommands (`cp`, `vim`) — file
+                // completion still applies. Peek only: the help provider is
+                // registered first and warms the shared cache from its
+                // applies pass; never spawn `man` from here.
+                if argument_position == 0
+                    && self
+                        .help
+                        .peek(command)
+                        .is_some_and(|help| help.has_subcommands())
+                {
+                    return None;
+                }
+                Some(SlotKind::Path)
+            }
+        }
     }
 }
 
@@ -254,6 +265,7 @@ mod tests {
     use super::*;
     use crate::{
         completion::{BufferSnapshot, CompletionEngine, SyncQuality},
+        providers::command_help::{CommandHelp, HelpEntry},
         shell::ShellKind,
         terminal::{BufferRevision, QueryId},
     };
@@ -275,7 +287,7 @@ mod tests {
         )
         .expect("context");
         let mut engine = CompletionEngine::new(100, 20);
-        engine.register(FilesystemProvider::new(false));
+        engine.register(provider(Arc::new(SpecRegistry::default())));
         let output = engine.complete(&context);
         assert!(output.candidates.iter().any(|candidate| {
             candidate.display.primary == "hello world.sh"
@@ -322,7 +334,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("directory");
         fs::write(directory.path().join("archive.tgz"), b"archive").expect("archive");
         fs::create_dir(directory.path().join("src")).expect("source directory");
-        let provider = FilesystemProvider::new(false);
+        let provider = provider(Arc::new(SpecRegistry::default()));
 
         let create = context(directory.path(), "tar -czf ", 1);
         let create_output = provider.complete(&create);
@@ -357,7 +369,7 @@ mod tests {
                 .expect("directory fixture");
         }
         let context = context(directory.path(), "cat ", 3);
-        let provider = FilesystemProvider::new(false);
+        let provider = provider(Arc::new(SpecRegistry::default()));
         let mut samples = Vec::new();
         for _ in 0..10 {
             let started = Instant::now();
@@ -373,6 +385,116 @@ mod tests {
             Duration::from_millis(85)
         };
         assert!(p95 <= budget, "5000-entry directory p95 was {p95:?}");
+    }
+
+    #[test]
+    fn dash_prefixed_directories_get_a_dot_slash_prefix_like_files() {
+        let directory = tempfile::tempdir().expect("directory");
+        fs::create_dir(directory.path().join("-dashdir")).expect("dash directory");
+        fs::write(directory.path().join("-dashfile"), b"").expect("dash file");
+        let provider = provider(Arc::new(SpecRegistry::default()));
+        let output = provider.complete(&context(directory.path(), "cd ", 1));
+        assert!(
+            output
+                .candidates
+                .iter()
+                .any(|candidate| candidate.display.primary == "./-dashdir/")
+        );
+        let output = provider.complete(&context(directory.path(), "cat ", 2));
+        assert!(
+            output
+                .candidates
+                .iter()
+                .any(|candidate| candidate.display.primary == "./-dashfile")
+        );
+    }
+
+    #[test]
+    fn dashed_active_word_produces_no_filesystem_candidates() {
+        let directory = tempfile::tempdir().expect("directory");
+        fs::write(directory.path().join("-dash"), b"").expect("dash file");
+        let provider = provider(Arc::new(SpecRegistry::default()));
+        let output = provider.complete(&context(directory.path(), "cat -", 1));
+        assert!(output.candidates.is_empty());
+        assert!(!provider.applies(&context(directory.path(), "cat -d", 2)));
+    }
+
+    #[test]
+    fn spec_covered_commands_own_the_fallback_path_slot() {
+        let directory = tempfile::tempdir().expect("directory");
+        fs::write(directory.path().join("plain.txt"), b"").expect("file");
+        let provider = provider(Arc::new(SpecRegistry::load(None)));
+        // `ls` is spec-covered: the fallback path slot is suppressed.
+        assert!(
+            provider
+                .complete(&context(directory.path(), "ls ", 1))
+                .candidates
+                .is_empty()
+        );
+        // `cat` is not: file completion still works.
+        assert!(
+            provider
+                .complete(&context(directory.path(), "cat ", 2))
+                .candidates
+                .iter()
+                .any(|candidate| candidate.display.primary == "plain.txt")
+        );
+    }
+
+    #[test]
+    fn help_subcommands_suppress_files_only_at_the_first_argument() {
+        let directory = tempfile::tempdir().expect("directory");
+        fs::write(directory.path().join("plain.txt"), b"").expect("file");
+        let help = Arc::new(CommandHelpCache::default());
+        help.seed(
+            "git",
+            CommandHelp {
+                flags: Vec::new(),
+                subcommands: vec![HelpEntry {
+                    name: "add".into(),
+                    description: String::new(),
+                }],
+            },
+        );
+        let provider =
+            FilesystemProvider::new(false, Arc::new(SpecRegistry::load(None)), Arc::clone(&help));
+        // Subcommand position with a positive help result: no file rows.
+        assert!(
+            provider
+                .complete(&context(directory.path(), "git ", 1))
+                .candidates
+                .is_empty()
+        );
+        // Past the first argument file completion still works.
+        assert!(
+            provider
+                .complete(&context(directory.path(), "git add ", 2))
+                .candidates
+                .iter()
+                .any(|candidate| candidate.display.primary == "plain.txt")
+        );
+        // Help without subcommands (e.g. `cp`) never suppresses files.
+        help.seed(
+            "cp",
+            CommandHelp {
+                flags: vec![HelpEntry {
+                    name: "-R".into(),
+                    description: String::new(),
+                }],
+                subcommands: Vec::new(),
+            },
+        );
+        assert!(
+            provider
+                .complete(&context(directory.path(), "cp ", 3))
+                .candidates
+                .iter()
+                .any(|candidate| candidate.display.primary == "plain.txt")
+        );
+    }
+
+    fn provider(specs: Arc<SpecRegistry>) -> FilesystemProvider {
+        FilesystemProvider::new(false, specs, Arc::new(CommandHelpCache::default()))
     }
 
     fn context(directory: &std::path::Path, text: &str, query: u64) -> CompletionContext {

@@ -22,6 +22,7 @@ v1 面向 macOS 和 Linux 上支持 UTF-8 与常见 ANSI/VT 控制序列的 POSI
 | Prompt 主题 | powerline 类主题序列（PUA 字形、RPROMPT、多行 PROMPT、instant/transient prompt） | 自动化通过 | 合成 .zshrc fixture 的真实 PTY 测试（tests/terminal_session.rs） |
 | Prompt 主题 | powerlevel10k 真实安装 | 待认证 | 需真实终端人工认证，见发布清单 |
 | Prompt 主题 | oh-my-zsh + agnoster | 待认证 | 需真实终端人工认证，见发布清单 |
+| Prompt 主题 | oh-my-posh（.zprofile 初始化 + login shell） | 实测通过 | 本机真实 PTY 会话：主题与 tooltip 透传、命令执行与退出正常；overlay 锚定同动态 prompt fixture 覆盖 |
 | Multiplexer | tmux 3.6b | 实测通过 | runtime probe 判定不支持 mode 2026，走 diff fallback |
 | Multiplexer | tmux 3.7+ | 待认证 | 必须按 runtime probe 选择路径，不能按版本猜测 |
 | Transport | SSH | 待认证 | timeout/分片策略已实现，尚无真实远端记录 |
@@ -48,6 +49,11 @@ Terminal.app、iTerm2、Ghostty、Kitty、WezTerm 和 Alacritty 均在发布阻�
   真实 precmd 起才锚定，这是预期行为，不是 bug。
 - 主题发出的 DECSCUSR、HVP、DECAWM、IRM 和 G0–G3 字符集序列已列入白名单；其余未知
   VT 序列仍触发 fail-safe 隐藏并重新锚定。
+- oh-my-posh 会在自己的 precmd 中关闭 `PROMPT_SUBST` 并异步重写 `PROMPT`；Hokan 的
+  prompt marker 以字面字节嵌入（不依赖 `PROMPT_SUBST`），并在每次 redraw 前重新断言
+  包裹。初始化写在 `.zprofile` 的主题（oh-my-posh、starship 常见）需要
+  `core.login_shell = true` 才能在内层 shell 加载；`hokan doctor` 的 `zsh theme`
+  检查会检测并提示。
 - bash：标准 emacs 编辑键使用本地镜像；未知键序列会把同步状态降为 uncertain 并隐藏列表。
 - fish：默认键位使用本地镜像；在真实 fish 认证完成前不承诺自定义 key binding 或 vi mode。
 - 与 zsh 插件共存：oh-my-zsh 和主题在 Hokan 内层 shell 中运行并逐字节透传；补全类插件
