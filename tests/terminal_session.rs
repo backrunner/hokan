@@ -26,6 +26,13 @@ const SYNC_QUERY: &[u8] = b"\x1b[?2026$p";
 const CPR_QUERY: &[u8] = b"\x1b[6n";
 const RESTORE_PRESENTATION: &[u8] = b"\x18\x1b[0m\x1b[?25h";
 
+/// Source tag glyphs as rendered with the default `nerd_fonts = true`.
+const TAG_SPEC: &str = "\u{f02d}";
+const TAG_HELP: &str = "\u{f059}";
+const TAG_HIS: &str = "\u{f1da}";
+const TAG_FILE: &str = "\u{f15b}";
+const TAG_EXEC: &str = "\u{f071}";
+
 struct TerminalSession {
     _home: TempDir,
     _work: TempDir,
@@ -417,6 +424,101 @@ impl TerminalSession {
         }
     }
 
+    /// Waits until the edit line is present AND every border glyph on screen
+    /// belongs to exactly one rectangular overlay box. Retries ride out
+    /// mid-paint transients; a persistent smear never satisfies this.
+    fn wait_for_clean_overlay(&mut self, edit_line: &str) {
+        let deadline = Instant::now() + TIMEOUT;
+        while Instant::now() < deadline {
+            if self.screen_text().contains(edit_line) {
+                let strays = self.border_strays();
+                if strays.is_empty() {
+                    return;
+                }
+            }
+            self.receive_once(READ_POLL);
+        }
+        panic!(
+            "overlay did not settle cleanly for {edit_line:?}; strays={:?}; screen=\n{}\ntranscript tail={:?}",
+            self.border_strays(),
+            self.screen_text(),
+            tail(&self.transcript, 2_048)
+        );
+    }
+
+    /// Describes every border glyph that cannot belong to a single current
+    /// overlay box. An empty result means the screen holds exactly one box:
+    /// one top edge, one bottom edge below it, matching corners, and side
+    /// pipes only on the box's left/right columns between the edges.
+    fn border_strays(&self) -> Vec<String> {
+        let screen = self.terminal.screen();
+        let mut tops = Vec::new();
+        let mut top_rights = Vec::new();
+        let mut bottoms = Vec::new();
+        let mut bottom_rights = Vec::new();
+        let mut sides = Vec::new();
+        for row in 0..self.rows {
+            for col in 0..self.cols {
+                let Some(cell) = screen.cell(row, col) else {
+                    continue;
+                };
+                match cell.contents() {
+                    "╭" => tops.push((row, col)),
+                    "╮" => top_rights.push((row, col)),
+                    "╰" => bottoms.push((row, col)),
+                    "╯" => bottom_rights.push((row, col)),
+                    "│" => sides.push((row, col)),
+                    _ => {}
+                }
+            }
+        }
+        let mut strays = Vec::new();
+        if tops.len() != 1
+            || top_rights.len() != 1
+            || bottoms.len() != 1
+            || bottom_rights.len() != 1
+        {
+            strays.push(format!(
+                "corner count ╭={} ╮={} ╰={} ╯={} (tops={tops:?} top_rights={top_rights:?} bottoms={bottoms:?} bottom_rights={bottom_rights:?} sides={sides:?})",
+                tops.len(),
+                top_rights.len(),
+                bottoms.len(),
+                bottom_rights.len()
+            ));
+            return strays;
+        }
+        let (top, left) = tops[0];
+        let (bottom, _) = bottoms[0];
+        let right = top_rights[0].1;
+        if top_rights[0].0 != top {
+            strays.push(format!(
+                "top-right corner at {:?}, expected row {top}",
+                top_rights[0]
+            ));
+        }
+        if bottoms[0].1 != left {
+            strays.push(format!(
+                "bottom-left corner at {:?}, expected ({bottom}, {left})",
+                bottoms[0]
+            ));
+        }
+        if bottom_rights[0] != (bottom, right) {
+            strays.push(format!(
+                "bottom-right corner at {:?}, expected ({bottom}, {right})",
+                bottom_rights[0]
+            ));
+        }
+        if bottom <= top + 1 {
+            strays.push(format!("box edges too close: top={top} bottom={bottom}"));
+        }
+        for (row, col) in sides {
+            if row <= top || row >= bottom || (col != left && col != right) {
+                strays.push(format!("stray side border at ({row}, {col})"));
+            }
+        }
+        strays
+    }
+
     fn screen_text(&self) -> String {
         let mut text = String::new();
         for row in 0..self.rows {
@@ -502,7 +604,7 @@ fn real_session_keeps_overlay_and_terminal_lifecycle_stable() {
     terminal.settle(Duration::from_millis(300));
     assert!(terminal.sync_replies >= 1, "DECRQM probe was not answered");
 
-    terminal.write(b"ls");
+    terminal.write(b"ls ");
     // Wait for the hint footer (the bottom edge of the box) rather than the
     // first SPEC label: early frames show item rows before the full box —
     // including its bottom edge — has been painted.
@@ -510,7 +612,10 @@ fn real_session_keeps_overlay_and_terminal_lifecycle_stable() {
     assert!(terminal.screen_text().contains("HK> ls"));
     let text = terminal.screen_text();
     assert!(text.contains('╭'), "overlay top border missing:\n{text}");
-    assert!(text.contains("SPEC"), "overlay spec rows missing:\n{text}");
+    assert!(
+        text.contains(TAG_SPEC),
+        "overlay spec rows missing:\n{text}"
+    );
 
     terminal.write(b"\x1b[B\x1b[A\x1b[6~\x1b[5~");
     terminal.settle(Duration::from_millis(100));
@@ -522,7 +627,7 @@ fn real_session_keeps_overlay_and_terminal_lifecycle_stable() {
     let before_resize = terminal.transcript.len();
     terminal.resize(30, 100);
     terminal.wait_for_bytes_since(before_resize, b"HK> ls");
-    terminal.wait_for_screen("SPEC");
+    terminal.wait_for_screen(TAG_SPEC);
 
     let pid = terminal.pid();
     signal::kill(Pid::from_raw(pid), Signal::SIGTSTP).expect("suspend hokan");
@@ -545,7 +650,7 @@ fn real_session_keeps_overlay_and_terminal_lifecycle_stable() {
     // rewrite the buffer to itself is filtered out, so the FILE row only
     // appears while the typed text is still a proper prefix.
     terminal.write(b"sh ./alternate.s");
-    terminal.wait_for_screen("FILE");
+    terminal.wait_for_screen(TAG_FILE);
     terminal.write(b"\x1b");
     terminal.settle(Duration::from_millis(80));
     terminal.write(b"h");
@@ -558,7 +663,11 @@ fn real_session_keeps_overlay_and_terminal_lifecycle_stable() {
     terminal.wait_for_bytes_since(alternate_start, b"\x1b[?1049l");
     let alternate_end = terminal.transcript.len();
     let alternate_output = &terminal.transcript[alternate_start..alternate_end];
-    assert!(!alternate_output.windows(4).any(|window| window == b"SPEC"));
+    assert!(
+        !alternate_output
+            .windows(TAG_SPEC.len())
+            .any(|window| window == TAG_SPEC.as_bytes())
+    );
     assert!(
         !alternate_output
             .windows("│".len())
@@ -585,8 +694,8 @@ fn real_session_uses_non_destructive_fallback_when_mode_2026_is_unavailable() {
     terminal.settle(Duration::from_millis(300));
     assert_eq!(terminal.sync_replies, 1);
 
-    terminal.write(b"ls");
-    terminal.wait_for_screen("SPEC");
+    terminal.write(b"ls ");
+    terminal.wait_for_screen(TAG_SPEC);
     terminal.write(b"\x1b[B\x1b[A");
     terminal.settle(Duration::from_millis(100));
     assert!(terminal.screen_text().contains("HK> ls"));
@@ -604,14 +713,52 @@ fn real_session_uses_non_destructive_fallback_when_mode_2026_is_unavailable() {
 }
 
 #[test]
+fn man_derived_help_rows_appear_and_file_rows_follow_help_suppression() {
+    if !command_exists("zsh") || !command_exists("man") {
+        return;
+    }
+    let (home, work) = fixture_directories();
+    fs::write(work.path().join("help-target.txt"), b"fixture").expect("work file");
+    let mut terminal = TerminalSession::spawn_hokan(home, work, 2);
+    terminal.wait_for_screen("HK> ");
+    terminal.settle(Duration::from_millis(100));
+
+    // `cp -`: `cp` has no spec coverage, so the man-derived flag list shows
+    // HELP rows; the dashed active word suppresses FILE rows entirely.
+    terminal.write(b"cp -");
+    terminal.wait_for_screen(TAG_HELP);
+    let text = terminal.screen_text();
+    assert!(text.contains(TAG_HELP), "HELP rows missing:\n{text}");
+    assert!(
+        !text.contains(TAG_FILE),
+        "FILE rows leaked into the flag position:\n{text}"
+    );
+
+    // `cp ` (no dash; the cp man page documents no subcommands): file
+    // completion still works.
+    terminal.write(b"\x03");
+    terminal.wait_for_screen("HK> ");
+    terminal.write(b"cp ");
+    terminal.wait_for_screen(TAG_FILE);
+    let text = terminal.screen_text();
+    assert!(
+        text.contains("help-target.txt"),
+        "file row missing after `cp `:\n{text}"
+    );
+
+    terminal.exit_shell();
+    terminal.wait_until_exit();
+}
+
+#[test]
 fn real_session_keeps_overlay_when_precmd_rewrites_prompt() {
     if !command_exists("zsh") {
         return;
     }
     let mut terminal = TerminalSession::spawn_with_dynamic_prompt();
     terminal.wait_for_screen("DYN> ");
-    terminal.write(b"ls");
-    terminal.wait_for_screen("SPEC");
+    terminal.write(b"ls ");
+    terminal.wait_for_screen(TAG_SPEC);
     assert!(terminal.screen_text().contains("DYN> ls"));
     terminal.exit_shell();
     terminal.wait_until_exit();
@@ -624,8 +771,8 @@ fn real_session_follows_zdotdir_set_by_user_zshenv() {
     }
     let mut terminal = TerminalSession::spawn_with_user_zdotdir();
     terminal.wait_for_screen("ZDOT> ");
-    terminal.write(b"ls");
-    terminal.wait_for_screen("SPEC");
+    terminal.write(b"ls ");
+    terminal.wait_for_screen(TAG_SPEC);
     assert!(terminal.screen_text().contains("ZDOT> ls"));
     terminal.exit_shell();
     terminal.wait_until_exit();
@@ -648,8 +795,8 @@ fn powerline_pua_glyphs_pass_through_and_overlay_still_anchors() {
         "Nerd Font PUA glyphs were not passed through byte-identically"
     );
 
-    terminal.write(b"ls");
-    terminal.wait_for_screen("SPEC");
+    terminal.write(b"ls ");
+    terminal.wait_for_screen(TAG_SPEC);
     assert!(terminal.screen_text().contains("\u{e0b0}\u{f000} HK> ls"));
     assert_forbidden_overlay_sequences_absent(&terminal.transcript);
 
@@ -695,8 +842,8 @@ fn rotating_rprompt_redraws_stay_consistent_and_overlay_still_anchors() {
         terminal.screen_text()
     );
 
-    terminal.write(b"ls");
-    terminal.wait_for_screen("SPEC");
+    terminal.write(b"ls ");
+    terminal.wait_for_screen(TAG_SPEC);
     assert!(terminal.screen_text().contains("HK> ls"));
     assert_forbidden_overlay_sequences_absent(&terminal.transcript);
 
@@ -714,8 +861,8 @@ fn multiline_prompt_anchors_overlay_below_the_edit_line() {
     terminal.settle(Duration::from_millis(300));
     assert!(terminal.screen_text().contains("META"));
 
-    terminal.write(b"ls");
-    terminal.wait_for_screen("SPEC");
+    terminal.write(b"ls ");
+    terminal.wait_for_screen(TAG_SPEC);
     let edit_row = *terminal
         .screen_rows_containing("HK> ls")
         .last()
@@ -736,7 +883,7 @@ fn multiline_prompt_anchors_overlay_below_the_edit_line() {
         terminal.screen_text()
     );
     assert!(
-        terminal.screen_line(overlay_row + 1).contains("SPEC"),
+        terminal.screen_line(overlay_row + 1).contains(TAG_SPEC),
         "overlay items must sit below the top border:\n{}",
         terminal.screen_text()
     );
@@ -767,8 +914,8 @@ fn instant_prompt_churn_passes_through_and_overlay_works_at_first_prompt() {
         "cached prompt block was not erased before the real prompt:\n{text}"
     );
 
-    terminal.write(b"ls");
-    terminal.wait_for_screen("SPEC");
+    terminal.write(b"ls ");
+    terminal.wait_for_screen(TAG_SPEC);
     assert!(terminal.screen_text().contains("HK> ls"));
     assert_forbidden_overlay_sequences_absent(&terminal.transcript);
 
@@ -802,8 +949,8 @@ fn transient_prompt_rewrite_reanchors_overlay_on_return_to_prompt() {
         terminal.screen_text()
     );
 
-    terminal.write(b"ls");
-    terminal.wait_for_screen("SPEC");
+    terminal.write(b"ls ");
+    terminal.wait_for_screen(TAG_SPEC);
     let edit_row = *terminal
         .screen_rows_containing("HK> ls")
         .last()
@@ -815,7 +962,7 @@ fn transient_prompt_rewrite_reanchors_overlay_on_return_to_prompt() {
         terminal.screen_text()
     );
     assert!(
-        terminal.screen_line(overlay_row + 1).contains("SPEC"),
+        terminal.screen_line(overlay_row + 1).contains(TAG_SPEC),
         "overlay items must sit below the top border:\n{}",
         terminal.screen_text()
     );
@@ -832,8 +979,8 @@ fn zsh_setup_auto_starts_hokan_and_restores_the_terminal() {
     }
     let mut terminal = TerminalSession::spawn_via_zsh_setup();
     terminal.wait_for_screen("HK1> ");
-    terminal.write(b"ls");
-    terminal.wait_for_screen("SPEC");
+    terminal.write(b"ls ");
+    terminal.wait_for_screen(TAG_SPEC);
     assert!(terminal.screen_text().contains("HK1> ls"));
     terminal.exit_shell();
     terminal.wait_until_exit();
@@ -873,8 +1020,8 @@ fn termination_signals_restore_the_terminal_after_an_active_overlay() {
         let mut terminal = TerminalSession::spawn();
         terminal.wait_for_screen("HK> ");
         terminal.settle(Duration::from_millis(300));
-        terminal.write(b"ls");
-        terminal.wait_for_screen("SPEC");
+        terminal.write(b"ls ");
+        terminal.wait_for_screen(TAG_SPEC);
 
         signal::kill(Pid::from_raw(terminal.pid()), signal).expect("signal hokan");
         terminal.wait_until_exit();
@@ -894,8 +1041,8 @@ fn tmux_36_uses_fallback_even_when_the_outer_terminal_supports_mode_2026() {
     let mut terminal = TerminalSession::spawn_in_tmux_36();
     terminal.wait_for_screen("HK> ");
     terminal.settle(Duration::from_millis(500));
-    terminal.write(b"ls");
-    terminal.wait_for_screen("SPEC");
+    terminal.write(b"ls ");
+    terminal.wait_for_screen(TAG_SPEC);
     terminal.write(b"\x1b[B\x1b[A");
     terminal.settle(Duration::from_millis(100));
     assert!(terminal.screen_text().contains("HK> ls"));
@@ -926,7 +1073,7 @@ fn enter_executes_typed_command_with_one_press_while_overlay_is_open() {
     terminal.settle(Duration::from_millis(300));
 
     terminal.write(b"echo HI_DONE");
-    terminal.wait_for_screen("HIS");
+    terminal.wait_for_screen(TAG_HIS);
     assert!(terminal.screen_text().contains("HK> echo HI_DONE"));
 
     // ONE Enter must execute exactly what was typed — with no explicit
@@ -948,8 +1095,8 @@ fn enter_runs_ls_with_one_press_while_overlay_is_open() {
     terminal.wait_for_screen("HK> ");
     terminal.settle(Duration::from_millis(300));
 
-    terminal.write(b"ls");
-    terminal.wait_for_screen("SPEC");
+    terminal.write(b"ls ");
+    terminal.wait_for_screen(TAG_SPEC);
     // ONE Enter runs the typed command: nothing is selected by default, so
     // Enter passes the buffer through to the shell unchanged.
     terminal.write(b"\r");
@@ -968,8 +1115,8 @@ fn tab_fills_back_the_selected_candidate_without_executing() {
     terminal.wait_for_screen("HK> ");
     terminal.settle(Duration::from_millis(300));
 
-    terminal.write(b"tar");
-    terminal.wait_for_screen("SPEC");
+    terminal.write(b"tar ");
+    terminal.wait_for_screen(TAG_SPEC);
     // No row is pre-selected: Down selects the first candidate, then Tab —
     // the fill edit-back path — rewrites the buffer to the candidate text…
     terminal.write(b"\x1b[B");
@@ -994,10 +1141,10 @@ fn overlay_opens_without_a_default_selection() {
     terminal.wait_for_screen("HK> ");
     terminal.settle(Duration::from_millis(300));
 
-    terminal.write(b"ls");
+    terminal.write(b"ls ");
     terminal.wait_for_screen("Tab 回填 · Enter 执行 · Esc 关闭");
     let text = terminal.screen_text();
-    assert!(text.contains("SPEC"), "overlay rows missing:\n{text}");
+    assert!(text.contains(TAG_SPEC), "overlay rows missing:\n{text}");
     assert!(!text.contains('▶'), "no row may be pre-selected:\n{text}");
 
     // Down selects the first row without ever touching the edit buffer.
@@ -1025,7 +1172,7 @@ fn enter_executes_the_selected_history_candidate() {
     terminal.settle(Duration::from_millis(300));
 
     terminal.write(b"echo HKSEL_H");
-    terminal.wait_for_screen("HIS");
+    terminal.wait_for_screen(TAG_HIS);
     terminal.write(b"\x1b[B");
     terminal.wait_for_screen("▶");
 
@@ -1051,7 +1198,7 @@ fn enter_on_a_dangerous_candidate_requires_confirmation() {
     terminal.settle(Duration::from_millis(300));
 
     terminal.write(b"rm -rf /tmp/hokan-dan");
-    terminal.wait_for_screen("HIS");
+    terminal.wait_for_screen(TAG_HIS);
     terminal.write(b"\x1b[B");
     terminal.wait_for_screen("▶");
 
@@ -1060,7 +1207,7 @@ fn enter_on_a_dangerous_candidate_requires_confirmation() {
     terminal.write(b"\r");
     terminal.wait_for_screen("Enter 确认执行 · Esc 取消");
     let text = terminal.screen_text();
-    assert!(text.contains("EXEC"), "EXEC row missing:\n{text}");
+    assert!(text.contains(TAG_EXEC), "EXEC row missing:\n{text}");
     assert!(
         text.contains("rm -rf /tmp/hokan-danger-x"),
         "final command missing from the EXEC row:\n{text}"
@@ -1094,7 +1241,7 @@ fn escape_cancels_the_danger_confirmation() {
     terminal.settle(Duration::from_millis(300));
 
     terminal.write(b"rm -rf /tmp/hokan-dan");
-    terminal.wait_for_screen("HIS");
+    terminal.wait_for_screen(TAG_HIS);
     terminal.write(b"\x1b[B");
     terminal.wait_for_screen("▶");
     let start = terminal.transcript.len();
@@ -1103,7 +1250,7 @@ fn escape_cancels_the_danger_confirmation() {
 
     // Esc drops the confirmation and brings the normal candidate list back.
     terminal.write(b"\x1b");
-    terminal.wait_for_screen("HIS");
+    terminal.wait_for_screen(TAG_HIS);
     terminal.settle(Duration::from_millis(200));
     let text = terminal.screen_text();
     assert!(
@@ -1144,7 +1291,7 @@ fn candidate_identical_to_the_typed_buffer_is_not_listed() {
         "buffer missing:\n{text}"
     );
     assert!(
-        !text.contains("HIS"),
+        !text.contains(TAG_HIS),
         "buffer-identical history candidate was listed:\n{text}"
     );
 
@@ -1167,6 +1314,28 @@ fn fresh_prompt_shows_no_overlay() {
 }
 
 #[test]
+fn bare_executable_waits_for_space_before_suggesting() {
+    if !command_exists("zsh") {
+        return;
+    }
+    let mut terminal = TerminalSession::spawn();
+    terminal.wait_for_screen("HK> ");
+    terminal.settle(Duration::from_millis(300));
+
+    // A bare executable word is already runnable: suggestions hold off until
+    // the user commits to typing arguments with a space.
+    terminal.write(b"ls");
+    terminal.settle(Duration::from_millis(500));
+    assert_no_overlay_rows(&terminal);
+
+    terminal.write(b" ");
+    terminal.wait_for_screen(TAG_SPEC);
+
+    terminal.exit_shell();
+    terminal.wait_until_exit();
+}
+
+#[test]
 fn deleting_to_an_empty_buffer_hides_the_overlay() {
     if !command_exists("zsh") {
         return;
@@ -1175,9 +1344,9 @@ fn deleting_to_an_empty_buffer_hides_the_overlay() {
     terminal.wait_for_screen("HK> ");
     terminal.settle(Duration::from_millis(300));
 
-    terminal.write(b"ls");
-    terminal.wait_for_screen("SPEC");
-    terminal.write(b"\x7f\x7f");
+    terminal.write(b"ls ");
+    terminal.wait_for_screen(TAG_SPEC);
+    terminal.write(b"\x7f\x7f\x7f");
     terminal.settle(Duration::from_millis(500));
     assert_no_overlay_rows(&terminal);
     let text = terminal.screen_text();
@@ -1221,8 +1390,50 @@ fn ctrl_r_on_an_empty_buffer_opens_the_history_view() {
     terminal.settle(Duration::from_millis(300));
     // Explicit user intent: Ctrl-R focuses history even on an empty buffer.
     terminal.write(b"\x12");
-    terminal.wait_for_screen("HIS");
+    terminal.wait_for_screen(TAG_HIS);
     assert!(terminal.screen_text().contains("echo HK_HIST_SEED"));
+
+    terminal.exit_shell();
+    terminal.wait_until_exit();
+}
+
+#[test]
+fn wrapping_edit_line_survives_scroll_to_make_room_and_box_moves() {
+    if !command_exists("zsh") {
+        return;
+    }
+    let mut terminal = TerminalSession::spawn();
+    terminal.wait_for_screen("HK> ");
+    terminal.settle(Duration::from_millis(300));
+
+    // Seed a long history command: typing a proper prefix of it keeps a HIS
+    // candidate (and therefore the overlay) open for the whole scenario.
+    let seed =
+        "echo HKWRAP_seed_aaaaaaaaaabbbbbbbbbbccccccccccddddddddddeeeeeeeeeeffffffffffgggggggggg";
+    terminal.write(seed.as_bytes());
+    terminal.write(b"\r");
+    terminal.wait_for_screen("HKWRAP_seed_aaaaaaaaaa");
+    terminal.settle(Duration::from_millis(300));
+
+    // Fill the screen so the fresh prompt sits on the terminal's last row.
+    terminal.write(b"seq 1 40\r");
+    terminal.wait_for_bare_row("40");
+    terminal.settle(Duration::from_millis(300));
+
+    // Type a proper prefix long enough to wrap the 80-column edit line. The
+    // overlay makes room by scrolling while the shell cursor is mid-screen,
+    // and the box's left edge follows the cursor across the wrap.
+    let typed = &seed[..78];
+    assert!(typed.len() + "HK> ".len() > terminal.cols as usize);
+    for chunk in typed.as_bytes().chunks(6) {
+        terminal.write(chunk);
+        terminal.settle(Duration::from_millis(25));
+    }
+
+    // (a) the edit-line start must survive the mid-screen scroll, and (b) no
+    // stale border glyphs may remain outside the current overlay box.
+    terminal.wait_for_clean_overlay("HK> echo HKWRAP_seed_");
+    assert_forbidden_overlay_sequences_absent(&terminal.transcript);
 
     terminal.exit_shell();
     terminal.wait_until_exit();

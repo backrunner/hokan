@@ -14,6 +14,12 @@ fn writable_terminal_handles_are_confined_to_output_and_guard() {
         {
             continue;
         }
+        // CLI subcommands (e.g. `hokan ai setup`) run before or instead of the
+        // PTY session and own process stdio like any ordinary command-line
+        // tool; this guard protects the terminal session's rendering only.
+        if relative.starts_with("cli") {
+            continue;
+        }
         let source = fs::read_to_string(&path).expect("Rust source should be readable");
         for forbidden in [
             "stdout()",
