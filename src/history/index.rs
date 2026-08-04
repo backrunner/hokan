@@ -327,6 +327,9 @@ fn normalize(command: &str) -> String {
 
 fn looks_sensitive(command: &str) -> bool {
     let lower = command.to_ascii_lowercase();
+    // Flags appear in both `--api-key=` and `--api_key=` spellings; normalize
+    // dashes (in the command and the markers) so one list covers both.
+    let normalized = lower.replace('-', "_");
     let marker = [
         "--password",
         "--passwd",
@@ -345,7 +348,7 @@ fn looks_sensitive(command: &str) -> bool {
         "secret_access_key",
     ]
     .iter()
-    .any(|marker| lower.contains(marker));
+    .any(|marker| normalized.contains(&marker.replace('-', "_")));
     marker || contains_url_credentials(&lower)
 }
 
@@ -400,6 +403,10 @@ mod tests {
             "export ACCESS_TOKEN=secret",
             "tool --header 'Cookie: session=secret'",
             "curl https://user:secret@example.test/path",
+            "tool --api-key=secret",
+            "tool --client-secret=secret",
+            "tool --access-token=secret",
+            "tool --refresh-token=secret",
         ] {
             assert!(!index.ingest(sensitive, 300, ShellKind::Zsh, None, None, &policy));
         }

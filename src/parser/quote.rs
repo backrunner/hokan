@@ -15,9 +15,13 @@ fn escape_unquoted(value: &str, shell: ShellKind) -> String {
     if value.is_empty() {
         return "''".into();
     }
-    if value
-        .chars()
-        .all(|character| character.is_alphanumeric() || "_+-./:@%=".contains(character))
+    // zsh EQUALS expansion (on by default): a word starting with `=` expands
+    // to the path of the command named after it, so `=vim` must be quoted.
+    let zsh_equals = matches!(shell, ShellKind::Zsh) && value.starts_with('=');
+    if !zsh_equals
+        && value
+            .chars()
+            .all(|character| character.is_alphanumeric() || "_+-./:@%=".contains(character))
     {
         return value.to_owned();
     }
@@ -73,6 +77,23 @@ mod tests {
     }
 
     #[test]
+    fn zsh_quotes_leading_equals_words() {
+        assert_eq!(
+            escape_for_shell("=vim", QuoteContext::Unquoted, ShellKind::Zsh),
+            "'=vim'"
+        );
+        // bash and fish have no EQUALS expansion: bare is safe there.
+        assert_eq!(
+            escape_for_shell("=vim", QuoteContext::Unquoted, ShellKind::Bash),
+            "=vim"
+        );
+        assert_eq!(
+            escape_for_shell("=vim", QuoteContext::Unquoted, ShellKind::Fish),
+            "=vim"
+        );
+    }
+
+    #[test]
     fn unquoted_words_round_trip_through_real_shells() {
         let fixtures = [
             "",
@@ -85,6 +106,7 @@ mod tests {
             "中文 文件",
             "emoji-😀",
             "-leading",
+            "=leading",
         ];
         for (shell, executable) in [
             (ShellKind::Bash, "bash"),

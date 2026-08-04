@@ -169,6 +169,20 @@ fn command_view<'a>(words: &'a [&'a str]) -> Option<CommandView<'a>> {
                     index += 1;
                 }
             }
+            "xargs" => {
+                index += 1;
+                // Options with a separate value; attached forms (`-n1`,
+                // `-I{}`) are skipped as plain options.
+                skip_wrapper_options(
+                    words,
+                    &mut index,
+                    &[
+                        "-E", "-e", "-I", "-L", "-n", "-P", "-s", "-S", "--eof",
+                        "--replace", "--max-lines", "--max-args", "--max-procs",
+                        "--max-chars", "--delimiter",
+                    ],
+                );
+            }
             _ => {
                 return Some(CommandView {
                     name: basename(words[index]),
@@ -402,7 +416,9 @@ fn classify_redirects(
     reasons: &mut Vec<RiskReason>,
 ) {
     for (index, token) in tokens.iter().enumerate() {
-        if token.kind != TokenKind::Redirect || !source[token.range.clone()].starts_with('>') {
+        let text = &source[token.range.clone()];
+        if token.kind != TokenKind::Redirect || !(text.starts_with('>') || text.starts_with("&>"))
+        {
             continue;
         }
         let target = tokens[index + 1..]
@@ -410,6 +426,11 @@ fn classify_redirects(
             .find(|candidate| candidate.kind != TokenKind::Whitespace)
             .filter(|candidate| candidate.kind == TokenKind::Word)
             .map(|candidate| candidate.cooked_prefix.as_str());
+        // `2>&1` / `2>&-` duplicate a descriptor; nothing is overwritten.
+        if target.is_some_and(|word| word == "-" || word.bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            continue;
+        }
         let device = target.is_some_and(is_device_path);
         raise_with_reason(
             level,
@@ -556,6 +577,12 @@ mod tests {
             ("exec rm -rf /", RiskLevel::Unknown),
             ("echo ${(e)payload}", RiskLevel::Unknown),
             ("echo \"${(Xe)payload}\"", RiskLevel::Unknown),
+            // Descriptor duplication is not an overwrite and not a background
+            // separator; `&>file` still overwrites a file.
+            ("echo hi 2>&1", RiskLevel::Low),
+            ("echo hi 2>&-", RiskLevel::Low),
+            ("echo hi &> file", RiskLevel::Medium),
+            ("echo hi >> file 2>&1", RiskLevel::Medium),
         ];
         for (command, expected) in cases {
             assert_eq!(
@@ -564,6 +591,22 @@ mod tests {
                 "unexpected classification for {command:?}"
             );
         }
+    }
+
+    #[test]
+    fn sees_through_xargs_to_the_wrapped_command() {
+        assert_eq!(classify_command("xargs rm -rf /").level, RiskLevel::High);
+        assert_eq!(classify_command("xargs rm file").level, RiskLevel::Medium);
+        assert_eq!(classify_command("xargs -I{} rm {}").level, RiskLevel::Medium);
+        assert_eq!(
+            classify_command("xargs -0 rm -f").level,
+            RiskLevel::High
+        );
+        assert_eq!(
+            classify_command("xargs -n 1 rm -r dir").level,
+            RiskLevel::High
+        );
+        assert_eq!(classify_command("xargs echo").level, RiskLevel::Low);
     }
 
     #[test]

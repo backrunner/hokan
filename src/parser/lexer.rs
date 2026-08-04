@@ -125,10 +125,17 @@ fn lex(text: &str) -> Vec<Token> {
         }
         let (kind, width) = match bytes[index..] {
             [b'&', b'&', ..] => (Some(TokenKind::AndIf), 2),
+            // `&>` redirects both streams; lexing it as `&` + `>` would
+            // invent a background separator that is not there.
+            [b'&', b'>', ..] => (Some(TokenKind::Redirect), 2),
             [b'&', ..] => (Some(TokenKind::Separator), 1),
             [b'|', b'|', ..] => (Some(TokenKind::OrIf), 2),
             [b'|', ..] => (Some(TokenKind::Pipe), 1),
             [b';', ..] => (Some(TokenKind::Separator), 1),
+            // `>&` (fd duplication / both-streams redirect) and `>>&` are
+            // single operators, not `>` followed by a background `&`.
+            [b'>', b'>', b'&', ..] => (Some(TokenKind::Redirect), 3),
+            [b'>', b'&', ..] => (Some(TokenKind::Redirect), 2),
             [b'<', ..] | [b'>', ..] => (Some(TokenKind::Redirect), 1),
             [b'#', ..] => (Some(TokenKind::Comment), bytes.len() - index),
             _ => (None, 0),
@@ -385,6 +392,42 @@ mod tests {
                 "missing opaque token for {text:?}"
             );
         }
+    }
+
+    #[test]
+    fn fd_duplication_redirects_lex_as_single_redirect_tokens() {
+        for (text, redirect) in [
+            ("echo hi 2>&1", ">&"),
+            ("echo hi &> file", "&>"),
+            ("echo hi >>& file", ">>&"),
+        ] {
+            let parsed = parse_line(text, text.len()).expect("line should parse");
+            let redirects: Vec<_> = parsed
+                .tokens
+                .iter()
+                .filter(|token| token.kind == TokenKind::Redirect)
+                .map(|token| &text[token.range.clone()])
+                .collect();
+            assert!(
+                redirects.contains(&redirect),
+                "missing {redirect:?} redirect token in {text:?}: {redirects:?}"
+            );
+            assert!(
+                !parsed
+                    .tokens
+                    .iter()
+                    .any(|token| token.kind == TokenKind::Separator),
+                "unexpected separator for {text:?}"
+            );
+        }
+        // `&&` must still lex as AndIf, not `&` + `>&`.
+        let parsed = parse_line("a && b", 5).expect("line should parse");
+        assert!(
+            parsed
+                .tokens
+                .iter()
+                .any(|token| token.kind == TokenKind::AndIf)
+        );
     }
 
     #[test]
