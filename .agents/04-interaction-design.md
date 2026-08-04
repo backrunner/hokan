@@ -24,12 +24,12 @@ Hokan 在输入行下方使用内联 overlay，不进入全屏：
 
 视觉约束：
 
-- 列表是一个紧凑圆角框（iris modern 风格）：单边框、选中箭头、Nerd Font 图标、来源标签和弱色描述建立层级；描述列跨行对齐，风险标记紧邻选中箭头，选中行主命令加粗。
+- 列表是一个紧凑圆角框（iris modern 风格）：单边框、选中箭头、Nerd Font 命令图标、来源图标和弱色描述建立层级；描述列跨行对齐，风险标记紧邻选中箭头，选中行主命令加粗。
 - 默认最多 8 行（6 行候选 + 上下边框）；分页计数内嵌顶边，键位提示或状态文字内嵌底边；不足空间时自动减少。
 - 默认宽度为当前终端宽度和 76 cells 的较小值，最小支持 40 cells；框左边缘跟随光标列，靠右时自动左移防溢出。
 - overlay 打开时一次确定专用 surface 的行数；连续键入、新 query 和 provider 增量只更新 surface 内 cells，不反复插入/删除终端行。
 - 主命令优先保留；描述在普通列表中单行截断（`…`），不挤压主命令到不可读。
-- 命令图标使用 Nerd Font（`ui.nerd_fonts` 默认开启，按命令首词查表，fallback `❯`）；关闭后图标列消失，只剩 `CMD`、`USE`、`HIS`、`FILE`、`DIR`、`PROJ`、`AI`、`RISK` 等 ASCII 标签。
+- 命令与来源均使用 Nerd Font 图标（`ui.nerd_fonts` 默认开启；命令图标按首词查表，来源图标按 `SPEC`/`HIS`/`HELP`/`FILE` 等标签映射，fallback `❯`）；关闭后图标列消失，退回 `HIS`、`FILE`、`PROJ`、`AI` 等 ASCII 标签。
 - 颜色使用 ANSI 自适应调色板（边框/键位品红、选中与高亮绿、描述暗灰、状态黄），随终端主题变化；无颜色时依靠标签和文字表达，不只靠颜色。
 - 所有宽度按 terminal cell 计算；CJK、组合字符和 emoji 不得破坏列对齐。
 
@@ -238,7 +238,7 @@ $ 查找当前目录 7 天内修改过的 rs 文件▌
 - AI 已启用、endpoint/model/key source 可用；
 - 同一输入只显示一个 AI 动作，不预先请求、不显示虚构命令。
 
-未配置时默认不显示 AI 动作；`hokan doctor` 和 `hokan config ai` 提供设置入口。
+未配置时默认不显示 AI 动作；`hokan ai setup`（交互向导）、`hokan config ai`（脚本化路径）和 `hokan doctor` 提供设置与诊断入口。
 
 ### 10.2 Loading 与取消
 
@@ -272,7 +272,7 @@ $ 查找当前目录 7 天内修改过的 rs 文件▌
 
 ```text
   [AI] 请求超时              retry
-  [AI] 凭据被拒绝            run: hokan config ai
+  [AI] 凭据被拒绝            run: hokan ai setup
   [AI] 响应不是有效命令列表  retry
 ```
 

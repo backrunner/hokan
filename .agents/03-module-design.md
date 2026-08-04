@@ -692,6 +692,14 @@ pub struct ScoreSignals {
 - metadata 查询按需执行，避免对每个 entry 调用 `stat`；`Executable` slot 才检查 mode/extension。
 - cache key 包含 canonical CWD、目录 metadata fingerprint、hidden policy 和 slot kind。
 - 返回 `display` 原始文件名与经过 `parser::quote` 生成的 edit。
+- 抑制规则：当前词以 `-` 开头（flags 位）不产生候选；spec 覆盖的命令或 man 文档含子命令的命令在首参数位不走 `_ => Path` 兜底（由 command_spec/command_help 接管），其余位置和命令照常补文件。
+
+### 8.3.1 `command_help`
+
+- 对无 spec 覆盖的 PATH 可执行命令，在 flags 位（当前词以 `-` 开头）和首参数位提供 man page 提取的 flag/子命令候选（source 标签 `HELP`）。
+- 提取只运行固定的 `man -P cat`（只读、run_bounded 限时 1200ms），绝不执行用户输入的命令本身。
+- 解析为保守启发式：去 overstrike 后，flag 行取 `-x, --xxx` + 同行/缩进块描述；子命令仅在存在 COMMANDS/SUBCOMMANDS 类小节或 `cmd-<sub>` 引用时提取。
+- session 级缓存（含负结果）；冷抓取在 `applies` 中完成，使 `complete` 永远命中缓存、不吃 `local_timeout` 预算；filesystem 的抑制检查用免抓取的 `peek`。
 
 ### 8.4 `process` 与 `network_interface`
 
@@ -943,6 +951,8 @@ rotations = 3
 
 [ai]
 enabled = false
+provider = ""
+auth = "api-key"
 endpoint = "https://api.openai.com/v1"
 model = ""
 api_key_env = "OPENAI_API_KEY"
@@ -963,6 +973,7 @@ hokan uninstall --integration-only
 hokan doctor [--json]
 hokan config <path|show|validate|init>
 hokan config ai
+hokan ai setup                   # 交互式 provider/凭据向导；凭据写入 credentials.toml（v2 按 provider 存储，0600）
 hokan history <import|stats|prune|clear>
 hokan spec <list|show|validate>
 hokan ipc <emit|take>            # internal, hidden from normal help

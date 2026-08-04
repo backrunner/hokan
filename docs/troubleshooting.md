@@ -65,6 +65,13 @@ reset
 边框的圆角字符（`╭│╰`）来自 Unicode 制表符区，任何等宽字体都支持；若连边框都异常，
 检查终端的 UTF-8  locale（`LANG`/`LC_CTYPE`）。
 
+## 看不到 oh-my-posh / starship 等主题
+
+这些主题常把初始化写在 `~/.zprofile`，而 `.zprofile` 只有 login shell 才会读取。Hokan
+的内层 zsh 默认不是 login shell（`core.login_shell = false`），因此主题不会加载。
+处理：在 `~/.config/hokan/config.toml` 的 `[core]` 中设置 `login_shell = true`，或把主题
+初始化移到 `~/.zshrc`。`hokan doctor` 的 `zsh theme` 检查会自动发现这种情况并给出提示。
+
 ## powerline 主题下 overlay 不出现或闪烁
 
 常见原因：
@@ -109,6 +116,53 @@ Hokan history、snapshot 和 lock 必须是当前用户拥有的普通文件，�
 
 AI 错误只报告稳定分类，不回显 API key、Authorization header 或完整请求。401/403
 检查凭据，429 等待配额恢复，timeout/network 检查 endpoint；本地候选不会因此停用。
+
+## AI 配置与错误码
+
+查看当前 AI 状态和凭据来源（不回显 secret）：
+
+```bash
+hokan config ai
+hokan doctor
+```
+
+重新配置（向导要求 stdin/stdout 是 TTY，脚本环境用 `hokan config ai --…`）：
+
+```bash
+hokan ai setup
+```
+
+向导会按服务商写入 `~/.config/hokan/credentials.toml`（`version = 2`，`0600`）。OAuth
+服务商的 token 过期前自动刷新；刷新失败时该次请求会带旧 token 并收到 401，重新运行
+`hokan ai setup` 登录即可。
+
+AI 请求错误（`AiClientError`）的稳定错误码：
+
+| 错误码 | 原因与处理 |
+| --- | --- |
+| `HK-AI-CFG` | endpoint 或客户端配置无效；检查 `[ai]` 配置并运行 `hokan config validate` |
+| `HK-AI-CRED` | 凭据环境变量未设置，或凭据文件被拒绝；运行 `hokan config ai` 查看诊断 |
+| `HK-AI-401` | endpoint 拒绝凭据；换 key 或重新运行 `hokan ai setup` 登录 |
+| `HK-AI-429` | endpoint 限流；等待配额恢复 |
+| `HK-AI-TIMEOUT` / `HK-AI-NET` | 请求超时或网络失败；检查 endpoint、代理和网络 |
+| `HK-AI-SIZE` | 响应超过大小上限 |
+| `HK-AI-JSON` | 响应不是有效命令 JSON；模型或 endpoint 不兼容 |
+| `HK-AI-CANCEL` | 请求被 `Esc` 取消 |
+| `HK-AI-HTTP` | endpoint 返回其他 HTTP 错误，消息中附状态码 |
+| `HK-AI-PROJECT` | Gemini Code Assist 未返回 Google Cloud project；为该 Google 账号启用 Gemini Code Assist 后重新运行向导登录 |
+
+OAuth 登录过程错误（`OAuthError`）的稳定错误码：
+
+| 错误码 | 原因与处理 |
+| --- | --- |
+| `HK-AUTH-CANCEL` | 用户取消登录（输入 `q`、EOF 或 Ctrl-C） |
+| `HK-AUTH-EXPIRED` | 设备码在登录完成前过期；重新运行 `hokan ai setup` |
+| `HK-AUTH-DENIED` | 用户或服务器拒绝授权 |
+| `HK-AUTH-NET` / `HK-AUTH-TIMEOUT` | 网络失败或超时；检查网络后重试 |
+| `HK-AUTH-JSON` | 授权服务器响应无效 |
+| `HK-AUTH-HTTP` | 授权服务器拒绝请求，消息中附 HTTP 状态码 |
+| `HK-AUTH-429` | 授权服务器限流；稍后重试 |
+
 
 ## 诊断日志
 

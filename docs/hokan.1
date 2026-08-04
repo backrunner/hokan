@@ -8,8 +8,9 @@ hokan \- shell-aware terminal completion overlay
 .SH DESCRIPTION
 Hokan starts an interactive zsh, bash, or fish inside a PTY and renders an
 inline completion list below the real shell prompt. Candidates come from shell
-history, built-in command recipes, the filesystem, package.json scripts, and an
-explicitly selected OpenAI-compatible provider.
+history, built-in command recipes, the filesystem, package.json scripts,
+subcommands and flags read from man pages (HELP rows, for commands without a
+built-in spec), and an explicitly selected OpenAI-compatible provider.
 .PP
 Hokan does not use the terminal alternate screen for its overlay. AI results,
 history entries, and commands classified as high or unknown risk are inserted
@@ -68,7 +69,19 @@ Inspect, validate, or initialize the TOML configuration.
 Inspect or update the OpenAI-compatible endpoint, model, and credential source.
 Use
 .B --api-key-stdin
-to store a private credential file.
+to store a private credential file. This is the scripted, non-interactive path;
+for an interactive provider and credential wizard use
+.BR "ai setup" .
+.TP
+.B ai setup
+Interactive guided setup for AI providers and credentials: pick one of the
+registered providers (DeepSeek, OpenAI (ChatGPT) and xAI Grok via OAuth device
+code, Google Gemini via OAuth pasted authorization code or API key, Ollama
+without credentials, or a custom OpenAI-compatible endpoint), supply the
+credential, pick a model, and run a connection test. Credentials are stored
+per provider in credentials.toml with mode 0600; OAuth tokens refresh
+automatically before expiry. The wizard prompts inline and requires stdin and
+stdout to be a terminal; it refuses to run when they are not.
 .TP
 .BI "history " import|stats|prune|repair|compact|clear
 Import and maintain Hokan's private history store. Clearing requires
@@ -137,6 +150,8 @@ Default configuration.
 .TP
 .I ~/.config/hokan/credentials.toml
 Optional credential file; must be owned by the user and mode 0600 or stricter.
+Version 2 format stores one entry per provider: either an API key or an OAuth
+access/refresh token set with expiry.
 .TP
 .I ~/.config/hokan/specs/
 User command specifications.
