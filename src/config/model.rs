@@ -137,6 +137,20 @@ impl Config {
             ));
         }
         if self.ai.enabled {
+            let provider = self.ai.provider.trim();
+            if !provider.is_empty() && !AI_PROVIDER_SLUGS.contains(&provider) {
+                return Err(crate::Error::Config(format!(
+                    "ai.provider must be one of: {}",
+                    AI_PROVIDER_SLUGS.join(", ")
+                )));
+            }
+            let oauth = self.ai.auth == AiAuth::OAuth;
+            if oauth && !AI_OAUTH_PROVIDER_SLUGS.contains(&provider) {
+                return Err(crate::Error::Config(
+                    "ai.auth = oauth requires ai.provider to be one of: openai-oauth, gemini-oauth, grok-oauth"
+                        .into(),
+                ));
+            }
             let has_credential_source = self
                 .ai
                 .api_key_file
@@ -145,7 +159,7 @@ impl Config {
                 || !self.ai.api_key_env.trim().is_empty();
             if self.ai.endpoint.trim().is_empty()
                 || self.ai.model.trim().is_empty()
-                || !has_credential_source
+                || !(oauth || has_credential_source)
             {
                 return Err(crate::Error::Config(
                     "enabled AI requires endpoint, model, and a credential source".into(),
@@ -416,6 +430,11 @@ impl Default for CompletionConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct AiConfig {
     pub enabled: bool,
+    /// Provider registry slug; `""` keeps the legacy single-endpoint behavior.
+    pub provider: String,
+    pub auth: AiAuth,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
     pub endpoint: String,
     pub model: String,
     pub api_key_env: String,
@@ -425,10 +444,42 @@ pub struct AiConfig {
     pub send_cwd_basename: bool,
 }
 
+/// Credential kind a provider entry uses, serialized kebab-case (`api-key` / `oauth`).
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AiAuth {
+    #[default]
+    ApiKey,
+    // `rename_all` alone would produce `o-auth`.
+    #[serde(rename = "oauth")]
+    OAuth,
+}
+
+/// Slugs accepted by `ai.provider`. Duplicated from `ai::providers::registry()`
+/// because config is the lower-level module and must not depend on the ai
+/// module; the `ai::providers` tests assert both lists stay in sync.
+pub(crate) const AI_PROVIDER_SLUGS: [&str; 8] = [
+    "deepseek",
+    "openai-oauth",
+    "gemini-oauth",
+    "gemini",
+    "grok-oauth",
+    "grok",
+    "ollama",
+    "custom",
+];
+
+/// Slugs whose registry entries support `auth = "oauth"`.
+pub(crate) const AI_OAUTH_PROVIDER_SLUGS: [&str; 3] =
+    ["openai-oauth", "gemini-oauth", "grok-oauth"];
+
 impl Default for AiConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            provider: String::new(),
+            auth: AiAuth::default(),
+            account_id: None,
             endpoint: "https://api.openai.com/v1".into(),
             model: String::new(),
             api_key_env: "OPENAI_API_KEY".into(),
@@ -558,5 +609,87 @@ mod tests {
                 .file_type()
                 .is_symlink()
         );
+    }
+
+    #[test]
+    fn ai_provider_fields_default_to_legacy_behavior() {
+        let config = AiConfig::default();
+        assert_eq!(config.provider, "");
+        assert_eq!(config.auth, AiAuth::ApiKey);
+        assert_eq!(config.account_id, None);
+
+        let rendered = toml::to_string(&config).expect("serialize ai config");
+        assert!(!rendered.contains("account_id"));
+        assert!(rendered.contains("auth = \"api-key\""));
+    }
+
+    #[test]
+    fn ai_provider_fields_serde_roundtrip() {
+        let parsed: AiConfig = toml::from_str(
+            "provider = \"grok-oauth\"\nauth = \"oauth\"\naccount_id = \"acct-1\"\n",
+        )
+        .expect("parse ai config");
+        assert_eq!(parsed.provider, "grok-oauth");
+        assert_eq!(parsed.auth, AiAuth::OAuth);
+        assert_eq!(parsed.account_id.as_deref(), Some("acct-1"));
+
+        let rendered = toml::to_string(&parsed).expect("serialize ai config");
+        let reparsed: AiConfig = toml::from_str(&rendered).expect("reparse ai config");
+        assert_eq!(parsed, reparsed);
+    }
+
+    #[test]
+    fn legacy_ai_config_without_provider_fields_loads_unchanged() {
+        let parsed: Config = toml::from_str(
+            "version = 1\n[ai]\nenabled = false\nendpoint = \"https://api.example.com/v1\"\nmodel = \"m\"\n",
+        )
+        .expect("legacy ai config must parse");
+        assert_eq!(parsed.ai.provider, "");
+        assert_eq!(parsed.ai.auth, AiAuth::ApiKey);
+        assert_eq!(parsed.ai.account_id, None);
+        assert_eq!(parsed.ai.endpoint, "https://api.example.com/v1");
+    }
+
+    #[test]
+    fn oauth_auth_requires_an_oauth_capable_provider() {
+        let mut config = Config::default();
+        config.ai.enabled = true;
+        config.ai.endpoint = "https://api.x.ai/v1".into();
+        config.ai.model = "grok-4.5".into();
+        config.ai.auth = AiAuth::OAuth;
+
+        // OAuth with no provider is rejected.
+        assert!(config.validate().is_err());
+        // OAuth with an API-key-only provider is rejected.
+        config.ai.provider = "deepseek".into();
+        assert!(config.validate().is_err());
+        // OAuth with an OAuth-capable provider needs no api_key source.
+        config.ai.provider = "grok-oauth".into();
+        config.ai.api_key_env = String::new();
+        config.ai.api_key_file = None;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn api_key_auth_requires_known_provider_and_credential_source() {
+        let mut config = Config::default();
+        config.ai.enabled = true;
+        config.ai.endpoint = "https://api.deepseek.com/v1".into();
+        config.ai.model = "deepseek-chat".into();
+
+        // Unknown provider slugs are rejected.
+        config.ai.provider = "unknown".into();
+        assert!(config.validate().is_err());
+        // Known providers still require a credential source.
+        config.ai.provider = "deepseek".into();
+        config.ai.api_key_env = String::new();
+        config.ai.api_key_file = None;
+        assert!(config.validate().is_err());
+        config.ai.api_key_env = "DEEPSEEK_API_KEY".into();
+        assert!(config.validate().is_ok());
+        // `custom` accepts any endpoint.
+        config.ai.provider = "custom".into();
+        config.ai.endpoint = "http://localhost:8080/v1".into();
+        assert!(config.validate().is_ok());
     }
 }

@@ -6,7 +6,8 @@ use std::{
 use super::ConfigCommand;
 use crate::config::{Config, ConfigPaths};
 
-const API_KEY_STDIN_MAX_BYTES: u64 = 8 * 1024 + 2;
+const API_KEY_MAX_BYTES: u64 = 8 * 1024;
+const API_KEY_STDIN_MAX_BYTES: u64 = API_KEY_MAX_BYTES + 2;
 
 pub fn run(output: &mut dyn Write, command: ConfigCommand) -> crate::Result<()> {
     let paths = ConfigPaths::discover()?;
@@ -72,8 +73,21 @@ fn run_with_io(
             }
             if api_key_stdin {
                 let key = read_api_key(input)?;
-                crate::config::write_api_key(&paths.credentials_file, &key)
+                // A configured provider owns its own slug so key rotation
+                // lands where `load_api_key` actually reads; legacy setups
+                // (no provider) keep the reserved migration slug.
+                let provider = config.ai.provider.trim();
+                if provider.is_empty() {
+                    crate::config::write_api_key(&paths.credentials_file, &key)
+                        .map_err(|error| crate::Error::Config(error.to_string()))?;
+                } else {
+                    crate::config::write_credential(
+                        &paths.credentials_file,
+                        provider,
+                        &crate::config::ProviderCredential::ApiKey(key),
+                    )
                     .map_err(|error| crate::Error::Config(error.to_string()))?;
+                }
                 config.ai.api_key_file = Some(PathBuf::from("credentials.toml"));
             }
             if changed {
@@ -93,12 +107,30 @@ fn write_ai_status(
 ) -> crate::Result<()> {
     let credential_path =
         crate::config::resolve_credential_path(&config.ai, &paths.credentials_file);
-    let key_available = crate::config::credential_available(&config.ai, &paths.credentials_file);
+    let key_available =
+        crate::config::configured_credential_available(&config.ai, &paths.credentials_file);
     writeln!(output, "config: {}", paths.config_file.display())?;
     writeln!(
         output,
         "enabled: {}",
         if config.ai.enabled { "yes" } else { "no" }
+    )?;
+    writeln!(
+        output,
+        "provider: {}",
+        if config.ai.provider.trim().is_empty() {
+            "<not configured>"
+        } else {
+            config.ai.provider.trim()
+        }
+    )?;
+    writeln!(
+        output,
+        "auth: {}",
+        match config.ai.auth {
+            crate::config::AiAuth::ApiKey => "api-key",
+            crate::config::AiAuth::OAuth => "oauth",
+        }
     )?;
     writeln!(
         output,
@@ -129,6 +161,7 @@ fn write_ai_status(
         if key_available { "yes" } else { "no" }
     )?;
     if !key_available
+        && config.ai.auth == crate::config::AiAuth::ApiKey
         && let Err(error) = crate::config::load_api_key(&config.ai, &paths.credentials_file)
     {
         writeln!(output, "api key diagnostic: {error}")?;
@@ -149,13 +182,15 @@ fn read_api_key(input: &mut dyn Read) -> crate::Result<zeroize::Zeroizing<String
     input
         .take(API_KEY_STDIN_MAX_BYTES)
         .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 >= API_KEY_STDIN_MAX_BYTES {
+    // Strip the line ending first so a maximum-length key is accepted with
+    // either LF or CRLF; only the key bytes count against the limit.
+    while matches!(bytes.last(), Some(b'\n' | b'\r')) {
+        bytes.pop();
+    }
+    if bytes.len() as u64 > API_KEY_MAX_BYTES {
         return Err(crate::Error::Config(
             "API key from stdin exceeded 8 KiB".into(),
         ));
-    }
-    while matches!(bytes.last(), Some(b'\n' | b'\r')) {
-        bytes.pop();
     }
     let key = String::from_utf8(std::mem::take(&mut *bytes))
         .map_err(|_| crate::Error::Config("API key from stdin was not UTF-8".into()))?;
@@ -230,5 +265,99 @@ mod tests {
         let config = Config::load(&paths.config_file).expect("load config");
         assert_eq!(config.ai.api_key_env, "MY_AI_KEY");
         assert!(config.ai.api_key_file.is_none());
+    }
+
+    #[test]
+    fn api_key_stdin_rotates_the_configured_providers_slug() {
+        let directory = tempfile::tempdir().expect("directory");
+        let paths = paths(&directory);
+        let mut config = Config::default();
+        config.ai.provider = "deepseek".into();
+        config.ai.api_key_file = Some(PathBuf::from("credentials.toml"));
+        config
+            .write_atomic(&paths.config_file)
+            .expect("write config");
+        crate::config::write_credential(
+            &paths.credentials_file,
+            "deepseek",
+            &crate::config::ProviderCredential::ApiKey(zeroize::Zeroizing::new(
+                "old-key".to_owned(),
+            )),
+        )
+        .expect("write existing provider credential");
+
+        let command = ConfigCommand::Ai {
+            enable: false,
+            disable: false,
+            endpoint: None,
+            model: None,
+            api_key_env: None,
+            api_key_stdin: true,
+        };
+        run_with_io(&mut Vec::new(), &mut &b"rotated-key\n"[..], command, &paths)
+            .expect("rotate key");
+
+        // The new key lands under the provider slug, replacing the old one.
+        match crate::config::read_credential(&paths.credentials_file, "deepseek")
+            .expect("provider credential")
+        {
+            crate::config::ProviderCredential::ApiKey(key) => {
+                assert_eq!(key.as_str(), "rotated-key")
+            }
+            crate::config::ProviderCredential::OAuth(_) => panic!("entry must stay an API key"),
+        }
+        // Nothing is written under the reserved legacy slug.
+        assert!(matches!(
+            crate::config::read_credential(&paths.credentials_file, "default"),
+            Err(crate::config::CredentialError::Missing)
+        ));
+        let config = Config::load(&paths.config_file).expect("load config");
+        let key = crate::config::load_api_key(&config.ai, &paths.credentials_file)
+            .expect("rotated key loads");
+        assert_eq!(key.as_str(), "rotated-key");
+    }
+
+    #[test]
+    fn ai_status_reports_oauth_credential_as_available() {
+        let directory = tempfile::tempdir().expect("directory");
+        let paths = paths(&directory);
+        crate::config::write_credential(
+            &paths.credentials_file,
+            "grok-oauth",
+            &crate::config::ProviderCredential::OAuth(crate::config::OAuthTokens {
+                access_token: zeroize::Zeroizing::new("access-token".to_owned()),
+                refresh_token: zeroize::Zeroizing::new("refresh-token".to_owned()),
+                expires_at: 1_735_689_600,
+                account_id: None,
+            }),
+        )
+        .expect("write oauth credential");
+
+        let mut config = Config::default();
+        config.ai.enabled = true;
+        config.ai.provider = "grok-oauth".into();
+        config.ai.auth = crate::config::AiAuth::OAuth;
+        let mut output = Vec::new();
+        write_ai_status(&mut output, &config, &paths).expect("status");
+        let rendered = String::from_utf8(output).expect("UTF-8 output");
+        assert!(rendered.contains("api key available: yes"), "{rendered}");
+        assert!(!rendered.contains("access-token"));
+    }
+
+    #[test]
+    fn read_api_key_accepts_max_length_key_with_crlf() {
+        let mut input = vec![b'a'; API_KEY_MAX_BYTES as usize];
+        input.extend_from_slice(b"\r\n");
+        let key = read_api_key(&mut &input[..]).expect("maximum key with CRLF");
+        assert_eq!(key.len(), API_KEY_MAX_BYTES as usize);
+
+        let mut input = vec![b'a'; API_KEY_MAX_BYTES as usize];
+        input.extend_from_slice(b"\n");
+        let key = read_api_key(&mut &input[..]).expect("maximum key with LF");
+        assert_eq!(key.len(), API_KEY_MAX_BYTES as usize);
+
+        let mut input = vec![b'a'; API_KEY_MAX_BYTES as usize + 1];
+        input.extend_from_slice(b"\n");
+        read_api_key(&mut &input[..]).expect_err("over-limit key must be rejected");
     }
 }

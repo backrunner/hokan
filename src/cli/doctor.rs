@@ -10,7 +10,7 @@ use std::{
 use serde::Serialize;
 
 use crate::{
-    config::{Config, ConfigPaths},
+    config::{AiAuth, Config, ConfigPaths, CredentialError, ProviderCredential},
     shell::{PROTOCOL_VERSION, ShellKind},
 };
 
@@ -78,9 +78,16 @@ struct DoctorReport {
     data_directories: BTreeMap<&'static str, Check>,
     debug_logging: Check,
     ai: Check,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ai_provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ai_auth: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ai_credential: Option<String>,
     shell_integration: ShellIntegrationReport,
     zsh_setup_mode: Check,
     zsh_plugin_conflicts: Vec<Check>,
+    zsh_theme: Check,
 }
 
 pub fn write_report(output: &mut dyn Write, json: bool) -> crate::Result<()> {
@@ -146,6 +153,15 @@ pub fn write_report(output: &mut dyn Write, json: bool) -> crate::Result<()> {
     }
     write_check(output, "debug logging", &report.debug_logging)?;
     write_check(output, "AI", &report.ai)?;
+    if let Some(provider) = &report.ai_provider {
+        writeln!(output, "AI provider: {provider}")?;
+    }
+    if let Some(auth) = report.ai_auth {
+        writeln!(output, "AI auth: {auth}")?;
+    }
+    if let Some(credential) = &report.ai_credential {
+        writeln!(output, "AI credential: {credential}")?;
+    }
     write_check(output, "shell hook", &report.shell_integration.hook)?;
     write_check(output, "shell protocol", &report.shell_integration.protocol)?;
     write_check(
@@ -162,6 +178,7 @@ pub fn write_report(output: &mut dyn Write, json: bool) -> crate::Result<()> {
     for check in &report.zsh_plugin_conflicts {
         write_check(output, "zsh plugin conflicts", check)?;
     }
+    write_check(output, "zsh theme", &report.zsh_theme)?;
     Ok(())
 }
 
@@ -186,8 +203,12 @@ fn collect() -> DoctorReport {
     let data_directories = inspect_data_directories(paths.as_ref());
     let debug_logging = inspect_debug_logging(config.as_ref(), paths.as_ref());
     let ai = inspect_ai(config.as_ref(), paths.as_ref());
+    let ai_details = inspect_ai_details(config.as_ref(), paths.as_ref());
     let shell_integration = inspect_shell_integration();
-    let (zsh_setup_mode, zsh_plugin_conflicts) = inspect_zsh_rc_files();
+    let login_shell = config
+        .as_ref()
+        .is_some_and(|config| config.core.login_shell);
+    let (zsh_setup_mode, zsh_plugin_conflicts, zsh_theme) = inspect_zsh_rc_files(login_shell);
     DoctorReport {
         hokan_version: env!("CARGO_PKG_VERSION"),
         protocol_version: PROTOCOL_VERSION,
@@ -210,9 +231,15 @@ fn collect() -> DoctorReport {
         data_directories,
         debug_logging,
         ai,
+        ai_provider: ai_details
+            .as_ref()
+            .and_then(|details| details.provider.clone()),
+        ai_auth: ai_details.as_ref().map(|details| details.auth),
+        ai_credential: ai_details.and_then(|details| details.credential),
         shell_integration,
         zsh_setup_mode,
         zsh_plugin_conflicts,
+        zsh_theme,
         shells,
         shell_capabilities,
     }
@@ -351,17 +378,88 @@ fn inspect_ai(config: Option<&Config>, paths: Option<&ConfigPaths>) -> Check {
     if !config.ai.enabled && !file_configured {
         return Check::new(CheckLevel::NotApplicable, "disabled; no credential is read");
     }
-    match crate::config::load_api_key(&config.ai, &paths.credentials_file) {
-        Ok(_) if config.ai.enabled => Check::new(
+    match inspect_ai_credential(config, paths) {
+        Ok(()) if config.ai.enabled => Check::new(
             CheckLevel::Ok,
             "enabled; endpoint, model, and credential are valid",
         ),
-        Ok(_) => Check::new(
+        Ok(()) => Check::new(
             CheckLevel::Ok,
             "disabled; configured credential file is private and valid",
         ),
         Err(error) => Check::new(CheckLevel::Error, error.to_string()),
     }
+}
+
+/// Validates the credential the way the configured auth method consumes it:
+/// API-key configs resolve through `load_api_key`, OAuth configs require a
+/// stored OAuth token set for `ai.provider` (an API-key entry does not
+/// satisfy an OAuth setup).
+fn inspect_ai_credential(config: &Config, paths: &ConfigPaths) -> crate::Result<()> {
+    if config.ai.auth == AiAuth::OAuth {
+        let provider = config.ai.provider.trim();
+        let path = crate::config::resolve_credential_path(&config.ai, &paths.credentials_file)
+            .unwrap_or_else(|| paths.credentials_file.clone());
+        return match crate::config::read_credential(&path, provider) {
+            Ok(ProviderCredential::OAuth(_)) => Ok(()),
+            Ok(ProviderCredential::ApiKey(_)) => Err(CredentialError::InvalidFormat),
+            Err(error) => Err(error),
+        }
+        .map_err(|error| crate::Error::Config(error.to_string()));
+    }
+    crate::config::load_api_key(&config.ai, &paths.credentials_file)
+        .map(|_| ())
+        .map_err(|error| crate::Error::Config(error.to_string()))
+}
+
+/// Provider/auth/credential-source lines reported for an enabled AI config.
+/// Never carries secrets: OAuth reports only whether the credentials entry
+/// exists, API-key configs report no credential detail (the `ai` check
+/// already validates the key without echoing it).
+struct AiDetails {
+    provider: Option<String>,
+    auth: &'static str,
+    credential: Option<String>,
+}
+
+fn inspect_ai_details(config: Option<&Config>, paths: Option<&ConfigPaths>) -> Option<AiDetails> {
+    let config = config?;
+    if !config.ai.enabled {
+        return None;
+    }
+    let provider = config.ai.provider.trim();
+    let auth = match config.ai.auth {
+        AiAuth::ApiKey => "api-key",
+        AiAuth::OAuth => "oauth",
+    };
+    let credential = if config.ai.auth == AiAuth::OAuth {
+        let paths = paths?;
+        let path = crate::config::resolve_credential_path(&config.ai, &paths.credentials_file)
+            .unwrap_or_else(|| paths.credentials_file.clone());
+        let detail = match crate::config::read_credential(&path, provider) {
+            Ok(ProviderCredential::OAuth(_)) => {
+                format!("{} entry for {provider} is present", path.display())
+            }
+            Ok(ProviderCredential::ApiKey(_)) => {
+                format!(
+                    "{} entry for {provider} is an API key, not OAuth tokens",
+                    path.display()
+                )
+            }
+            Err(CredentialError::Missing) => {
+                format!("no entry for {provider} in {}", path.display())
+            }
+            Err(error) => format!("{} is unreadable: {error}", path.display()),
+        };
+        Some(detail)
+    } else {
+        None
+    };
+    Some(AiDetails {
+        provider: (!provider.is_empty()).then(|| provider.to_owned()),
+        auth,
+        credential,
+    })
 }
 
 fn inspect_debug_logging(config: Option<&Config>, paths: Option<&ConfigPaths>) -> Check {
@@ -447,7 +545,9 @@ fn inspect_shell_integration() -> ShellIntegrationReport {
 /// Read the user's zsh rc files ($ZDOTDIR or $HOME: `.zshenv`, `.zshrc`) and
 /// report the installed setup mode plus any known-conflicting plugin
 /// integrations. Never fails: unreadable files degrade to an info note.
-fn inspect_zsh_rc_files() -> (Check, Vec<Check>) {
+/// Also checks `.zprofile`/`.zshrc` for prompt-theme initializers that the
+/// inner shell might skip (login_shell = false).
+fn inspect_zsh_rc_files(login_shell: bool) -> (Check, Vec<Check>, Check) {
     // An empty ZDOTDIR is treated as unset, matching zsh's behavior.
     let base = env::var_os("ZDOTDIR")
         .filter(|value| !value.is_empty())
@@ -463,6 +563,7 @@ fn inspect_zsh_rc_files() -> (Check, Vec<Check>) {
                 CheckLevel::NotApplicable,
                 "cannot locate zsh rc files",
             )],
+            Check::new(CheckLevel::NotApplicable, "cannot locate zsh rc files"),
         );
     };
     let mut setup_mode = Check::new(
@@ -500,7 +601,65 @@ fn inspect_zsh_rc_files() -> (Check, Vec<Check>) {
         };
         conflicts.push(Check::new(CheckLevel::Ok, detail));
     }
-    (setup_mode, conflicts)
+    (setup_mode, conflicts, inspect_zsh_theme(&base, login_shell))
+}
+
+/// Detect prompt-theme initializers (oh-my-posh, starship, powerlevel10k) in
+/// the user's zsh startup files. A theme initialized only in `.zprofile` is
+/// loaded by login shells only, so a non-login inner shell
+/// (`core.login_shell = false`) never sees it.
+fn inspect_zsh_theme(base: &Path, login_shell: bool) -> Check {
+    let zshrc = base.join(".zshrc");
+    if let Ok(contents) = fs::read_to_string(&zshrc)
+        && let Some(theme) = theme_for_contents(&contents)
+    {
+        return Check::new(
+            CheckLevel::Ok,
+            format!("{theme} initializes in .zshrc; the inner shell loads it"),
+        );
+    }
+    let zprofile = base.join(".zprofile");
+    if let Ok(contents) = fs::read_to_string(&zprofile)
+        && let Some(theme) = theme_for_contents(&contents)
+    {
+        if login_shell {
+            return Check::new(
+                CheckLevel::Ok,
+                format!("{theme} initializes in .zprofile; loaded because login_shell = true"),
+            );
+        }
+        return Check::new(
+            CheckLevel::Warn,
+            format!(
+                "{theme} initializes in .zprofile, which only login shells read; Hokan's inner zsh is not a login shell (core.login_shell = false), so the theme will not appear inside Hokan. Set `login_shell = true` in ~/.config/hokan/config.toml or move the init to .zshrc"
+            ),
+        );
+    }
+    Check::new(
+        CheckLevel::NotApplicable,
+        "no prompt theme initializer found in .zshrc/.zprofile",
+    )
+}
+
+/// Return the theme name when the file contents initialize a known prompt
+/// theme. Comment lines are ignored.
+fn theme_for_contents(contents: &str) -> Option<&'static str> {
+    for line in contents.lines() {
+        let line = line.trim_start();
+        if line.starts_with('#') {
+            continue;
+        }
+        if line.contains("oh-my-posh init") {
+            return Some("oh-my-posh");
+        }
+        if line.contains("starship init") {
+            return Some("starship");
+        }
+        if line.contains("powerlevel10k") || line.contains("p10k") {
+            return Some("powerlevel10k");
+        }
+    }
+    None
 }
 
 /// Classify the managed integration block as auto-start or on-demand.
@@ -675,6 +834,65 @@ mod tests {
     }
 
     #[test]
+    fn inspect_ai_follows_the_configured_auth_method() {
+        use zeroize::Zeroizing;
+
+        let directory = tempfile::tempdir().expect("directory");
+        let paths = ConfigPaths {
+            config_file: directory.path().join("config.toml"),
+            credentials_file: directory.path().join("credentials.toml"),
+            specs_directory: directory.path().join("specs"),
+            state_directory: directory.path().join("state"),
+            cache_directory: directory.path().join("cache"),
+        };
+        crate::config::write_credential(
+            &paths.credentials_file,
+            "grok-oauth",
+            &ProviderCredential::OAuth(crate::config::OAuthTokens {
+                access_token: Zeroizing::new("access-token".to_owned()),
+                refresh_token: Zeroizing::new("refresh-token".to_owned()),
+                expires_at: 1_735_689_600,
+                account_id: None,
+            }),
+        )
+        .expect("write oauth credential");
+
+        let mut config = Config::default();
+        config.ai.enabled = true;
+        config.ai.provider = "grok-oauth".into();
+        config.ai.auth = AiAuth::OAuth;
+        // A stored OAuth token set satisfies an OAuth config; it must not be
+        // misreported as an invalid API-key file.
+        let check = inspect_ai(Some(&config), Some(&paths));
+        assert_eq!(check.level, CheckLevel::Ok, "{}", check.detail);
+
+        // A missing entry is an error, not an "invalid file".
+        config.ai.provider = "gemini-oauth".into();
+        let check = inspect_ai(Some(&config), Some(&paths));
+        assert_eq!(check.level, CheckLevel::Error);
+        assert!(check.detail.contains("not configured"), "{}", check.detail);
+
+        // An API-key entry cannot satisfy an OAuth config.
+        config.ai.provider = "deepseek".into();
+        crate::config::write_credential(
+            &paths.credentials_file,
+            "deepseek",
+            &ProviderCredential::ApiKey(Zeroizing::new("deepseek-key".to_owned())),
+        )
+        .expect("write api key credential");
+        assert_eq!(
+            inspect_ai(Some(&config), Some(&paths)).level,
+            CheckLevel::Error
+        );
+
+        // API-key auth still resolves through the legacy file lookup.
+        config.ai.auth = AiAuth::ApiKey;
+        config.ai.api_key_file = Some(PathBuf::from("credentials.toml"));
+        let check = inspect_ai(Some(&config), Some(&paths));
+        assert_eq!(check.level, CheckLevel::Ok, "{}", check.detail);
+    }
+
+    #[test]
     fn disabled_ai_does_not_require_or_read_a_default_environment_key() {
         let directory = tempfile::tempdir().expect("directory");
         let paths = ConfigPaths {
@@ -688,6 +906,60 @@ mod tests {
             inspect_ai(Some(&Config::default()), Some(&paths)).level,
             CheckLevel::NotApplicable
         );
+    }
+
+    #[test]
+    fn ai_details_report_provider_auth_and_oauth_entry_without_secrets() {
+        use zeroize::Zeroizing;
+
+        let directory = tempfile::tempdir().expect("directory");
+        let paths = ConfigPaths {
+            config_file: directory.path().join("config.toml"),
+            credentials_file: directory.path().join("credentials.toml"),
+            specs_directory: directory.path().join("specs"),
+            state_directory: directory.path().join("state"),
+            cache_directory: directory.path().join("cache"),
+        };
+        crate::config::write_credential(
+            &paths.credentials_file,
+            "grok-oauth",
+            &ProviderCredential::OAuth(crate::config::OAuthTokens {
+                access_token: Zeroizing::new("access-token".to_owned()),
+                refresh_token: Zeroizing::new("refresh-token".to_owned()),
+                expires_at: 1_735_689_600,
+                account_id: None,
+            }),
+        )
+        .expect("write oauth credential");
+
+        // Disabled configs report no details at all.
+        assert!(inspect_ai_details(Some(&Config::default()), Some(&paths)).is_none());
+
+        let mut config = Config::default();
+        config.ai.enabled = true;
+        config.ai.provider = "grok-oauth".into();
+        config.ai.auth = AiAuth::OAuth;
+        let details = inspect_ai_details(Some(&config), Some(&paths)).expect("details");
+        assert_eq!(details.provider.as_deref(), Some("grok-oauth"));
+        assert_eq!(details.auth, "oauth");
+        let credential = details.credential.expect("oauth credential line");
+        assert!(credential.contains("present"), "{credential}");
+        assert!(!credential.contains("access-token"));
+        assert!(!credential.contains("refresh-token"));
+
+        // A missing entry is reported as absent, still without secrets.
+        config.ai.provider = "gemini-oauth".into();
+        let details = inspect_ai_details(Some(&config), Some(&paths)).expect("details");
+        let credential = details.credential.expect("oauth credential line");
+        assert!(credential.contains("no entry"), "{credential}");
+
+        // API-key configs report provider/auth but no credential detail.
+        config.ai.provider = "deepseek".into();
+        config.ai.auth = AiAuth::ApiKey;
+        let details = inspect_ai_details(Some(&config), Some(&paths)).expect("details");
+        assert_eq!(details.provider.as_deref(), Some("deepseek"));
+        assert_eq!(details.auth, "api-key");
+        assert!(details.credential.is_none());
     }
 
     #[test]
@@ -778,5 +1050,51 @@ export EDITOR=vim
             Some("on-demand (`hk` alias)")
         );
         assert_eq!(detect_setup_mode("export EDITOR=vim\n"), None);
+    }
+
+    #[test]
+    fn theme_detection_finds_known_initializers() {
+        assert_eq!(
+            theme_for_contents("eval \"$(oh-my-posh init zsh)\"\n"),
+            Some("oh-my-posh")
+        );
+        assert_eq!(
+            theme_for_contents("eval \"$(starship init zsh)\"\n"),
+            Some("starship")
+        );
+        assert_eq!(
+            theme_for_contents("source ~/powerlevel10k/powerlevel10k.zsh-theme\n"),
+            Some("powerlevel10k")
+        );
+        assert_eq!(
+            theme_for_contents("# eval \"$(oh-my-posh init zsh)\"\nexport EDITOR=vim\n"),
+            None
+        );
+        assert_eq!(theme_for_contents("export EDITOR=vim\n"), None);
+    }
+
+    #[test]
+    fn zprofile_only_theme_warns_unless_login_shell() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join(".zprofile"),
+            "eval \"$(oh-my-posh init zsh)\"\n",
+        )
+        .expect("zprofile fixture");
+        let warn = inspect_zsh_theme(dir.path(), false);
+        assert_eq!(warn.level, CheckLevel::Warn);
+        assert!(
+            warn.detail.contains("login_shell = true"),
+            "{}",
+            warn.detail
+        );
+        let ok = inspect_zsh_theme(dir.path(), true);
+        assert_eq!(ok.level, CheckLevel::Ok);
+
+        fs::write(dir.path().join(".zshrc"), "eval \"$(starship init zsh)\"\n")
+            .expect("zshrc fixture");
+        let in_zshrc = inspect_zsh_theme(dir.path(), false);
+        assert_eq!(in_zshrc.level, CheckLevel::Ok);
+        assert!(in_zshrc.detail.contains(".zshrc"), "{}", in_zshrc.detail);
     }
 }

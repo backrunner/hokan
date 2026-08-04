@@ -1,3 +1,4 @@
+mod ai;
 mod config;
 mod doctor;
 mod history;
@@ -65,6 +66,10 @@ enum Command {
     #[command(subcommand)]
     Config(ConfigCommand),
 
+    /// Configure AI providers and credentials interactively.
+    #[command(subcommand)]
+    Ai(AiCommand),
+
     /// Import and maintain Hokan's history store.
     #[command(subcommand)]
     History(HistoryCommand),
@@ -100,6 +105,12 @@ enum ConfigCommand {
         #[arg(long, conflicts_with = "api_key_env")]
         api_key_stdin: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum AiCommand {
+    /// Interactive guided setup for AI providers and credentials.
+    Setup,
 }
 
 #[derive(Debug, Subcommand)]
@@ -178,6 +189,12 @@ pub fn run<W: Write>(cli: Cli, output: &mut W) -> crate::Result<Option<SessionOp
         }
         Some(Command::Config(command)) => {
             config::run(output, command)?;
+            Ok(None)
+        }
+        Some(Command::Ai(command)) => {
+            // The wizard prompts inline and needs immediate echo, so it owns
+            // stdio directly instead of the buffered `output` path.
+            ai::run(command)?;
             Ok(None)
         }
         Some(Command::History(command)) => {

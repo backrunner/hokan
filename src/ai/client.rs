@@ -1,22 +1,71 @@
-use std::{path::Path, time::Duration};
-
-use reqwest::{Client, StatusCode, redirect::Policy};
-use serde::{Deserialize, Serialize};
-use tokio_util::sync::CancellationToken;
-
-use crate::{
-    ai::protocol::AiContext,
-    config::{AiConfig, CredentialError, load_api_key},
+use std::{
+    path::{Path, PathBuf},
+    sync::Mutex,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-const RESPONSE_MAX_BYTES: usize = 128 * 1024;
+use reqwest::{Client, RequestBuilder, StatusCode, redirect::Policy};
+use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
+use zeroize::Zeroizing;
+
+use crate::{
+    ai::{
+        code_assist, codex,
+        oauth::{OAuthError, expires_soon, refresh_skew_secs, refresh_tokens_async},
+        protocol::AiContext,
+    },
+    config::{
+        AiAuth, AiConfig, CredentialError, OAuthTokens, ProviderCredential, load_api_key,
+        read_credential, resolve_credential_path, write_credential,
+    },
+};
+
+pub(crate) const RESPONSE_MAX_BYTES: usize = 128 * 1024;
+
+/// Identical system prompt for every transport.
+pub(crate) const SYSTEM_PROMPT: &str = "Return only JSON: {\"commands\":[{\"command\":\"...\",\"explanation\":\"...\"}]}. Provide 1-5 single-line shell commands. Never use Markdown.";
 
 pub struct AiClient {
-    client: Client,
-    endpoint: String,
-    model: String,
+    pub(crate) client: Client,
+    /// Fully normalized per transport (chat completions URL, Codex
+    /// `/responses` URL, or the Code Assist base URL).
+    pub(crate) endpoint: String,
+    pub(crate) model: String,
+    /// Code Assist project id resolved by `loadCodeAssist`, cached so it is
+    /// resolved once per process.
+    pub(crate) code_assist_project: Mutex<Option<String>>,
     config: AiConfig,
     default_credential_path: std::path::PathBuf,
+    transport: Transport,
+    /// Test hook overriding the production OAuth token endpoint used during
+    /// credential refresh; always `None` in production.
+    refresh_endpoint: Option<String>,
+}
+
+/// Inference protocol, chosen from `ai.provider`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Transport {
+    ChatCompletions,
+    CodexResponses,
+    GeminiCodeAssist,
+}
+
+impl Transport {
+    fn for_provider(provider: &str) -> Self {
+        match provider {
+            "openai-oauth" => Self::CodexResponses,
+            "gemini-oauth" => Self::GeminiCodeAssist,
+            _ => Self::ChatCompletions,
+        }
+    }
+}
+
+/// Bearer credential resolved for one request, plus the ChatGPT account id
+/// the Codex transport needs (OAuth tokens first, `ai.account_id` fallback).
+pub(crate) struct PreparedAuth {
+    pub bearer: Zeroizing<String>,
+    pub account_id: Option<String>,
 }
 
 impl AiClient {
@@ -28,13 +77,21 @@ impl AiClient {
             .redirect(Policy::none())
             .build()
             .map_err(|_| AiClientError::Configuration)?;
-        let endpoint = normalize_endpoint(&config.endpoint)?;
+        let transport = Transport::for_provider(config.provider.trim());
+        let endpoint = match transport {
+            Transport::ChatCompletions => normalize_endpoint(&config.endpoint)?,
+            Transport::CodexResponses => codex::normalize_endpoint(&config.endpoint)?,
+            Transport::GeminiCodeAssist => code_assist::normalize_endpoint(&config.endpoint)?,
+        };
         Ok(Self {
             client,
             endpoint,
             model: config.model.clone(),
+            code_assist_project: Mutex::new(None),
             config: config.clone(),
             default_credential_path: default_credential_path.to_owned(),
+            transport,
+            refresh_endpoint: None,
         })
     }
 
@@ -46,65 +103,46 @@ impl AiClient {
         if cancel.is_cancelled() {
             return Err(AiClientError::Cancelled);
         }
-        let api_key =
-            load_api_key(&self.config, &self.default_credential_path).map_err(|error| {
-                if matches!(error, CredentialError::Missing) {
-                    AiClientError::MissingCredential
-                } else {
-                    AiClientError::CredentialRejected
-                }
-            })?;
+        let auth = self.prepare_credential(cancel).await?;
         let user_content = user_prompt(context);
+        match self.transport {
+            Transport::ChatCompletions => self.chat_completions(&auth, &user_content, cancel).await,
+            Transport::CodexResponses => codex::request(self, &auth, &user_content, cancel).await,
+            Transport::GeminiCodeAssist => {
+                code_assist::request(self, &auth, &user_content, cancel).await
+            }
+        }
+    }
+
+    async fn chat_completions(
+        &self,
+        auth: &PreparedAuth,
+        user_content: &str,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<crate::ai::AiCommand>, AiClientError> {
         let request = ChatRequest {
             model: &self.model,
             messages: vec![
                 ChatMessage {
                     role: "system",
-                    content: "Return only JSON: {\"commands\":[{\"command\":\"...\",\"explanation\":\"...\"}]}. Provide 1-5 single-line shell commands. Never use Markdown.",
+                    content: SYSTEM_PROMPT,
                 },
                 ChatMessage {
                     role: "user",
-                    content: &user_content,
+                    content: user_content,
                 },
             ],
             temperature: 0.1,
             max_tokens: 500,
         };
-        let request = self
-            .client
-            .post(&self.endpoint)
-            .bearer_auth(api_key.as_str())
-            .json(&request);
-        let mut response = tokio::select! {
-            biased;
-            () = cancel.cancelled() => return Err(AiClientError::Cancelled),
-            response = request.send() => response.map_err(map_reqwest_error)?,
-        };
-        let status = response.status();
-        if !status.is_success() {
-            return Err(status_error(status));
-        }
-        if response
-            .content_length()
-            .is_some_and(|length| length > RESPONSE_MAX_BYTES as u64)
-        {
-            return Err(AiClientError::ResponseTooLarge);
-        }
-        let mut body = Vec::new();
-        loop {
-            let chunk = tokio::select! {
-                biased;
-                () = cancel.cancelled() => return Err(AiClientError::Cancelled),
-                chunk = response.chunk() => chunk.map_err(map_reqwest_error)?,
-            };
-            let Some(chunk) = chunk else {
-                break;
-            };
-            if body.len().saturating_add(chunk.len()) > RESPONSE_MAX_BYTES {
-                return Err(AiClientError::ResponseTooLarge);
-            }
-            body.extend_from_slice(&chunk);
-        }
+        let body = send_and_read(
+            self.client
+                .post(&self.endpoint)
+                .bearer_auth(auth.bearer.as_str())
+                .json(&request),
+            cancel,
+        )
+        .await?;
         let response: ChatResponse =
             serde_json::from_slice(&body).map_err(|_| AiClientError::InvalidResponse)?;
         let content = response
@@ -114,6 +152,204 @@ impl AiClient {
             .ok_or(AiClientError::InvalidResponse)?;
         crate::ai::parse_ai_commands(content).map_err(|_| AiClientError::InvalidResponse)
     }
+
+    /// Resolves the bearer credential for one request, dispatched on
+    /// `ai.auth`. OAuth tokens are refreshed transparently when they expire
+    /// within the provider's skew.
+    async fn prepare_credential(
+        &self,
+        cancel: &CancellationToken,
+    ) -> Result<PreparedAuth, AiClientError> {
+        match self.config.auth {
+            AiAuth::ApiKey => {
+                let bearer = match load_api_key(&self.config, &self.default_credential_path) {
+                    Ok(key) => key,
+                    // Ollama ignores the bearer token but expects the header;
+                    // a placeholder keeps key-less local setups working.
+                    Err(CredentialError::Missing) if self.provider_slug() == "ollama" => {
+                        Zeroizing::new("ollama".to_owned())
+                    }
+                    Err(CredentialError::Missing) => return Err(AiClientError::MissingCredential),
+                    Err(_) => return Err(AiClientError::CredentialRejected),
+                };
+                Ok(PreparedAuth {
+                    bearer,
+                    account_id: self.config.account_id.clone(),
+                })
+            }
+            AiAuth::OAuth => {
+                let tokens = match read_credential(&self.credential_path(), self.provider_slug()) {
+                    Ok(ProviderCredential::OAuth(tokens)) => tokens,
+                    // An API key stored under an OAuth slug is a config /
+                    // store mismatch; report it as a missing OAuth credential.
+                    Ok(ProviderCredential::ApiKey(_)) | Err(CredentialError::Missing) => {
+                        return Err(AiClientError::MissingCredential);
+                    }
+                    Err(_) => return Err(AiClientError::CredentialRejected),
+                };
+                let tokens = self.refresh_if_due(tokens, cancel).await?;
+                Ok(PreparedAuth {
+                    account_id: tokens
+                        .account_id
+                        .clone()
+                        .or_else(|| self.config.account_id.clone()),
+                    bearer: tokens.access_token,
+                })
+            }
+        }
+    }
+
+    fn provider_slug(&self) -> &str {
+        self.config.provider.trim()
+    }
+
+    /// Credential store path for OAuth reads and writes: the configured
+    /// `ai.api_key_file` when set (matching `configured_credential_available`),
+    /// else the default credentials file.
+    fn credential_path(&self) -> PathBuf {
+        resolve_credential_path(&self.config, &self.default_credential_path)
+            .unwrap_or_else(|| self.default_credential_path.clone())
+    }
+
+    /// Refreshes `tokens` once when they expire within the provider's skew.
+    /// The refresh runs on the caller's runtime via the async variant: the
+    /// sync `refresh_tokens` builds its own runtime and would panic inside
+    /// `request` ("Cannot start a runtime from within a runtime"). A
+    /// transiently failed refresh keeps the stale tokens so the server
+    /// answers 401 instead of failing locally; rotated tokens are persisted
+    /// best-effort.
+    async fn refresh_if_due(
+        &self,
+        tokens: OAuthTokens,
+        cancel: &CancellationToken,
+    ) -> Result<OAuthTokens, AiClientError> {
+        if !expires_soon(
+            &tokens,
+            now_epoch_secs(),
+            refresh_skew_secs(self.provider_slug()),
+        ) {
+            return Ok(tokens);
+        }
+        let Some(refreshed) = await_refresh(
+            refresh_tokens_async(
+                &self.client,
+                self.provider_slug(),
+                &tokens,
+                self.refresh_endpoint.as_deref(),
+            ),
+            cancel,
+        )
+        .await
+        else {
+            return Err(AiClientError::Cancelled);
+        };
+        match refreshed {
+            Ok(refreshed) => {
+                // Best-effort persist: when the write fails (e.g. a read-only
+                // config directory) the rotated tokens still authorize this
+                // request and the next one simply refreshes again. AiClient
+                // holds no debug-log channel, so the failure is deliberately
+                // swallowed here; a lost rotation stays observable through
+                // the repeated refresh traffic in `hokan doctor`.
+                let _ = write_credential(
+                    &self.credential_path(),
+                    self.provider_slug(),
+                    &ProviderCredential::OAuth(refreshed.clone()),
+                );
+                Ok(refreshed)
+            }
+            // The refresh token was revoked (`invalid_grant` arrives as a
+            // 400): every following request would pay a doomed refresh round
+            // trip, so fail fast and send the user back to `hokan ai setup`.
+            Err(OAuthError::ServerRejected(400)) | Err(OAuthError::Denied) => {
+                Err(AiClientError::CredentialRejected)
+            }
+            // Transient failure: keep the stale tokens so the server answers
+            // 401 instead of failing locally.
+            Err(_) => Ok(tokens),
+        }
+    }
+}
+
+/// Drives `refresh` to completion unless `cancel` fires first, returning
+/// `None` when cancelled. The refresh branch is polled first so that, when
+/// both complete in the same tick, the rotated tokens still win and can be
+/// persisted: the server has already invalidated the old refresh token, and
+/// dropping the result would silently sign the user out for good.
+async fn await_refresh<F>(
+    refresh: F,
+    cancel: &CancellationToken,
+) -> Option<Result<OAuthTokens, OAuthError>>
+where
+    F: std::future::Future<Output = Result<OAuthTokens, OAuthError>>,
+{
+    tokio::select! {
+        biased;
+        refreshed = refresh => Some(refreshed),
+        () = cancel.cancelled() => None,
+    }
+}
+
+/// Shared HTTP plumbing for every transport: send with cancellation, map the
+/// status, then read the body in chunks under `RESPONSE_MAX_BYTES`.
+pub(crate) async fn send_and_read(
+    request: RequestBuilder,
+    cancel: &CancellationToken,
+) -> Result<Vec<u8>, AiClientError> {
+    let mut response = tokio::select! {
+        biased;
+        () = cancel.cancelled() => return Err(AiClientError::Cancelled),
+        response = request.send() => response.map_err(map_reqwest_error)?,
+    };
+    let status = response.status();
+    if !status.is_success() {
+        return Err(status_error(status));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > RESPONSE_MAX_BYTES as u64)
+    {
+        return Err(AiClientError::ResponseTooLarge);
+    }
+    let mut body = Vec::new();
+    loop {
+        let chunk = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(AiClientError::Cancelled),
+            chunk = response.chunk() => chunk.map_err(map_reqwest_error)?,
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
+        if body.len().saturating_add(chunk.len()) > RESPONSE_MAX_BYTES {
+            return Err(AiClientError::ResponseTooLarge);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+/// URL hygiene shared by all endpoint normalizers: absolute http(s), no
+/// credentials, query, or fragment.
+pub(crate) fn validate_endpoint_url(url: &str) -> Result<(), AiClientError> {
+    let parsed = reqwest::Url::parse(url).map_err(|_| AiClientError::Configuration)?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(AiClientError::Configuration);
+    }
+    Ok(())
+}
+
+fn now_epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
 }
 
 fn map_reqwest_error(error: reqwest::Error) -> AiClientError {
@@ -172,16 +408,7 @@ fn normalize_endpoint(endpoint: &str) -> Result<String, AiClientError> {
     } else {
         format!("{endpoint}/chat/completions")
     };
-    let parsed = reqwest::Url::parse(&url).map_err(|_| AiClientError::Configuration)?;
-    if !matches!(parsed.scheme(), "http" | "https")
-        || parsed.host_str().is_none()
-        || !parsed.username().is_empty()
-        || parsed.password().is_some()
-        || parsed.query().is_some()
-        || parsed.fragment().is_some()
-    {
-        return Err(AiClientError::Configuration);
-    }
+    validate_endpoint_url(&url)?;
     Ok(url)
 }
 
@@ -205,6 +432,7 @@ pub enum AiClientError {
     ResponseTooLarge,
     InvalidResponse,
     Cancelled,
+    CodeAssistProject,
     Http(u16),
 }
 
@@ -223,6 +451,9 @@ impl std::fmt::Display for AiClientError {
             Self::ResponseTooLarge => "AI response exceeded the size limit",
             Self::InvalidResponse => "AI response did not contain valid command JSON",
             Self::Cancelled => "AI request was cancelled",
+            Self::CodeAssistProject => {
+                "Gemini Code Assist did not return a Google Cloud project; enable Gemini Code Assist for your Google account and sign in again"
+            }
             Self::Http(code) => return write!(formatter, "AI endpoint returned HTTP {code}"),
         };
         formatter.write_str(message)
@@ -243,337 +474,12 @@ impl AiClientError {
             Self::ResponseTooLarge => "HK-AI-SIZE",
             Self::InvalidResponse => "HK-AI-JSON",
             Self::Cancelled => "HK-AI-CANCEL",
+            Self::CodeAssistProject => "HK-AI-PROJECT",
             Self::Http(_) => "HK-AI-HTTP",
         }
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use std::{
-        io::{Read, Write},
-        net::{TcpListener, TcpStream},
-        path::PathBuf,
-        sync::mpsc,
-        thread,
-        time::{Duration, Instant},
-    };
-
-    use super::*;
-    use crate::{config::write_api_key, shell::ShellKind};
-
-    struct TestClient {
-        _directory: tempfile::TempDir,
-        client: AiClient,
-    }
-
-    fn test_client(endpoint: &str, timeout: Duration) -> TestClient {
-        let directory = tempfile::tempdir().expect("credential directory");
-        let credential_path = directory.path().join("credentials.toml");
-        write_api_key(&credential_path, "test-secret").expect("write credential");
-        let config = AiConfig {
-            enabled: true,
-            endpoint: endpoint.to_owned(),
-            model: "test-model".into(),
-            api_key_file: Some(PathBuf::from("credentials.toml")),
-            timeout_ms: timeout.as_millis() as u64,
-            ..AiConfig::default()
-        };
-        let client = AiClient::new(&config, &credential_path).expect("client");
-        TestClient {
-            _directory: directory,
-            client,
-        }
-    }
-
-    fn context() -> AiContext {
-        AiContext {
-            request: "find recently modified Rust files".into(),
-            os: "test-os",
-            architecture: "test-arch",
-            shell: ShellKind::Zsh,
-            cwd_basename: Some("project".into()),
-            project_kinds: vec!["rust"],
-        }
-    }
-
-    fn runtime() -> tokio::runtime::Runtime {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime")
-    }
-
-    fn spawn_server<F>(handler: F) -> (String, mpsc::Receiver<Vec<u8>>, thread::JoinHandle<()>)
-    where
-        F: FnOnce(&mut TcpStream) + Send + 'static,
-    {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind server");
-        let address = listener.local_addr().expect("server address");
-        let (request_sender, request_receiver) = mpsc::channel();
-        let join = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept request");
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .expect("read timeout");
-            let request = read_http_request(&mut stream);
-            let _ = request_sender.send(request);
-            handler(&mut stream);
-        });
-        (format!("http://{address}/v1"), request_receiver, join)
-    }
-
-    fn read_http_request(stream: &mut TcpStream) -> Vec<u8> {
-        let mut request = Vec::new();
-        let mut buffer = [0_u8; 4096];
-        let mut expected = None;
-        loop {
-            let count = stream.read(&mut buffer).expect("read request");
-            if count == 0 {
-                break;
-            }
-            request.extend_from_slice(&buffer[..count]);
-            if expected.is_none()
-                && let Some(header_end) = find_bytes(&request, b"\r\n\r\n")
-            {
-                let headers = String::from_utf8_lossy(&request[..header_end]);
-                let content_length = headers
-                    .lines()
-                    .find_map(|line| {
-                        let (name, value) = line.split_once(':')?;
-                        name.eq_ignore_ascii_case("content-length")
-                            .then(|| value.trim().parse::<usize>().ok())
-                            .flatten()
-                    })
-                    .unwrap_or(0);
-                expected = Some(header_end + 4 + content_length);
-            }
-            if expected.is_some_and(|length| request.len() >= length) {
-                break;
-            }
-        }
-        request
-    }
-
-    fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-        haystack
-            .windows(needle.len())
-            .position(|window| window == needle)
-    }
-
-    fn write_response(stream: &mut TcpStream, status: &str, body: &[u8], extra: &str) {
-        write!(
-            stream,
-            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n{extra}\r\n",
-            body.len()
-        )
-        .expect("write headers");
-        stream.write_all(body).expect("write body");
-        stream.flush().expect("flush response");
-    }
-
-    fn success_body() -> Vec<u8> {
-        serde_json::to_vec(&serde_json::json!({
-            "choices": [{
-                "message": {
-                    "content": "{\"commands\":[{\"command\":\"find . -name '*.rs'\",\"explanation\":\"find Rust files\"}]}"
-                }
-            }]
-        }))
-        .expect("response JSON")
-    }
-
-    #[test]
-    fn sends_minimal_request_and_parses_success() {
-        let body = success_body();
-        let (endpoint, request_receiver, join) = spawn_server(move |stream| {
-            write_response(
-                stream,
-                "200 OK",
-                &body,
-                "Content-Type: application/json\r\n",
-            );
-        });
-        let test = test_client(&endpoint, Duration::from_secs(1));
-        let commands = runtime()
-            .block_on(test.client.request(&context(), &CancellationToken::new()))
-            .expect("AI response");
-        assert_eq!(commands[0].command, "find . -name '*.rs'");
-
-        let request =
-            String::from_utf8(request_receiver.recv().expect("request")).expect("UTF-8 request");
-        assert!(request.starts_with("POST /v1/chat/completions "));
-        assert!(request.contains("authorization: Bearer test-secret"));
-        assert!(request.contains("find recently modified Rust files"));
-        assert!(!request.contains("history"));
-        assert!(!request.contains("/full/path/to/project"));
-        join.join().expect("server");
-    }
-
-    #[test]
-    fn maps_http_errors_without_exposing_credentials() {
-        for (status, expected) in [
-            ("401 Unauthorized", AiClientError::Unauthorized),
-            ("403 Forbidden", AiClientError::Unauthorized),
-            ("404 Not Found", AiClientError::Http(404)),
-            ("429 Too Many Requests", AiClientError::RateLimited),
-            ("500 Server Error", AiClientError::Http(500)),
-        ] {
-            let (endpoint, _, join) = spawn_server(move |stream| {
-                write_response(stream, status, b"ignored", "");
-            });
-            let test = test_client(&endpoint, Duration::from_secs(1));
-            let error = runtime()
-                .block_on(test.client.request(&context(), &CancellationToken::new()))
-                .expect_err("HTTP status must fail");
-            assert_eq!(error, expected);
-            assert!(!format!("{error:?} {error}").contains("test-secret"));
-            join.join().expect("server");
-        }
-    }
-
-    #[test]
-    fn never_follows_redirects_with_authorization() {
-        let target = TcpListener::bind("127.0.0.1:0").expect("redirect target");
-        target.set_nonblocking(true).expect("nonblocking target");
-        let target_url = format!(
-            "http://{}/capture",
-            target.local_addr().expect("target address")
-        );
-        let (endpoint, _, join) = spawn_server(move |stream| {
-            write_response(
-                stream,
-                "302 Found",
-                b"redirect",
-                &format!("Location: {target_url}\r\n"),
-            );
-        });
-        let test = test_client(&endpoint, Duration::from_secs(1));
-        let error = runtime()
-            .block_on(test.client.request(&context(), &CancellationToken::new()))
-            .expect_err("redirect must not be followed");
-        assert_eq!(error, AiClientError::Http(302));
-        thread::sleep(Duration::from_millis(20));
-        assert_eq!(
-            target
-                .accept()
-                .expect_err("target must receive no request")
-                .kind(),
-            std::io::ErrorKind::WouldBlock
-        );
-        join.join().expect("server");
-    }
-
-    #[test]
-    fn enforces_body_limit_and_json_shape() {
-        let (endpoint, _, join) = spawn_server(|stream| {
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                RESPONSE_MAX_BYTES + 1
-            )
-            .expect("oversize headers");
-            stream.flush().expect("flush headers");
-        });
-        let test = test_client(&endpoint, Duration::from_secs(1));
-        assert_eq!(
-            runtime()
-                .block_on(test.client.request(&context(), &CancellationToken::new()))
-                .expect_err("oversize body"),
-            AiClientError::ResponseTooLarge
-        );
-        join.join().expect("server");
-
-        let (endpoint, _, join) = spawn_server(|stream| {
-            write_response(stream, "200 OK", b"{not-json", "");
-        });
-        let test = test_client(&endpoint, Duration::from_secs(1));
-        assert_eq!(
-            runtime()
-                .block_on(test.client.request(&context(), &CancellationToken::new()))
-                .expect_err("invalid JSON"),
-            AiClientError::InvalidResponse
-        );
-        join.join().expect("server");
-    }
-
-    #[test]
-    fn cancellation_interrupts_slow_headers() {
-        let (endpoint, _, join) = spawn_server(|stream| {
-            thread::sleep(Duration::from_millis(150));
-            let _ = write_response_after_cancel(stream);
-        });
-        let test = test_client(&endpoint, Duration::from_secs(2));
-        let cancel = CancellationToken::new();
-        let trigger = cancel.clone();
-        let started = Instant::now();
-        let error = runtime().block_on(async {
-            tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-                trigger.cancel();
-            });
-            test.client.request(&context(), &cancel).await
-        });
-        assert_eq!(error.expect_err("cancel request"), AiClientError::Cancelled);
-        assert!(started.elapsed() < Duration::from_millis(120));
-        join.join().expect("server");
-    }
-
-    fn write_response_after_cancel(stream: &mut TcpStream) -> std::io::Result<()> {
-        write!(
-            stream,
-            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
-        )
-    }
-
-    #[test]
-    fn timeout_applies_while_reading_body() {
-        let (endpoint, _, join) = spawn_server(|stream| {
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nx"
-            )
-            .expect("partial response");
-            stream.flush().expect("flush partial response");
-            thread::sleep(Duration::from_millis(150));
-        });
-        let test = test_client(&endpoint, Duration::from_millis(40));
-        assert_eq!(
-            runtime()
-                .block_on(test.client.request(&context(), &CancellationToken::new()))
-                .expect_err("slow body must time out"),
-            AiClientError::Timeout
-        );
-        join.join().expect("server");
-    }
-
-    #[test]
-    fn timeout_applies_while_waiting_for_headers() {
-        let (endpoint, _, join) = spawn_server(|stream| {
-            thread::sleep(Duration::from_millis(150));
-            let _ = write_response_after_cancel(stream);
-        });
-        let test = test_client(&endpoint, Duration::from_millis(40));
-        assert_eq!(
-            runtime()
-                .block_on(test.client.request(&context(), &CancellationToken::new()))
-                .expect_err("slow headers must time out"),
-            AiClientError::Timeout
-        );
-        join.join().expect("server");
-    }
-
-    #[test]
-    fn reports_connection_failure() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("ephemeral address");
-        let endpoint = format!("http://{}/v1", listener.local_addr().expect("address"));
-        drop(listener);
-        let test = test_client(&endpoint, Duration::from_millis(100));
-        assert_eq!(
-            runtime()
-                .block_on(test.client.request(&context(), &CancellationToken::new()))
-                .expect_err("connection must fail"),
-            AiClientError::Network
-        );
-    }
-}
+#[path = "client_tests.rs"]
+mod client_tests;
