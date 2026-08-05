@@ -5,7 +5,6 @@ use crate::{
         Candidate, CandidateAction, CandidateKind, CandidateProvider, CandidateSource,
         Completeness, CompletionContext, CursorPlacement, ProviderOutput, SlotKind, TextEdit,
     },
-    parser::TokenKind,
     platform::CommandPathCache,
     project::{GitContext, GitRefsCache, GitStatus, GitStatusCache},
     providers::argument_progress,
@@ -200,14 +199,32 @@ fn ref_candidate(
 
 /// The ref-taking subcommand when the cursor sits at-or-past its first
 /// argument (`git checkout <…>`), `None` everywhere else — `git add <path>`
-/// keeps file completion, and a dashed active word belongs to flag
-/// completion.
+/// keeps file completion, a dashed active word belongs to flag completion,
+/// `--` before the active slot means pathspec (files, not refs), and the word
+/// after `checkout -b` / `switch -c` is a NEW branch name, not a ref.
 fn ref_subcommand(context: &CompletionContext) -> Option<&'static str> {
     if context.parsed.current_prefix.starts_with('-') {
         return None;
     }
     let (words, position) = argument_progress(context)?;
+    if new_branch_slot(&words, position) {
+        return None;
+    }
+    ref_slot_subcommand(&words, position)
+}
+
+/// The ref-taking subcommand at the active slot, if any. A `--` in the words
+/// before the active slot ends ref territory: what follows is a pathspec.
+/// Shared with the filesystem provider, which suppresses its rows at ref
+/// slots and resumes them after `--`.
+pub(crate) fn ref_slot_subcommand(words: &[&str], position: usize) -> Option<&'static str> {
     if position == 0 {
+        return None;
+    }
+    if words
+        .get(1..=position)
+        .is_some_and(|before| before.contains(&"--"))
+    {
         return None;
     }
     let subcommand = words.get(1).copied()?;
@@ -215,6 +232,17 @@ fn ref_subcommand(context: &CompletionContext) -> Option<&'static str> {
         .iter()
         .copied()
         .find(|name| *name == subcommand)
+}
+
+/// The word before the active slot is `checkout -b` / `switch -c`: the slot
+/// takes a NEW branch name (a value), so neither ref rows nor file rows
+/// belong there.
+pub(crate) fn new_branch_slot(words: &[&str], position: usize) -> bool {
+    let flag = words.get(position).copied().unwrap_or_default();
+    matches!(
+        (words.get(1).copied(), flag),
+        (Some("checkout"), "-b") | (Some("switch"), "-c")
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -286,35 +314,26 @@ fn row_candidate(
     )
 }
 
-/// The whole typed line is replaced, like spec recipes: from the command
-/// word's start to the cursor.
+/// The whole typed line from the effective command word is replaced, like
+/// spec recipes — a wrapper/assignment prefix (`sudo git …`) is preserved.
 fn command_edit_range(context: &CompletionContext) -> std::ops::Range<usize> {
     let start = context
         .parsed
-        .tokens
-        .iter()
-        .find(|token| {
-            token.kind == TokenKind::Word
-                && token.range.start >= context.parsed.active_segment.start
-        })
-        .map_or(context.buffer.cursor, |token| token.range.start);
+        .command_range
+        .as_ref()
+        .map_or(context.buffer.cursor, |range| range.start);
     start..context.buffer.cursor
 }
 
 /// Only the `git` word itself or its first argument: ref-taking deeper
 /// slots (`git checkout <…>`) are handled by `ref_subcommand` instead.
+/// Measured from the effective command, so `sudo git st` still fires.
 fn at_git_argument_position(context: &CompletionContext) -> bool {
-    let words = context
-        .parsed
-        .tokens
-        .iter()
-        .filter(|token| {
-            token.kind == TokenKind::Word
-                && token.range.start >= context.parsed.active_segment.start
-                && token.range.start <= context.buffer.cursor
-        })
-        .count();
-    words <= 2
+    match argument_progress(context) {
+        // Still on the effective command word itself.
+        None => true,
+        Some((_, position)) => position == 0,
+    }
 }
 
 #[cfg(test)]
@@ -583,6 +602,87 @@ mod tests {
         let rows = primaries(&context(root.path(), "git log "), &provider);
         for expected in ["main", "feature/mars", "origin/main", "v1"] {
             assert!(rows.contains(&expected.to_owned()), "rows: {rows:?}");
+        }
+    }
+
+    #[test]
+    fn wrapper_prefix_is_preserved_in_row_edits() {
+        let directory = tempfile::tempdir().expect("directory");
+        let provider = GitProvider::new(
+            Arc::new(GitStatusCache::default()),
+            Arc::new(GitRefsCache::default()),
+            git_on_path(directory.path()),
+        );
+        // `sudo git ` still recommends from state, and the row edit starts
+        // at the effective command word so `sudo ` survives the fill.
+        let sudo_git = context(directory.path(), "sudo git ");
+        assert!(provider.applies(&sudo_git));
+        let output = provider.complete(&sudo_git);
+        assert_eq!(
+            output
+                .candidates
+                .first()
+                .map(|candidate| candidate.display.primary.as_str()),
+            Some("git init")
+        );
+        let edit = output.candidates[0].edit.as_ref().expect("edit");
+        assert_eq!(edit.range, 5..9);
+        assert_eq!(edit.replacement, "git init");
+
+        // `sudo git st` still fires at the subcommand slot.
+        assert!(provider.applies(&context(directory.path(), "sudo git st")));
+    }
+
+    #[test]
+    fn wrapper_prefixed_checkout_completes_refs() {
+        let Some(root) = ref_repository() else { return };
+        let provider = GitProvider::new(
+            Arc::new(GitStatusCache::default()),
+            Arc::new(GitRefsCache::default()),
+            git_on_path(root.path()),
+        );
+        let context = context(root.path(), "sudo git checkout fea");
+        assert!(provider.applies(&context));
+        let rows = primaries(&context, &provider);
+        assert!(rows.contains(&"feature/mars".to_owned()), "rows: {rows:?}");
+    }
+
+    #[test]
+    fn double_dash_ends_the_ref_slot() {
+        let Some(root) = ref_repository() else { return };
+        let provider = GitProvider::new(
+            Arc::new(GitStatusCache::default()),
+            Arc::new(GitRefsCache::default()),
+            git_on_path(root.path()),
+        );
+        // After `--` the slot is a pathspec: no ref rows.
+        for text in ["git checkout -- ", "git checkout -- ma"] {
+            let context = context(root.path(), text);
+            assert!(
+                provider.complete(&context).candidates.is_empty(),
+                "{text:?} must not offer refs"
+            );
+            assert!(!provider.applies(&context), "{text:?} must not apply");
+        }
+        // Without `--` the same subcommand still offers refs.
+        assert!(provider.applies(&context(root.path(), "git checkout ")));
+    }
+
+    #[test]
+    fn checkout_dash_b_and_switch_dash_c_take_a_new_branch_name() {
+        let Some(root) = ref_repository() else { return };
+        let provider = GitProvider::new(
+            Arc::new(GitStatusCache::default()),
+            Arc::new(GitRefsCache::default()),
+            git_on_path(root.path()),
+        );
+        // The word after `-b`/`-c` is a NEW branch name, not an existing ref.
+        for text in ["git checkout -b ", "git checkout -b ne", "git switch -c "] {
+            let context = context(root.path(), text);
+            assert!(
+                provider.complete(&context).candidates.is_empty(),
+                "{text:?} must not offer refs"
+            );
         }
     }
 

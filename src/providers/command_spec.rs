@@ -176,16 +176,14 @@ fn replacement_candidate(
     )
 }
 
+/// The edit starts at the effective command word, preserving any
+/// wrapper/assignment prefix (`FOO=bar ls ` keeps `FOO=bar `).
 fn active_edit_range(context: &CompletionContext) -> std::ops::Range<usize> {
     let start = context
         .parsed
-        .tokens
-        .iter()
-        .find(|token| {
-            token.kind == crate::parser::TokenKind::Word
-                && token.range.start >= context.parsed.active_segment.start
-        })
-        .map_or(context.buffer.cursor, |token| token.range.start);
+        .command_range
+        .as_ref()
+        .map_or(context.buffer.cursor, |range| range.start);
     start..context.buffer.cursor
 }
 
@@ -262,6 +260,43 @@ mod tests {
                 .iter()
                 .any(|candidate| candidate.display.primary == "ls -la")
         );
+    }
+
+    #[test]
+    fn recipe_fill_preserves_assignment_and_wrapper_prefixes() {
+        let specs = Arc::new(SpecRegistry::load(None));
+        let directory = tempfile::tempdir().expect("command directory");
+        let ls = directory.path().join("ls");
+        fs::write(&ls, b"#!/bin/sh\n").expect("fake ls");
+        fs::set_permissions(&ls, fs::Permissions::from_mode(0o700)).expect("ls mode");
+        let path = OsString::from(directory.path());
+        let commands = Arc::new(CommandPathCache::from_path(Some(&path)));
+        let mut engine = CompletionEngine::new(100, 12);
+        engine.register(CommandSpecProvider::new(specs, commands));
+
+        // `FOO=bar ls ` hits the ls spec through the assignment prefix, and
+        // the fill starts at the effective command word: the assignment
+        // survives.
+        let output = engine.complete(&context("FOO=bar ls "));
+        let recipe = output
+            .candidates
+            .iter()
+            .find(|candidate| candidate.display.primary.trim_end() == "ls -la")
+            .expect("ls -la recipe");
+        let edit = recipe.edit.as_ref().expect("edit");
+        assert_eq!(edit.range, 8..11);
+        let buffer = "FOO=bar ls ";
+        let filled = format!("{}{}", &buffer[..edit.range.start], edit.replacement);
+        assert_eq!(filled, "FOO=bar ls -la");
+
+        // Same through a wrapper: `sudo ls ` fills `sudo ls -la `.
+        let output = engine.complete(&context("sudo ls "));
+        let recipe = output
+            .candidates
+            .iter()
+            .find(|candidate| candidate.display.primary.trim_end() == "ls -la")
+            .expect("ls -la recipe behind sudo");
+        assert_eq!(recipe.edit.as_ref().expect("edit").range, 5..8);
     }
 
     fn context(text: &str) -> CompletionContext {

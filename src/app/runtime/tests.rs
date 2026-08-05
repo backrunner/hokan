@@ -32,7 +32,6 @@ fn runtime_state(directory: &Path) -> RuntimeState {
         None,
         Arc::new(CommandPathCache::default()),
         Arc::new(crate::specs::SpecRegistry::default()),
-        Arc::new(crate::providers::CommandHelpCache::default()),
     )
 }
 
@@ -43,7 +42,7 @@ fn bare_executable_holds_suggestions_until_space() {
     let directory = tempfile::tempdir().expect("directory");
     let bin = directory.path().join("bin");
     std::fs::create_dir(&bin).expect("bin directory");
-    for name in ["kimi", "git"] {
+    for name in ["kimi", "git", "ls", "tar"] {
         let executable = bin.join(name);
         std::fs::write(&executable, b"#!/bin/sh\n").expect("write executable");
         let mut permissions = std::fs::metadata(&executable)
@@ -54,8 +53,9 @@ fn bare_executable_holds_suggestions_until_space() {
     }
     let path = std::ffi::OsString::from(&bin);
     let commands = CommandPathCache::from_path(Some(&path));
-    let specs = crate::specs::SpecRegistry::default();
-    let help = crate::providers::CommandHelpCache::default();
+    // The embedded spec set covers `ls` (requires_arguments = false) and
+    // `tar` (requires_arguments = true); `kimi` and `git` have no spec.
+    let specs = crate::specs::SpecRegistry::load(None);
     let awaiting = |text: &str| {
         let snapshot = BufferSnapshot::new(
             Arc::<str>::from(text),
@@ -71,7 +71,7 @@ fn bare_executable_holds_suggestions_until_space() {
             snapshot,
         )
         .expect("context");
-        executable_awaiting_arguments(&context, &commands, &specs, &help)
+        executable_awaiting_arguments(&context, &commands, &specs)
     };
 
     // Bare executable word, cursor on it: hold suggestions.
@@ -80,10 +80,14 @@ fn bare_executable_holds_suggestions_until_space() {
     assert!(!awaiting("kimi "));
     // Unknown prefix keeps path completion alive.
     assert!(!awaiting("kim"));
-    // Executable as a later argument is unaffected.
-    assert!(!awaiting("sudo kimi"));
+    // With wrapper peeling, `sudo kimi` IS the bare effective command `kimi`:
+    // the same hold-back applies as for a plain `kimi`.
+    assert!(awaiting("sudo kimi"));
     // A subcommand-style CLI cannot run standalone: no holding back.
     assert!(!awaiting("git"));
+    // Spec-covered commands keep their recipe rows at the bare position.
+    assert!(!awaiting("ls"));
+    assert!(!awaiting("tar"));
 
     // Same executable with the cursor mid-word: still the runnable token.
     let mut mid_word = CompletionContext::new(
@@ -100,9 +104,7 @@ fn bare_executable_holds_suggestions_until_space() {
     )
     .expect("context");
     mid_word.parsed = crate::parser::parse_line("kimi", 2).expect("parse");
-    assert!(executable_awaiting_arguments(
-        &mid_word, &commands, &specs, &help
-    ));
+    assert!(executable_awaiting_arguments(&mid_word, &commands, &specs));
 }
 
 #[test]
@@ -872,4 +874,14 @@ fn unready_terminal_arms_repaint_retry_and_probe_recovery() {
 
     output.restore_and_exit().expect("shutdown");
     join.join().expect("actor joins").expect("actor exits");
+}
+
+#[test]
+fn auto_update_spawn_requires_enabled_config_and_no_env_opt_out() {
+    let mut config = Config::default();
+    assert!(should_spawn_auto_update(&config, false));
+    assert!(!should_spawn_auto_update(&config, true));
+    config.update.enabled = false;
+    assert!(!should_spawn_auto_update(&config, false));
+    assert!(!should_spawn_auto_update(&config, true));
 }

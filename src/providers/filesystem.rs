@@ -213,9 +213,19 @@ impl FilesystemProvider {
             }
             // Build-tool first arguments are target names, not paths.
             "make" | "just" if argument_position == 0 => None,
+            // Bare/script/keyword/filter positions of the Node package
+            // managers belong to the project provider — cwd file rows are
+            // noise there (`npm run `, `pnpm --filter `, `pnpm `, …).
+            _ if super::manager_position(context).is_some()
+                || super::filter_position(context).is_some() =>
+            {
+                None
+            }
             _ => {
-                // Spec-covered commands own their arguments.
-                if self.specs.get(command).is_some() {
+                // Spec-covered commands own the empty slot; with a typed
+                // prefix the spec rows die on match anyway and file rows
+                // must appear (`ls Do` completes `Documents/`).
+                if self.specs.get(command).is_some() && context.parsed.current_prefix.is_empty() {
                     return None;
                 }
                 // A flag immediately before the active slot decides what the
@@ -252,12 +262,12 @@ impl FilesystemProvider {
 }
 
 /// `git checkout <…>`-style slots take refs, not files — the git provider
-/// owns them (`git add <path>` keeps file completion).
+/// owns them (`git add <path>` keeps file completion). After `--` the slot is
+/// a pathspec and file rows resume; after `checkout -b` / `switch -c` the
+/// slot is a new branch name and stays suppressed.
 fn at_git_ref_slot(words: &[&str], argument_position: usize) -> bool {
-    argument_position >= 1
-        && words
-            .get(1)
-            .is_some_and(|subcommand| super::git::GIT_REF_SUBCOMMANDS.contains(subcommand))
+    super::git::ref_slot_subcommand(words, argument_position).is_some()
+        || super::git::new_branch_slot(words, argument_position)
 }
 
 fn tar_slot(words: &[&str], argument_position: usize) -> Option<SlotKind> {
@@ -302,18 +312,33 @@ fn flag_value_slot(command: &str, flag: &str) -> Option<SlotKind> {
             | "--user" | "-A" | "--user-agent" | "-e" | "--referer" | "-x" | "--proxy"
             | "--connect-timeout" | "--max-time",
         ) => Some(SlotKind::Value),
-        ("ssh", "-i" | "-F") | ("scp", "-i" | "-F") => Some(SlotKind::Path),
+        ("ssh", "-i" | "-F" | "-S") | ("scp", "-i" | "-F") => Some(SlotKind::Path),
         ("ssh", "-p" | "-l" | "-o" | "-L" | "-R" | "-D" | "-J" | "-W" | "-b" | "-c" | "-m")
-        | ("scp", "-P" | "-o" | "-l" | "-c") => Some(SlotKind::Value),
+        | ("scp", "-P" | "-o" | "-l" | "-c")
+        | ("mosh", "-p")
+        | ("sftp", "-P") => Some(SlotKind::Value),
         ("cargo", "--manifest-path") => Some(SlotKind::Path),
         (
             "cargo",
             "-p" | "--package" | "--features" | "-j" | "--jobs" | "--target" | "--profile",
         ) => Some(SlotKind::Value),
-        ("make", "-f" | "--file" | "-C" | "--directory") => Some(SlotKind::Directory),
+        ("make", "-f" | "--file") => Some(SlotKind::Path),
+        ("make", "-C" | "--directory") => Some(SlotKind::Directory),
         ("make", "-j" | "--jobs") => Some(SlotKind::Value),
+        // The attached form `make -j4` carries its own value: the slot after
+        // it is a target, not a path.
+        ("make", flag) if is_attached_jobs_flag(flag) => Some(SlotKind::Value),
         _ => None,
     }
+}
+
+/// `make -j<digits>`: the jobs flag with its value attached.
+fn is_attached_jobs_flag(flag: &str) -> bool {
+    flag.len() > 2
+        && flag.starts_with("-j")
+        && flag[2..]
+            .chars()
+            .all(|character| character.is_ascii_digit())
 }
 
 fn split_prefix(prefix: &str) -> (&str, &str) {
@@ -702,6 +727,132 @@ mod tests {
                 "{buffer:?} must offer files"
             );
         }
+    }
+
+    #[test]
+    fn typed_prefix_on_a_spec_covered_command_offers_files() {
+        let directory = tempfile::tempdir().expect("directory");
+        fs::write(directory.path().join("Dockerfile"), b"").expect("file");
+        let provider = provider(Arc::new(SpecRegistry::load(None)));
+        // `ls` recipes are flag-only: with a typed prefix the spec rows die
+        // on match and file rows must appear.
+        let output = provider.complete(&context(directory.path(), "ls Do", 1));
+        assert!(
+            output
+                .candidates
+                .iter()
+                .any(|candidate| candidate.display.primary == "Dockerfile"),
+            "`ls Do` must offer files"
+        );
+        // The empty slot still belongs to the spec.
+        assert!(
+            provider
+                .complete(&context(directory.path(), "ls ", 2))
+                .candidates
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn package_manager_slots_offer_no_file_rows() {
+        let directory = tempfile::tempdir().expect("directory");
+        fs::write(directory.path().join("plain.txt"), b"").expect("file");
+        let provider = provider(Arc::new(SpecRegistry::default()));
+        for buffer in [
+            "pnpm ",
+            "pnpm bu",
+            "npm ",
+            "yarn ",
+            "bun ",
+            "npm run ",
+            "pnpm run ",
+            "pnpm run bu",
+            "deno task ",
+            "pnpm --filter ",
+            "pnpm --filter @acme/api ",
+        ] {
+            let output = provider.complete(&context(directory.path(), buffer, 1));
+            assert!(
+                output.candidates.is_empty(),
+                "{buffer:?} must not offer file rows"
+            );
+        }
+    }
+
+    #[test]
+    fn git_double_dash_resumes_file_rows_and_dash_b_stays_quiet() {
+        let directory = tempfile::tempdir().expect("directory");
+        fs::write(directory.path().join("plain.txt"), b"plain").expect("file");
+        let provider = provider(Arc::new(SpecRegistry::default()));
+        // After `--` the slot is a pathspec again: file rows resume.
+        for buffer in ["git checkout -- ", "git checkout -- pl"] {
+            let output = provider.complete(&context(directory.path(), buffer, 1));
+            assert!(
+                output
+                    .candidates
+                    .iter()
+                    .any(|candidate| candidate.display.primary == "plain.txt"),
+                "{buffer:?} must offer files"
+            );
+        }
+        // After `-b`/`-c` the slot is a new branch name: no file rows.
+        for buffer in ["git checkout -b ", "git checkout -b ne", "git switch -c "] {
+            let output = provider.complete(&context(directory.path(), buffer, 1));
+            assert!(
+                output.candidates.is_empty(),
+                "{buffer:?} must not offer file rows"
+            );
+        }
+    }
+
+    #[test]
+    fn make_and_ssh_family_flag_tables() {
+        let directory = tempfile::tempdir().expect("directory");
+        fs::write(directory.path().join("plain.txt"), b"plain").expect("file");
+        fs::create_dir(directory.path().join("nested")).expect("nested directory");
+        let provider = provider(Arc::new(SpecRegistry::default()));
+
+        // `make -f` takes a file (Path), `-C` stays directory-only.
+        let output = provider.complete(&context(directory.path(), "make -f ", 1));
+        assert!(
+            output
+                .candidates
+                .iter()
+                .any(|candidate| candidate.display.primary == "plain.txt"),
+            "`make -f ` must offer files"
+        );
+        let output = provider.complete(&context(directory.path(), "make -C ", 2));
+        assert!(
+            !output
+                .candidates
+                .iter()
+                .any(|candidate| candidate.display.primary == "plain.txt"),
+            "`make -C ` must stay directory-only"
+        );
+
+        // Attached jobs flag `make -j4`: no file rows at the next slot.
+        let output = provider.complete(&context(directory.path(), "make -j4 ", 3));
+        assert!(
+            output.candidates.is_empty(),
+            "`make -j4 ` must not offer file rows"
+        );
+
+        // ssh-family value flags stay quiet; `ssh -S` wants a path.
+        for buffer in ["mosh -p ", "sftp -P "] {
+            let output = provider.complete(&context(directory.path(), buffer, 1));
+            assert!(
+                output.candidates.is_empty(),
+                "{buffer:?} must not offer file rows"
+            );
+        }
+        let output = provider.complete(&context(directory.path(), "ssh -S ", 4));
+        assert!(
+            output
+                .candidates
+                .iter()
+                .any(|candidate| candidate.display.primary == "plain.txt"),
+            "`ssh -S ` must offer files"
+        );
     }
 
     fn context(directory: &std::path::Path, text: &str, query: u64) -> CompletionContext {

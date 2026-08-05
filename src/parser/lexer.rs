@@ -37,6 +37,10 @@ pub struct ParsedLine {
     pub replacement: Range<usize>,
     pub quote: QuoteContext,
     pub command: Option<String>,
+    /// Token range of the effective command word. Callers replacing whole
+    /// lines must start the edit here so a wrapper/assignment prefix
+    /// (`sudo …`, `FOO=bar …`) is preserved.
+    pub command_range: Option<Range<usize>>,
     pub current_prefix: String,
 }
 
@@ -73,14 +77,23 @@ pub fn parse_line(text: &str, cursor: usize) -> Result<ParsedLine, crate::Error>
             (token.range.clone(), quote_at(text, cursor), prefix)
         },
     );
-    let command = tokens
-        .iter()
-        .find(|token| {
-            token.kind == TokenKind::Word
-                && token.range.start >= active_segment.start
-                && token.range.end <= active_segment.end
-        })
-        .map(|token| cook_word(&text[token.range.clone()]));
+    let command_token = {
+        let words: Vec<&Token> = tokens
+            .iter()
+            .filter(|token| {
+                token.kind == TokenKind::Word
+                    && token.range.start >= active_segment.start
+                    && token.range.end <= active_segment.end
+            })
+            .collect();
+        let cooked: Vec<&str> = words
+            .iter()
+            .map(|token| token.cooked_prefix.as_str())
+            .collect();
+        effective_command_index(&cooked).map(|index| words[index])
+    };
+    let command = command_token.map(|token| token.cooked_prefix.clone());
+    let command_range = command_token.map(|token| token.range.clone());
 
     Ok(ParsedLine {
         tokens,
@@ -88,8 +101,69 @@ pub fn parse_line(text: &str, cursor: usize) -> Result<ParsedLine, crate::Error>
         replacement,
         quote,
         command,
+        command_range,
         current_prefix,
     })
+}
+
+/// Wrappers that run another command: the word after them is the effective
+/// command, unless an option (`-…`) sits in between — then peeling stops and
+/// the wrapper itself stays the command (`sudo -u root ls` completes sudo's
+/// own slots, not ls's).
+const COMMAND_WRAPPERS: &[&str] = &[
+    "sudo", "doas", "command", "builtin", "nohup", "time", "watch", "env",
+];
+
+/// Index of the effective command word within `words` (the cooked words of a
+/// segment in order): leading `NAME=value` assignments and wrapper words
+/// (`sudo`, `env`, …) are skipped. `env` may itself be followed by
+/// assignments. `None` when only assignments/wrappers have been typed so far
+/// (`sudo `) — there is no effective command yet.
+pub(crate) fn effective_command_index(words: &[&str]) -> Option<usize> {
+    let mut index = 0;
+    while words
+        .get(index)
+        .is_some_and(|word| is_assignment_word(word))
+    {
+        index += 1;
+    }
+    loop {
+        let word = words.get(index).copied()?;
+        if !COMMAND_WRAPPERS.contains(&word) {
+            return Some(index);
+        }
+        let wrapper = index;
+        index += 1;
+        if word == "env" {
+            while words
+                .get(index)
+                .is_some_and(|next| is_assignment_word(next))
+            {
+                index += 1;
+            }
+        }
+        match words.get(index) {
+            None => return None,
+            // An option between wrapper and command ends the peeling.
+            Some(next) if next.starts_with('-') => return Some(wrapper),
+            Some(_) => {}
+        }
+    }
+}
+
+/// A leading `NAME=value` environment assignment word.
+fn is_assignment_word(word: &str) -> bool {
+    let Some((name, _)) = word.split_once('=') else {
+        return false;
+    };
+    !name.is_empty()
+        && name
+            .chars()
+            .next()
+            .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
 }
 
 fn lex(text: &str) -> Vec<Token> {
@@ -446,5 +520,47 @@ mod tests {
         }
         let parsed = parse_line("sleep 1 & wait", 13).expect("line should parse");
         assert_eq!(parsed.command.as_deref(), Some("wait"));
+    }
+
+    #[test]
+    fn effective_command_skips_assignments_and_wrappers() {
+        let cases: &[(&str, Option<&str>)] = &[
+            ("FOO=bar ls ", Some("ls")),
+            ("FOO=bar BAZ=qux ls -la", Some("ls")),
+            ("sudo vim f", Some("vim")),
+            ("sudo git checkout ", Some("git")),
+            ("env FOO=bar ls ", Some("ls")),
+            ("env FOO=bar sudo ls ", Some("ls")),
+            ("time ls -la", Some("ls")),
+            ("nohup make ", Some("make")),
+            // Only wrappers/assignments so far: no effective command yet.
+            ("sudo ", None),
+            ("sudo", None),
+            ("FOO=bar ", None),
+            ("env FOO=bar ", None),
+            // A dash-word between wrapper and command stops the peeling.
+            ("sudo -u root ls ", Some("sudo")),
+            ("env -i ls ", Some("env")),
+            ("watch -n1 ls ", Some("watch")),
+        ];
+        for (text, expected) in cases {
+            let parsed = parse_line(text, text.len()).expect("line should parse");
+            assert_eq!(
+                parsed.command.as_deref(),
+                *expected,
+                "effective command for {text:?}"
+            );
+            assert_eq!(
+                parsed
+                    .command_range
+                    .as_ref()
+                    .map(|range| &text[range.clone()]),
+                expected.map(|command| {
+                    let start = text.rfind(command).expect("command in text");
+                    &text[start..start + command.len()]
+                }),
+                "command range for {text:?}"
+            );
+        }
     }
 }

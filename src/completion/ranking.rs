@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
 use crate::{
-    completion::{Candidate, CandidateAction, Completeness, CompletionContext, CursorPlacement},
+    completion::{
+        Candidate, CandidateAction, CandidateKind, Completeness, CompletionContext, CursorPlacement,
+    },
     parser::apply_edit,
     project::WorkspaceMarkers,
     terminal::RiskLevel,
@@ -42,10 +44,15 @@ pub fn rank_and_dedupe(
             }
         }
         candidate.score.source_trust = candidate.source.trust();
-        candidate.score.context = workspace_bonus(context.workspace, replacement_target);
+        candidate.score.context = workspace_bonus(context.workspace, replacement_target).max(
+            workspace_bonus(context.workspace, &candidate.display.primary),
+        );
         candidate.score.risk_penalty = risk_penalty(candidate.risk);
         candidate.score.incomplete_penalty = match candidate.completeness {
             Completeness::Runnable => 0,
+            // Directories are always NeedsInput because descending into them IS
+            // the interaction — the penalty would sink them below files.
+            Completeness::NeedsInput { .. } if candidate.kind == CandidateKind::Directory => 0,
             Completeness::NeedsInput { .. } => 60,
             Completeness::ActionOnly => 80,
         };
@@ -62,6 +69,9 @@ pub fn rank_and_dedupe(
                 } else {
                     existing.risk = stricter_risk(existing.risk, candidate.risk);
                 }
+                // The merge may have raised the risk level; keep the displayed
+                // score in sync with the risk the merged row now carries.
+                existing.score.risk_penalty = risk_penalty(existing.risk);
             }
             None => {
                 deduped.insert(key, candidate);
@@ -69,13 +79,17 @@ pub fn rank_and_dedupe(
         }
     }
     let mut candidates: Vec<_> = deduped.into_values().collect();
+    // `deduped` is a HashMap, so only the sort keys stabilize the output order.
+    // Ties fall back to deterministic content keys — never the candidate id,
+    // which hashes the query id and would re-shuffle every keystroke.
     candidates.sort_by(|left, right| {
         right
             .score
             .total()
             .cmp(&left.score.total())
             .then_with(|| left.source.order().cmp(&right.source.order()))
-            .then_with(|| left.id.cmp(&right.id))
+            .then_with(|| left.display.primary.cmp(&right.display.primary))
+            .then_with(|| left.provenance.cmp(&right.provenance))
     });
     candidates.truncate(limit);
     candidates
@@ -231,7 +245,7 @@ const fn risk_severity(risk: RiskLevel) -> u8 {
 mod tests {
     use super::*;
     use crate::completion::{
-        BufferSnapshot, CandidateKind, CandidateSource, SyncQuality, TextEdit,
+        BufferSnapshot, CandidateKind, CandidateSource, SlotKind, SyncQuality, TextEdit,
     };
     use crate::shell::ShellKind;
     use crate::terminal::{BufferRevision, QueryId};
@@ -477,5 +491,180 @@ mod tests {
         healthy.score.frecency = 100;
         let ranked = rank_and_dedupe(&context, vec![failed, healthy], 10);
         assert_eq!(ranked[0].display.primary, "x-healthy");
+    }
+
+    fn recipe(context: &CompletionContext, name: &str) -> Candidate {
+        Candidate::new(
+            context.query_id,
+            name,
+            "project",
+            None,
+            CandidateAction::None,
+            CandidateSource::Project,
+            CandidateKind::Recipe,
+            Completeness::Runnable,
+            RiskLevel::Low,
+            "project",
+        )
+    }
+
+    fn recipe_order(query_id: u64) -> Vec<String> {
+        let buffer =
+            BufferSnapshot::new("", 0, BufferRevision::new(1), SyncQuality::Exact).expect("buffer");
+        let context = CompletionContext::new(
+            QueryId::new(query_id),
+            ShellKind::Zsh,
+            PathBuf::from("/tmp"),
+            buffer,
+        )
+        .expect("context");
+        // Curated spec order — deliberately not alphabetical.
+        let curated = ["test", "dev", "build"];
+        let candidates = curated.iter().map(|name| recipe(&context, name)).collect();
+        rank_and_dedupe(&context, candidates, 10)
+            .into_iter()
+            .map(|candidate| candidate.display.primary)
+            .collect()
+    }
+
+    #[test]
+    fn equal_score_ties_keep_a_stable_order_across_query_ids() {
+        let first = recipe_order(1);
+        let second = recipe_order(2);
+        assert_eq!(
+            first, second,
+            "tie order must not depend on the query id hash"
+        );
+        assert_eq!(
+            first,
+            vec!["build", "dev", "test"],
+            "ties resolve on display.primary"
+        );
+    }
+
+    #[test]
+    fn directories_are_not_penalized_for_needing_input() {
+        let context = buffer_context("src/");
+        let path_candidate = |name: &str, kind, completeness| {
+            Candidate::new(
+                context.query_id,
+                name,
+                "filesystem",
+                Some(TextEdit {
+                    range: 0..4,
+                    replacement: name.into(),
+                    cursor_after: CursorPlacement::End,
+                }),
+                CandidateAction::InsertAndContinue {
+                    next_slot: SlotKind::Path,
+                },
+                CandidateSource::Filesystem,
+                kind,
+                completeness,
+                RiskLevel::ReadOnly,
+                "filesystem",
+            )
+        };
+        let ranked = rank_and_dedupe(
+            &context,
+            vec![
+                // Equal-length names keep match_quality identical so only the
+                // completeness penalty can separate the two rows.
+                path_candidate(
+                    "src/adir",
+                    CandidateKind::Directory,
+                    Completeness::NeedsInput {
+                        slot: SlotKind::Path,
+                    },
+                ),
+                path_candidate("src/bfil", CandidateKind::File, Completeness::Runnable),
+            ],
+            10,
+        );
+        assert_eq!(ranked.len(), 2);
+        let directory = &ranked[0];
+        assert_eq!(directory.kind, CandidateKind::Directory);
+        assert_eq!(directory.score.incomplete_penalty, 0);
+        assert_eq!(
+            ranked[0].score.total(),
+            ranked[1].score.total(),
+            "directory ranks level with the file at a path slot"
+        );
+    }
+
+    #[test]
+    fn merged_candidate_penalty_matches_the_merged_risk() {
+        let risky_duplicate = |context: &CompletionContext, risk: RiskLevel| {
+            let mut candidate = history_candidate(context, "x-duplicate", 1);
+            candidate.risk = risk;
+            candidate
+        };
+
+        // Lose branch: the kept row's risk is raised by the merged duplicate.
+        let context = buffer_context("x");
+        let ranked = rank_and_dedupe(
+            &context,
+            vec![
+                risky_duplicate(&context, RiskLevel::Low),
+                risky_duplicate(&context, RiskLevel::High),
+            ],
+            10,
+        );
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].risk, RiskLevel::High);
+        assert_eq!(
+            ranked[0].score.risk_penalty,
+            risk_penalty(RiskLevel::High),
+            "kept row's penalty must match the merged risk"
+        );
+
+        // Win branch: the replacement row inherits the stricter merged risk.
+        let ranked = rank_and_dedupe(
+            &context,
+            vec![
+                risky_duplicate(&context, RiskLevel::High),
+                risky_duplicate(&context, RiskLevel::Low),
+            ],
+            10,
+        );
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].risk, RiskLevel::High);
+        assert_eq!(
+            ranked[0].score.risk_penalty,
+            risk_penalty(RiskLevel::High),
+            "replacement row's penalty must match the merged risk"
+        );
+    }
+
+    #[test]
+    fn workspace_bonus_matches_display_primary_for_short_replacements() {
+        let markers = WorkspaceMarkers {
+            git: true,
+            ..WorkspaceMarkers::default()
+        };
+        let context = buffer_context("st").with_workspace(markers);
+        // Man-page style row: the edit inserts only the subcommand, but the
+        // display shows the full command line.
+        let row = Candidate::new(
+            context.query_id,
+            "git status",
+            "man",
+            Some(TextEdit {
+                range: 0..2,
+                replacement: "status".into(),
+                cursor_after: CursorPlacement::End,
+            }),
+            CandidateAction::Insert,
+            CandidateSource::CommandHelp,
+            CandidateKind::Command,
+            Completeness::Runnable,
+            RiskLevel::ReadOnly,
+            "man",
+        );
+        let ranked = rank_and_dedupe(&context, vec![row], 10);
+        assert_eq!(
+            ranked[0].score.context, 40,
+            "git bonus must apply via display.primary"
+        );
     }
 }

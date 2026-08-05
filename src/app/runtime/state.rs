@@ -11,7 +11,7 @@ use crate::{
     diagnostics::DebugLog,
     history::{HistoryCursor, HistoryEventV1},
     platform::CommandPathCache,
-    providers::{CommandHelpCache, argument_progress},
+    providers::argument_progress,
     shell::ShellKind,
     specs::SpecRegistry,
     terminal::{
@@ -50,7 +50,6 @@ pub(super) struct RuntimeState {
     pub(super) workspace_probe: crate::project::WorkspaceProbe,
     pub(super) commands: Arc<CommandPathCache>,
     pub(super) specs: Arc<SpecRegistry>,
-    pub(super) help: Arc<CommandHelpCache>,
     pub(super) pending_confirm: Option<PendingConfirm>,
     pub(super) ai_query: Option<ActiveAiRequest>,
     /// Bumped for every AI request so a late result from a superseded request
@@ -93,7 +92,6 @@ impl RuntimeState {
         debug_log: Option<DebugLog>,
         commands: Arc<CommandPathCache>,
         specs: Arc<SpecRegistry>,
-        help: Arc<CommandHelpCache>,
     ) -> Self {
         Self {
             shell,
@@ -124,7 +122,6 @@ impl RuntimeState {
             workspace_probe: crate::project::WorkspaceProbe::default(),
             commands,
             specs,
-            help,
             pending_confirm: None,
             ai_query: None,
             ai_generation: 0,
@@ -209,9 +206,11 @@ impl RuntimeState {
         // A bare executable word with the cursor still on it (`kimi`, no
         // trailing space) is already runnable — hold suggestions until the
         // user commits to arguments with a space instead of flashing rows
-        // that all just complete the same command name.
+        // that all just complete the same command name. Spec-covered
+        // commands are exempt: their recipe rows (`ls -la`) are exactly what
+        // the user wants next.
         if !self.history_only
-            && executable_awaiting_arguments(&context, &self.commands, &self.specs, &self.help)
+            && executable_awaiting_arguments(&context, &self.commands, &self.specs)
         {
             self.context = None;
             self.candidates.clear();
@@ -277,27 +276,29 @@ pub(super) fn visible_page_size(max_overlay_height: u16, terminal_size: Terminal
 /// True while the cursor is still on the command token (no trailing
 /// whitespace) and the typed word is itself an executable on PATH that runs
 /// standalone — a bare `kimi`. The line is already runnable, so suggestions
-/// wait for the space that commits the user to typing arguments. Commands
-/// that do nothing useful without arguments (`git` and other subcommand-style
-/// CLIs, specs with `requires_arguments`, man pages with subcommands) are NOT
-/// held back: their suggestions are exactly what the user needs next.
+/// wait for the space that commits the user to typing arguments. Spec-covered
+/// commands are NOT held back (their recipe rows are useful at the bare
+/// position), and neither are commands that do nothing useful without
+/// arguments (`git` and other subcommand-style CLIs, specs with
+/// `requires_arguments`): their suggestions are exactly what the user needs
+/// next.
 pub(super) fn executable_awaiting_arguments(
     context: &CompletionContext,
     commands: &CommandPathCache,
     specs: &SpecRegistry,
-    help: &CommandHelpCache,
 ) -> bool {
     argument_progress(context).is_none()
         && context.command().is_some_and(|command| {
-            commands.contains(command) && !requires_arguments(command, specs, help)
+            commands.contains(command)
+                && specs.get(command).is_none()
+                && !requires_arguments(command, specs)
         })
 }
 
 /// Commands that cannot run standalone. The PATH cache cannot express this,
-/// so combine three signals: a built-in list of subcommand-style CLIs, the
-/// spec registry's `requires_arguments` flag, and man-derived subcommand
-/// coverage when the help cache happens to be warm.
-fn requires_arguments(command: &str, specs: &SpecRegistry, help: &CommandHelpCache) -> bool {
+/// so combine two deterministic signals: a built-in list of subcommand-style
+/// CLIs and the spec registry's `requires_arguments` flag.
+fn requires_arguments(command: &str, specs: &SpecRegistry) -> bool {
     const SUBCOMMAND_COMMANDS: &[&str] = &[
         "ansible",
         "apt",
@@ -352,8 +353,7 @@ fn requires_arguments(command: &str, specs: &SpecRegistry, help: &CommandHelpCac
     if let Some(spec) = specs.get(command) {
         return spec.requires_arguments;
     }
-    help.peek(command)
-        .is_some_and(|help| help.has_subcommands())
+    false
 }
 
 /// A navigation the user made against the overlay, kept across query changes.
