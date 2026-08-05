@@ -7,6 +7,7 @@ use crate::{
     },
     history::HistoryIndex,
     platform::CommandPathCache,
+    shell::AliasCache,
     specs::SpecRegistry,
 };
 
@@ -14,6 +15,7 @@ pub struct HistoryProvider {
     index: Arc<RwLock<HistoryIndex>>,
     commands: Arc<CommandPathCache>,
     specs: Arc<SpecRegistry>,
+    aliases: Arc<AliasCache>,
 }
 
 impl HistoryProvider {
@@ -22,11 +24,13 @@ impl HistoryProvider {
         index: Arc<RwLock<HistoryIndex>>,
         commands: Arc<CommandPathCache>,
         specs: Arc<SpecRegistry>,
+        aliases: Arc<AliasCache>,
     ) -> Self {
         Self {
             index,
             commands,
             specs,
+            aliases,
         }
     }
 }
@@ -48,7 +52,7 @@ impl CandidateProvider for HistoryProvider {
         let matches = index.search(&context.buffer.text, &context.cwd, now_ms, 50);
         let candidates = matches
             .into_iter()
-            .filter(|matched| self.plausible_command(&matched.record.command))
+            .filter(|matched| self.plausible_command(context, &matched.record.command))
             .map(|matched| {
                 let shell = matched.record.shell.to_string();
                 let mut candidate = Candidate::new(
@@ -89,12 +93,12 @@ impl CandidateProvider for HistoryProvider {
 
 impl HistoryProvider {
     /// History rows whose command cannot ever have run — the word is not an
-    /// executable on PATH, not a shell builtin or keyword, not spec-covered,
-    /// and not an explicit path — are typos and noise; drop them outright.
-    /// Anything we cannot classify (unparseable line, opaque substitution)
-    /// is kept: filtering must never hide a command we merely fail to
-    /// understand.
-    fn plausible_command(&self, command: &str) -> bool {
+    /// executable on PATH, not a shell builtin, alias, or keyword, not
+    /// spec-covered, and not an explicit path — are typos and noise; drop
+    /// them outright. Anything we cannot classify (unparseable line, opaque
+    /// substitution) is kept: filtering must never hide a command we merely
+    /// fail to understand.
+    fn plausible_command(&self, context: &CompletionContext, command: &str) -> bool {
         let Some(word) = crate::safety::effective_command_word(command) else {
             return true;
         };
@@ -102,6 +106,7 @@ impl HistoryProvider {
             || self.commands.contains(&word)
             || self.specs.get(&word).is_some()
             || is_shell_builtin_or_keyword(&word)
+            || self.aliases.load(context.shell).contains(&word)
     }
 }
 
@@ -240,6 +245,7 @@ mod tests {
             Arc::new(RwLock::new(index)),
             commands,
             Arc::new(SpecRegistry::default()),
+            Arc::new(AliasCache::default()),
         )
     }
 
@@ -333,7 +339,7 @@ mod tests {
             index.ingest(command, 1_000, ShellKind::Zsh, None, Some(0), &policy);
             let provider = provider_with_executables(HistoryIndex::default(), &["git"]);
             assert_eq!(
-                provider.plausible_command(command),
+                provider.plausible_command(&context(command, None), command),
                 kept,
                 "plausibility of {command:?}"
             );
@@ -353,8 +359,28 @@ mod tests {
     #[test]
     fn unparseable_or_opaque_history_rows_are_kept() {
         let provider = provider_with_executables(HistoryIndex::default(), &["git"]);
-        assert!(provider.plausible_command("echo $(gti status)"));
-        assert!(provider.plausible_command("echo 'unterminated"));
-        assert!(provider.plausible_command(""));
+        let ctx = |text: &str| context(text, None);
+        assert!(provider.plausible_command(&ctx("echo $(gti status)"), "echo $(gti status)"));
+        assert!(provider.plausible_command(&ctx("echo 'unterminated"), "echo 'unterminated"));
+        assert!(provider.plausible_command(&ctx(""), ""));
+    }
+
+    #[test]
+    fn aliases_from_rc_files_are_not_mistaken_for_typos() {
+        // `gc` is not on PATH, not a builtin, not spec-covered — but it is
+        // defined in the user's rc files, so the row must survive.
+        let mut aliases = crate::shell::ShellAliases::default();
+        crate::shell::parse_rc_text(ShellKind::Zsh, "alias gc='git commit'\n", &mut aliases);
+        let provider = HistoryProvider::new(
+            Arc::new(RwLock::new(HistoryIndex::default())),
+            Arc::new(CommandPathCache::default()),
+            Arc::new(SpecRegistry::default()),
+            Arc::new(AliasCache::new_fixed(aliases)),
+        );
+        assert!(provider.plausible_command(&context("gc", None), "gc"));
+
+        // Without the alias definition the same row is filtered as a typo.
+        let provider = provider_with_executables(HistoryIndex::default(), &["git"]);
+        assert!(!provider.plausible_command(&context("gc", None), "gc"));
     }
 }

@@ -135,13 +135,15 @@ pub(super) fn build_engine(
     let projects = Arc::new(ProjectCache::default());
     let help = Arc::new(CommandHelpCache::default());
     let git_status = Arc::new(crate::project::GitStatusCache::default());
+    let aliases = Arc::new(crate::shell::AliasCache::default());
     let mut engine = CompletionEngine::new(config.completion.max_candidates, config.ui.max_rows)
         .with_local_timeout(Duration::from_millis(config.completion.local_timeout_ms));
     if config.history.enabled {
         engine.register(HistoryProvider::new(
-            history,
+            Arc::clone(&history),
             Arc::clone(&commands),
             Arc::clone(&specs),
+            Arc::clone(&aliases),
         ));
     }
     engine.register(CommandSpecProvider::new(
@@ -153,7 +155,11 @@ pub(super) fn build_engine(
         Arc::clone(&commands),
         Arc::clone(&help),
     ));
-    engine.register(ProjectProvider::new(projects, Arc::clone(&commands)));
+    engine.register(ProjectProvider::new(
+        projects,
+        Arc::clone(&commands),
+        Arc::clone(&history),
+    ));
     engine.register(crate::providers::GitProvider::new(
         git_status,
         Arc::new(crate::project::GitRefsCache::default()),
@@ -166,6 +172,7 @@ pub(super) fn build_engine(
         Arc::clone(&help),
     ));
     engine.register(PathCommandProvider::new(Arc::clone(&commands)));
+    engine.register(crate::providers::AliasProvider::new(aliases));
     engine.register(ProcessProvider);
     engine.register(NetworkInterfaceProvider);
     engine.register(AiActionProvider::new(

@@ -1,8 +1,14 @@
+mod aliases;
+mod function_slot;
 mod init;
 mod kind;
 mod protocol;
 mod session;
 
+#[cfg(test)]
+pub(crate) use aliases::parse_rc_text;
+pub use aliases::{AliasCache, AliasEntry, AliasKind, ShellAliases};
+pub(crate) use function_slot::{FunctionSlot, infer_function_slot};
 pub use init::{PROTOCOL_VERSION, init_script};
 pub use kind::ShellKind;
 pub use protocol::{ProtocolDiagnostic, ShellEvent, ShellProtocolDecoder};
