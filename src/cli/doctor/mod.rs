@@ -7,6 +7,7 @@ use std::{
     collections::BTreeMap,
     env,
     io::{IsTerminal, Write},
+    path::PathBuf,
 };
 
 use serde::Serialize;
@@ -15,7 +16,7 @@ use crate::shell::PROTOCOL_VERSION;
 
 use checks::{
     configured_shell_ready, find_on_path, inspect_ai, inspect_ai_details, inspect_config,
-    inspect_data_directories, inspect_debug_logging, inspect_shell_integration,
+    inspect_data_directories, inspect_debug_logging, inspect_shell_integration, inspect_update,
 };
 use zsh::inspect_zsh_rc_files;
 
@@ -82,6 +83,14 @@ struct DoctorReport {
     key_bindings: Check,
     data_directories: BTreeMap<&'static str, Check>,
     debug_logging: Check,
+    update: Check,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    update_channel: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    update_interval_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    update_latest_known: Option<String>,
+    update_exe: Check,
     ai: Check,
     #[serde(skip_serializing_if = "Option::is_none")]
     ai_provider: Option<String>,
@@ -157,6 +166,17 @@ pub fn write_report(output: &mut dyn Write, json: bool) -> crate::Result<()> {
         write_check(output, &format!("{name} directory"), check)?;
     }
     write_check(output, "debug logging", &report.debug_logging)?;
+    write_check(output, "auto-update", &report.update)?;
+    if let Some(channel) = &report.update_channel {
+        writeln!(output, "update channel: {channel}")?;
+    }
+    if let Some(interval) = report.update_interval_secs {
+        writeln!(output, "update interval: {interval}s")?;
+    }
+    if let Some(latest) = &report.update_latest_known {
+        writeln!(output, "update latest known: v{latest}")?;
+    }
+    write_check(output, "update install path", &report.update_exe)?;
     write_check(output, "AI", &report.ai)?;
     if let Some(provider) = &report.ai_provider {
         writeln!(output, "AI provider: {provider}")?;
@@ -207,6 +227,8 @@ fn collect() -> DoctorReport {
     let (paths, config, config_check, key_bindings) = inspect_config();
     let data_directories = inspect_data_directories(paths.as_ref());
     let debug_logging = inspect_debug_logging(config.as_ref(), paths.as_ref());
+    let current_exe = env::current_exe().unwrap_or_else(|_| PathBuf::from("hokan"));
+    let update = inspect_update(config.as_ref(), paths.as_ref(), &current_exe);
     let ai = inspect_ai(config.as_ref(), paths.as_ref());
     let ai_details = inspect_ai_details(config.as_ref(), paths.as_ref());
     let shell_integration = inspect_shell_integration();
@@ -235,6 +257,11 @@ fn collect() -> DoctorReport {
         key_bindings,
         data_directories,
         debug_logging,
+        update: update.check,
+        update_channel: update.channel,
+        update_interval_secs: update.interval_secs,
+        update_latest_known: update.latest_known,
+        update_exe: update.exe,
         ai,
         ai_provider: ai_details
             .as_ref()

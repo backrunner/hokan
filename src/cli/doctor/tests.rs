@@ -322,3 +322,99 @@ fn zprofile_only_theme_warns_unless_login_shell() {
     assert_eq!(in_zshrc.level, CheckLevel::Ok);
     assert!(in_zshrc.detail.contains(".zshrc"), "{}", in_zshrc.detail);
 }
+
+#[test]
+fn update_section_reports_config_cache_and_exe_writability() {
+    use super::checks::inspect_update;
+
+    let directory = tempfile::tempdir().expect("directory");
+    let paths = ConfigPaths {
+        config_file: directory.path().join("config.toml"),
+        credentials_file: directory.path().join("credentials.toml"),
+        specs_directory: directory.path().join("specs"),
+        state_directory: directory.path().join("state"),
+        cache_directory: directory.path().join("cache"),
+    };
+    fs::create_dir_all(&paths.state_directory).expect("state dir");
+    fs::write(
+        paths.state_directory.join("update-check.json"),
+        "{\"last_check_epoch\":1,\"channel\":\"stable\",\"latest_known\":\"0.2.0\"}",
+    )
+    .expect("seed update cache");
+    let exe = directory.path().join("bin/hokan");
+    fs::create_dir_all(exe.parent().expect("exe parent")).expect("bin dir");
+
+    let details = inspect_update(Some(&Config::default()), Some(&paths), &exe);
+    assert_eq!(
+        details.check.level,
+        CheckLevel::Ok,
+        "{}",
+        details.check.detail
+    );
+    assert!(details.check.detail.contains("channel stable"));
+    assert!(details.check.detail.contains("every 1800s"));
+    assert_eq!(details.channel.as_deref(), Some("stable"));
+    assert_eq!(details.interval_secs, Some(1_800));
+    assert_eq!(details.latest_known.as_deref(), Some("0.2.0"));
+    assert_eq!(details.exe.level, CheckLevel::Ok, "{}", details.exe.detail);
+
+    // Disabled configs say so, and still report channel/interval/cache.
+    let mut config = Config::default();
+    config.update.enabled = false;
+    config.update.channel = "beta".into();
+    let details = inspect_update(Some(&config), Some(&paths), &exe);
+    assert_eq!(details.check.level, CheckLevel::NotApplicable);
+    assert!(details.check.detail.contains("disabled"));
+    assert_eq!(details.channel.as_deref(), Some("beta"));
+    assert_eq!(details.latest_known.as_deref(), Some("0.2.0"));
+
+    // No config at all is an error with no optional fields.
+    let details = inspect_update(None, None, &exe);
+    assert_eq!(details.check.level, CheckLevel::Error);
+    assert!(details.channel.is_none());
+    assert!(details.interval_secs.is_none());
+    assert!(details.latest_known.is_none());
+
+    // Without a cache file there is no latest-known line.
+    let empty = tempfile::tempdir().expect("directory");
+    let empty_paths = ConfigPaths {
+        state_directory: empty.path().join("state"),
+        ..paths.clone()
+    };
+    let details = inspect_update(Some(&Config::default()), Some(&empty_paths), &exe);
+    assert!(details.latest_known.is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn update_exe_in_a_system_directory_is_a_warning() {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::checks::inspect_update;
+
+    if nix::unistd::geteuid().is_root() {
+        // Root ignores permission bits; the probe would succeed.
+        return;
+    }
+    let directory = tempfile::tempdir().expect("directory");
+    let paths = ConfigPaths {
+        config_file: directory.path().join("config.toml"),
+        credentials_file: directory.path().join("credentials.toml"),
+        specs_directory: directory.path().join("specs"),
+        state_directory: directory.path().join("state"),
+        cache_directory: directory.path().join("cache"),
+    };
+    let bin = directory.path().join("bin");
+    fs::create_dir_all(&bin).expect("bin dir");
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o555)).expect("read-only bin");
+
+    let details = inspect_update(Some(&Config::default()), Some(&paths), &bin.join("hokan"));
+    assert_eq!(details.exe.level, CheckLevel::Warn);
+    assert!(
+        details.exe.detail.contains("package manager"),
+        "{}",
+        details.exe.detail
+    );
+
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).expect("restore bin");
+}

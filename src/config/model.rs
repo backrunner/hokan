@@ -23,6 +23,7 @@ pub struct Config {
     pub completion: CompletionConfig,
     pub logging: LoggingConfig,
     pub ai: AiConfig,
+    pub update: UpdateConfig,
 }
 
 impl Default for Config {
@@ -36,6 +37,7 @@ impl Default for Config {
             completion: CompletionConfig::default(),
             logging: LoggingConfig::default(),
             ai: AiConfig::default(),
+            update: UpdateConfig::default(),
         }
     }
 }
@@ -134,6 +136,16 @@ impl Config {
             return Err(crate::Error::Config(
                 "logging.max_bytes must be 65536..=67108864 and logging.rotations must be 1..=10"
                     .into(),
+            ));
+        }
+        if !matches!(self.update.channel.as_str(), "stable" | "beta") {
+            return Err(crate::Error::Config(
+                "update.channel must be stable or beta".into(),
+            ));
+        }
+        if !(60..=86_400).contains(&self.update.interval_secs) {
+            return Err(crate::Error::Config(
+                "update.interval_secs must be 60..=86400".into(),
             ));
         }
         if self.ai.enabled {
@@ -491,6 +503,24 @@ impl Default for AiConfig {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UpdateConfig {
+    pub enabled: bool,
+    pub channel: String,
+    pub interval_secs: u64,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            channel: "stable".into(),
+            interval_secs: 1_800,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -691,5 +721,57 @@ mod tests {
         config.ai.provider = "custom".into();
         config.ai.endpoint = "http://localhost:8080/v1".into();
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn update_config_defaults_to_enabled_stable() {
+        let update = UpdateConfig::default();
+        assert!(update.enabled);
+        assert_eq!(update.channel, "stable");
+        assert_eq!(update.interval_secs, 1_800);
+        assert_eq!(Config::default().update, update);
+    }
+
+    #[test]
+    fn update_config_serde_roundtrip() {
+        let parsed: UpdateConfig =
+            toml::from_str("enabled = false\nchannel = \"beta\"\ninterval_secs = 600\n")
+                .expect("parse update config");
+        assert!(!parsed.enabled);
+        assert_eq!(parsed.channel, "beta");
+        assert_eq!(parsed.interval_secs, 600);
+
+        let rendered = toml::to_string(&parsed).expect("serialize update config");
+        let reparsed: UpdateConfig = toml::from_str(&rendered).expect("reparse update config");
+        assert_eq!(parsed, reparsed);
+    }
+
+    #[test]
+    fn update_config_rejects_invalid_channel_and_interval() {
+        let mut config = Config::default();
+        config.update.channel = "nightly".into();
+        assert!(config.validate().is_err());
+
+        config.update.channel = "beta".into();
+        config.update.interval_secs = 59;
+        assert!(config.validate().is_err());
+        config.update.interval_secs = 60;
+        assert!(config.validate().is_ok());
+        config.update.interval_secs = 86_400;
+        assert!(config.validate().is_ok());
+        config.update.interval_secs = 86_401;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn legacy_config_without_update_section_loads_with_defaults() {
+        let parsed: Config = toml::from_str("version = 1\n[ui]\nmax_rows = 8\n")
+            .expect("legacy config without [update] must parse");
+        assert_eq!(parsed.update, UpdateConfig::default());
+
+        let rendered = toml::to_string(&parsed).expect("serialize config");
+        assert!(rendered.contains("[update]"));
+        let reparsed: Config = toml::from_str(&rendered).expect("reparse config");
+        assert!(reparsed.validate().is_ok());
     }
 }

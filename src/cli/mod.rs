@@ -4,6 +4,7 @@ mod doctor;
 mod history;
 mod integration;
 mod specs;
+mod upgrade;
 
 use std::{io::Write, path::PathBuf};
 
@@ -77,6 +78,25 @@ enum Command {
     /// Inspect and validate command specifications.
     #[command(subcommand)]
     Spec(SpecCommand),
+
+    /// Check for and install updates from GitHub releases.
+    Upgrade {
+        /// Only report what is available; never download or install.
+        #[arg(long, conflicts_with = "force")]
+        check: bool,
+        /// Track this release channel (stable or beta); persisted to the config.
+        #[arg(long)]
+        channel: Option<String>,
+        /// Reinstall even when the latest version equals the current one.
+        #[arg(long)]
+        force: bool,
+        /// Skip the confirmation prompt (scripted usage).
+        #[arg(long)]
+        yes: bool,
+        /// Headless background check spawned at session start.
+        #[arg(long, hide = true)]
+        auto: bool,
+    },
 
     /// Internal shell IPC.
     #[command(hide = true, subcommand)]
@@ -203,6 +223,24 @@ pub fn run<W: Write>(cli: Cli, output: &mut W) -> crate::Result<Option<SessionOp
         }
         Some(Command::Spec(command)) => {
             specs::run(output, command)?;
+            Ok(None)
+        }
+        Some(Command::Upgrade {
+            check,
+            channel,
+            force,
+            yes,
+            auto,
+        }) => {
+            // Like the AI wizard, upgrade prompts inline and writes directly
+            // to stdio, so the buffered `output` path stays empty.
+            upgrade::run(upgrade::UpgradeArgs {
+                check,
+                channel,
+                force,
+                yes,
+                auto,
+            })?;
             Ok(None)
         }
         Some(Command::Ipc(IpcCommand::Take { session })) => {

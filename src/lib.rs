@@ -16,6 +16,7 @@ pub mod safety;
 pub mod shell;
 pub mod specs;
 pub mod terminal;
+pub mod update;
 
 #[must_use]
 pub fn history_now_ms() -> i64 {

@@ -84,4 +84,6 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
+          # Beta channels ship as pre-releases (tags like v0.2.0-beta.1).
+          prerelease: ${{ contains(github.ref_name, '-') }}
           files: dist/*

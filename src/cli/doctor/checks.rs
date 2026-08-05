@@ -261,6 +261,79 @@ pub(super) fn inspect_debug_logging(config: Option<&Config>, paths: Option<&Conf
     )
 }
 
+/// Update-section fields reported alongside the `update` check line.
+pub(super) struct UpdateDetails {
+    pub(super) check: Check,
+    pub(super) channel: Option<String>,
+    pub(super) interval_secs: Option<u64>,
+    /// Latest version the most recent check recorded in the TTL cache.
+    pub(super) latest_known: Option<String>,
+    pub(super) exe: Check,
+}
+
+pub(super) fn inspect_update(
+    config: Option<&Config>,
+    paths: Option<&ConfigPaths>,
+    exe: &Path,
+) -> UpdateDetails {
+    let exe_check = inspect_update_exe(exe);
+    let (Some(config), Some(paths)) = (config, paths) else {
+        return UpdateDetails {
+            check: Check::new(CheckLevel::Error, "configuration is unavailable"),
+            channel: None,
+            interval_secs: None,
+            latest_known: None,
+            exe: exe_check,
+        };
+    };
+    let check = if config.update.enabled {
+        Check::new(
+            CheckLevel::Ok,
+            format!(
+                "enabled; channel {}, checks every {}s",
+                config.update.channel, config.update.interval_secs
+            ),
+        )
+    } else {
+        Check::new(
+            CheckLevel::NotApplicable,
+            "disabled; no background update checks run",
+        )
+    };
+    let latest_known =
+        crate::update::read_cached_check(&paths.state_directory).map(|cached| cached.latest_known);
+    UpdateDetails {
+        check,
+        channel: Some(config.update.channel.clone()),
+        interval_secs: Some(config.update.interval_secs),
+        latest_known,
+        exe: exe_check,
+    }
+}
+
+/// Writability of the running executable's directory: package-manager
+/// installs live in system paths that self-update must not touch.
+fn inspect_update_exe(exe: &Path) -> Check {
+    let directory = exe.parent().unwrap_or(exe);
+    if crate::update::directory_writable(directory) {
+        Check::new(
+            CheckLevel::Ok,
+            format!(
+                "{} is writable; self-updates can apply",
+                directory.display()
+            ),
+        )
+    } else {
+        Check::new(
+            CheckLevel::Warn,
+            format!(
+                "{} is not writable; upgrade through your package manager",
+                directory.display()
+            ),
+        )
+    }
+}
+
 pub(super) fn inspect_shell_integration() -> ShellIntegrationReport {
     let active = env::var_os("HOKAN_ACTIVE").is_some();
     if !active {
