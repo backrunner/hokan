@@ -10,8 +10,7 @@ fn writable_terminal_handles_are_confined_to_output_and_guard() {
         let relative = path
             .strip_prefix(&source_root)
             .expect("source file is below source root");
-        if relative == Path::new("terminal/output.rs") || relative == Path::new("terminal/guard.rs")
-        {
+        if relative.starts_with("terminal/output") || relative == Path::new("terminal/guard.rs") {
             continue;
         }
         // CLI subcommands (e.g. `hokan ai setup`) run before or instead of the
