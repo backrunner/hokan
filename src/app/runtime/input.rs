@@ -116,12 +116,18 @@ pub(super) fn handle_input_event(
             return enter_with_selection(state, pty, session, output, worker, config, ai_sender);
         }
         // The accept key (Tab) always activates as an edit-back fill — it
-        // never executes.
+        // never executes. With no explicit selection it defaults to the
+        // top-ranked candidate: `move_selection` both selects the first row
+        // and records the intent, so the list refreshed after the fill
+        // re-selects its first row automatically.
         if config.keys.accept.matches(&event.kind) {
-            if state.selected.is_some() {
-                return activate_selected(state, pty, session, output, worker, config, ai_sender);
+            if state.selected.is_none() {
+                if state.candidates.is_empty() {
+                    return Ok(());
+                }
+                move_selection(state, 1);
             }
-            return Ok(());
+            return activate_selected(state, pty, session, output, worker, config, ai_sender);
         }
         if config.keys.dismiss.matches(&event.kind) {
             state.overlay_visible = false;
