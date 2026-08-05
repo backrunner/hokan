@@ -207,6 +207,19 @@ impl HistoryIndex {
         (count.saturating_mul(200) / max).min(200) as i16
     }
 
+    /// Usage-based frecency of an exact command line, matching `search`'s
+    /// scoring. 0 when the command was never recorded.
+    #[must_use]
+    pub fn usage_frecency(&self, command: &str, now_ms: i64) -> i16 {
+        let Some(record) = self.records.get(&normalize(command)) else {
+            return 0;
+        };
+        let age_hours = now_ms.saturating_sub(record.last_used_ms).max(0) / 3_600_000;
+        let recency = 150_i64.saturating_sub(age_hours.min(150));
+        let frequency = (record.count.min(50) * 2) as i64;
+        (recency + frequency).min(200) as i16
+    }
+
     pub fn merge_events_absolute(&mut self, events: &[HistoryEventV1], policy: &HistoryPolicy) {
         let mut incoming = Self::default();
         for event in events {

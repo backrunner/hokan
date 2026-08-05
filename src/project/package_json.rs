@@ -29,6 +29,13 @@ struct FileFingerprint {
 #[derive(Debug, Default)]
 pub struct ProjectCache {
     manifests: Mutex<HashMap<PathBuf, (FileFingerprint, Arc<PackageManifest>)>>,
+    deno_manifests: Mutex<HashMap<PathBuf, (FileFingerprint, Arc<DenoManifest>)>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DenoManifest {
+    pub path: PathBuf,
+    pub tasks: BTreeMap<String, String>,
 }
 
 impl ProjectCache {
@@ -114,6 +121,98 @@ impl ProjectCache {
             .map_err(|_| crate::Error::Project("project cache was poisoned".into()))?;
         cache.insert(path, (fingerprint, Arc::clone(&manifest)));
         Ok(Some(manifest))
+    }
+
+    /// Nearest `deno.json`/`deno.jsonc` with its `tasks`, cached with the
+    /// same fingerprint discipline as package.json manifests.
+    pub fn load_deno_nearest(&self, cwd: &Path) -> crate::Result<Option<Arc<DenoManifest>>> {
+        let Some(path) = discover_deno_json(cwd) else {
+            return Ok(None);
+        };
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.file_type().is_file() || metadata.len() > MANIFEST_MAX_BYTES {
+            return Ok(None);
+        }
+        let fingerprint = FileFingerprint {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            length: metadata.len(),
+            modified_ns: metadata
+                .modified()
+                .ok()
+                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                .map_or(0, |duration| duration.as_nanos()),
+        };
+        if let Ok(cache) = self.deno_manifests.lock()
+            && let Some((cached_fingerprint, manifest)) = cache.get(&path)
+            && *cached_fingerprint == fingerprint
+        {
+            return Ok(Some(Arc::clone(manifest)));
+        }
+        let bytes = fs::read(&path)?;
+        let manifest = Arc::new(DenoManifest {
+            path: path.clone(),
+            tasks: parse_deno_tasks(&bytes),
+        });
+        let mut cache = self
+            .deno_manifests
+            .lock()
+            .map_err(|_| crate::Error::Project("project cache was poisoned".into()))?;
+        cache.insert(path, (fingerprint, Arc::clone(&manifest)));
+        Ok(Some(manifest))
+    }
+}
+
+/// `tasks` from a deno.json(c) body. JSONC line comments (`// …`) are
+/// tolerated; anything more exotic yields an empty task list rather than a
+/// wrong one.
+fn parse_deno_tasks(bytes: &[u8]) -> BTreeMap<String, String> {
+    let text = String::from_utf8_lossy(bytes);
+    let stripped: String = text
+        .lines()
+        .map(|line| {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") { "" } else { line }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&stripped) else {
+        return BTreeMap::new();
+    };
+    value
+        .get("tasks")
+        .and_then(serde_json::Value::as_object)
+        .map(|tasks| {
+            tasks
+                .iter()
+                .filter_map(|(name, command)| {
+                    command
+                        .as_str()
+                        .map(|command| (name.clone(), command.to_owned()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Nearest `deno.json` or `deno.jsonc` walking up, stopping after the
+/// `.git` level like package.json discovery.
+#[must_use]
+pub fn discover_deno_json(cwd: &Path) -> Option<PathBuf> {
+    let mut directory = fs::canonicalize(cwd).ok()?;
+    loop {
+        for name in ["deno.json", "deno.jsonc"] {
+            let candidate = directory.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        if directory.join(".git").exists() {
+            return None;
+        }
+        if !directory.pop() {
+            return None;
+        }
     }
 }
 
