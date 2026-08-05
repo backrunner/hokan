@@ -27,6 +27,12 @@ use crate::{
 // while covering loaded machines; the fetch runs at most once per command
 // per session, from the applies pass, outside the engine's local budget.
 const MAN_TIMEOUT: Duration = Duration::from_millis(1200);
+// `--help` fallback for modern CLIs without a (useful) man page: the binary
+// itself is a fixed program resolved on PATH, receives no shell, a single
+// literal `--help` argument, null stdin, and is bounded in time and output —
+// the same discipline as the `man` probe. 800 ms covers warm `kubectl
+// --help`-style runs without letting a cold binary stall the applies pass.
+const HELP_TIMEOUT: Duration = Duration::from_millis(800);
 const MAN_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_ENTRIES: usize = 200;
 const MAX_DESCRIPTION_CHARS: usize = 72;
@@ -50,11 +56,12 @@ impl CommandHelp {
     }
 }
 
-/// Session-scoped command → parsed man page cache. Negative results (man
-/// failed, page unparsable) are cached as empty entries so a missing or slow
-/// page costs at most one bounded `man` run per command per session. Shared
-/// between the help provider (which fetches) and the filesystem provider
-/// (which only peeks) so the suppression check never spawns `man`.
+/// Session-scoped command → parsed help cache. Negative results (man failed,
+/// page unparsable, `--help` fallback empty) are cached as empty entries so a
+/// missing or slow page costs at most one bounded fetch per command per
+/// session. Shared between the help provider (which fetches) and the
+/// filesystem provider (which only peeks) so the suppression check never
+/// spawns a subprocess.
 #[derive(Default)]
 pub struct CommandHelpCache {
     entries: Mutex<HashMap<String, Arc<CommandHelp>>>,
@@ -69,12 +76,13 @@ impl CommandHelpCache {
         lock(&self.entries).get(command).cloned()
     }
 
-    /// Cache-first lookup; on a cold miss runs `man` synchronously once
-    /// (bounded) and caches the outcome, including failures. The entries lock
+    /// Cache-first lookup; on a cold miss fetches synchronously once
+    /// (bounded `man`, with a bounded `--help` fallback when the page yields
+    /// nothing) and caches the outcome, including failures. The entries lock
     /// is held across the fetch so concurrent cold misses for the same
-    /// command spawn a single `man` run instead of one per caller.
+    /// command spawn a single fetch instead of one per caller.
     pub fn get(&self, command: &str) -> Arc<CommandHelp> {
-        self.get_with(command, fetch_man_page)
+        self.get_with(command, fetch_command_help)
     }
 
     fn get_with(&self, command: &str, fetch: impl Fn(&str) -> CommandHelp) -> Arc<CommandHelp> {
@@ -227,6 +235,160 @@ fn fetch_man_page(command: &str) -> CommandHelp {
     }
     let text = String::from_utf8_lossy(&output.stdout);
     parse_man_page(command, &text)
+}
+
+/// Full cold-miss fetch: try the man page, and only when it yields no flags
+/// and no subcommands (kubectl has no man page at all; docker's page has no
+/// COMMANDS section) fall back to a single bounded `<cmd> --help` run. An
+/// empty fallback result is returned as-is so the negative-cache path still
+/// guarantees at most one fetch per command per session.
+fn fetch_command_help(command: &str) -> CommandHelp {
+    fetch_with_fallback(command, fetch_man_page, fetch_help_output)
+}
+
+fn fetch_with_fallback(
+    command: &str,
+    man: impl Fn(&str) -> CommandHelp,
+    help: impl Fn(&str) -> CommandHelp,
+) -> CommandHelp {
+    let parsed = man(command);
+    if !parsed.flags.is_empty() || !parsed.subcommands.is_empty() {
+        return parsed;
+    }
+    help(command)
+}
+
+/// Modern-CLI fallback: `<cmd> --help`, bounded exactly like the man probe —
+/// the command resolves on PATH (the provider only fires for commands the
+/// user can execute), gets no shell and no user-controlled argv beyond the
+/// literal `--help`, reads null stdin, and dies on timeout. A failing,
+/// hanging, or empty run degrades to an empty `CommandHelp`.
+fn fetch_help_output(command: &str) -> CommandHelp {
+    let Ok(output) =
+        crate::platform::run_bounded(command, ["--help"], HELP_TIMEOUT, MAN_MAX_OUTPUT_BYTES)
+    else {
+        return CommandHelp::default();
+    };
+    if !output.status.success() || output.stdout.is_empty() {
+        return CommandHelp::default();
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    parse_help_output(&text)
+}
+
+/// Conservative heuristics over `--help` text (kubectl/docker/cobra, cargo
+/// clap, and similar two-column layouts). Same philosophy as the man parser:
+/// skip anything unrecognized rather than guess.
+fn parse_help_output(text: &str) -> CommandHelp {
+    let lines: Vec<String> = text.lines().map(str::to_owned).collect();
+    let mut help = CommandHelp::default();
+    let mut seen_flags = HashSet::new();
+    let mut seen_subcommands = HashSet::new();
+    let mut in_commands = false;
+    for (index, line) in lines.iter().enumerate() {
+        if is_commands_header(line) {
+            in_commands = true;
+            continue;
+        }
+        if is_help_section_header(line) {
+            in_commands = false;
+            continue;
+        }
+        if let Some((names, rest)) = parse_flag_line(line) {
+            let description = inline_description(&rest)
+                .or_else(|| block_description(&lines, index, indent_of(line)))
+                .map_or_else(String::new, |text| shorten(&text));
+            for name in names {
+                if seen_flags.insert(name.clone()) && help.flags.len() < MAX_ENTRIES {
+                    help.flags.push(HelpEntry {
+                        name,
+                        description: description.clone(),
+                    });
+                }
+            }
+            continue;
+        }
+        if !in_commands {
+            continue;
+        }
+        if let Some((name, description)) = help_subcommand_row(line)
+            && seen_subcommands.insert(name.clone())
+            && help.subcommands.len() < MAX_ENTRIES
+        {
+            help.subcommands.push(HelpEntry {
+                name,
+                description: shorten(&description),
+            });
+        }
+    }
+    help
+}
+
+/// Flush-left `Commands:`-family headers used by cobra/clap-style help:
+/// `Commands:`, `Available Commands:`, `Management Commands:`, and the
+/// parenthesized `Commands (…)` variants.
+fn is_commands_header(line: &str) -> bool {
+    if line.starts_with(char::is_whitespace) {
+        return false;
+    }
+    let head = line
+        .trim()
+        .trim_end_matches(':')
+        .split('(')
+        .next()
+        .unwrap_or_default()
+        .trim_end();
+    head == "Commands" || head.ends_with(" Commands")
+}
+
+/// Any other flush-left `Something:` line ends a commands section (`Flags:`,
+/// `Options:`, `Global Flags:`, …). The commands header itself is matched
+/// first by the caller.
+fn is_help_section_header(line: &str) -> bool {
+    !line.starts_with(char::is_whitespace) && line.trim_end().ends_with(':')
+}
+
+/// Two-column `name   description` rows inside a `--help` commands section.
+/// Unlike the man-page variant, hyphenated names (`api-versions`) and
+/// clap-style alias lists (`build, b`) are accepted — the alias after the
+/// comma is dropped.
+fn help_subcommand_row(line: &str) -> Option<(String, String)> {
+    if line.starts_with('-') || !line.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let trimmed = line.trim_start();
+    let name_end = trimmed.find(char::is_whitespace)?;
+    let name_token = &trimmed[..name_end];
+    let name = name_token.trim_end_matches(',');
+    if !is_entry_name(name) {
+        return None;
+    }
+    let mut rest = &trimmed[name_end..];
+    // Alias rows (`build, b    Compile…`): skip the single-word alias so the
+    // column gap is measured after it.
+    if name_token.ends_with(',') {
+        let alias = rest.trim_start();
+        let alias_end = alias.find(char::is_whitespace)?;
+        if !alias[..alias_end]
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric())
+        {
+            return None;
+        }
+        rest = &alias[alias_end..];
+    }
+    let gap = rest
+        .chars()
+        .take_while(|character| *character == ' ')
+        .count();
+    if gap < 2 {
+        return None;
+    }
+    let description = rest.trim_start();
+    if description.is_empty() {
+        return None;
+    }
+    Some((name.to_owned(), description.to_owned()))
 }
 
 /// Conservative heuristics over `man -P cat` output. Anything unrecognized is
@@ -632,6 +794,207 @@ mod tests {
             parse_man_page("x", "random prose\n- not a flag line\n--\n-@notaflag\n"),
             CommandHelp::default()
         );
+    }
+
+    const KUBECTL_HELP: &str = "\
+kubectl controls the Kubernetes cluster manager.
+
+Usage:
+  kubectl [flags] [options]
+
+Available Commands:
+  apply         Apply a configuration to a resource by file name or stdin
+  api-versions  Print the supported API versions on the server
+  create        Create a resource from a file or from stdin
+  get           Display one or many resources
+
+Flags:
+  -h, --help              help for kubectl
+      --kubeconfig string  Path to the kubeconfig file
+
+Use \"kubectl <command> --help\" for more information about a given command.
+";
+
+    const DOCKER_HELP: &str = "\
+Usage:  docker [OPTIONS] COMMAND
+
+A self-sufficient runtime for containers
+
+Management Commands:
+  builder     Manage builds
+  container   Manage containers
+
+Commands:
+  attach      Attach local standard input, output, and error streams to a running container
+  build       Build an image from a Dockerfile
+
+Global Flags:
+      --config string   Location of client config files
+  -D, --debug           Enable debug mode
+";
+
+    const CARGO_HELP: &str = "\
+Rust's package manager
+
+Usage: cargo [OPTIONS] [COMMAND]
+
+Commands:
+  build, b    Compile the current package
+  check, c    Analyze the current package and report errors
+  run         Run a binary or example of the local package
+
+Options:
+  -V, --version   Print version
+";
+
+    #[test]
+    fn parses_kubectl_style_help() {
+        let help = parse_help_output(KUBECTL_HELP);
+        let names: Vec<&str> = help
+            .subcommands
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, ["apply", "api-versions", "create", "get"]);
+        assert_eq!(
+            help.subcommands[1].description,
+            "Print the supported API versions on the server"
+        );
+        let flags: Vec<(&str, &str)> = help
+            .flags
+            .iter()
+            .map(|entry| (entry.name.as_str(), entry.description.as_str()))
+            .collect();
+        assert_eq!(
+            flags,
+            [
+                ("-h", "help for kubectl"),
+                ("--help", "help for kubectl"),
+                ("--kubeconfig", "Path to the kubeconfig file"),
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_docker_style_help_with_management_commands() {
+        let help = parse_help_output(DOCKER_HELP);
+        let names: Vec<&str> = help
+            .subcommands
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, ["builder", "container", "attach", "build"]);
+        let flags: Vec<&str> = help.flags.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(flags, ["--config", "-D", "--debug"]);
+        assert_eq!(help.flags[0].description, "Location of client config files");
+    }
+
+    #[test]
+    fn parses_cargo_style_help_with_aliases() {
+        let help = parse_help_output(CARGO_HELP);
+        let names: Vec<&str> = help
+            .subcommands
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, ["build", "check", "run"]);
+        assert_eq!(
+            help.subcommands[0].description,
+            "Compile the current package"
+        );
+        let flags: Vec<&str> = help.flags.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(flags, ["-V", "--version"]);
+    }
+
+    #[test]
+    fn help_garbage_yields_no_entries() {
+        assert_eq!(parse_help_output(""), CommandHelp::default());
+        assert_eq!(
+            parse_help_output("just some prose\n"),
+            CommandHelp::default()
+        );
+        // A commands header with no parseable rows still yields no
+        // subcommands; rows outside any commands section are ignored.
+        let orphan_rows = "  start   Start the service.\nCommands:\n\nFlags:\n";
+        let help = parse_help_output(orphan_rows);
+        assert!(help.subcommands.is_empty());
+    }
+
+    #[test]
+    fn help_fallback_only_runs_when_the_man_page_is_empty() {
+        use std::cell::Cell;
+
+        let help_calls = Cell::new(0);
+        let counting_help = |_: &str| {
+            help_calls.set(help_calls.get() + 1);
+            CommandHelp {
+                flags: Vec::new(),
+                subcommands: vec![HelpEntry {
+                    name: "apply".into(),
+                    description: String::new(),
+                }],
+            }
+        };
+        let man_with_flags = |_: &str| CommandHelp {
+            flags: vec![HelpEntry {
+                name: "-x".into(),
+                description: String::new(),
+            }],
+            subcommands: Vec::new(),
+        };
+        // A non-empty man parse wins; `--help` is never spawned.
+        let result = fetch_with_fallback("demo", man_with_flags, counting_help);
+        assert_eq!(result.flags.len(), 1);
+        assert_eq!(help_calls.get(), 0);
+        // An empty man parse falls back to `--help` exactly once.
+        let result = fetch_with_fallback("demo", |_| CommandHelp::default(), counting_help);
+        assert_eq!(result.subcommands.len(), 1);
+        assert_eq!(help_calls.get(), 1);
+        // Both empty: the negative result is returned for caching.
+        let result = fetch_with_fallback(
+            "demo",
+            |_| CommandHelp::default(),
+            |_| CommandHelp::default(),
+        );
+        assert_eq!(result, CommandHelp::default());
+    }
+
+    #[test]
+    fn failing_or_hanging_help_degrades_to_empty() {
+        let directory = tempfile::tempdir().expect("script directory");
+        let failing = directory.path().join("failing");
+        fs::write(&failing, "#!/bin/sh\nexit 1\n").expect("failing script");
+        fs::set_permissions(&failing, fs::Permissions::from_mode(0o700)).expect("failing mode");
+        let hanging = directory.path().join("hanging");
+        // Note: `run_bounded` joins its output readers after killing the
+        // direct child, so a grandchild holding the pipe keeps the fetch
+        // blocked until it exits — keep this sleep short.
+        fs::write(&hanging, "#!/bin/sh\nsleep 2\n").expect("hanging script");
+        fs::set_permissions(&hanging, fs::Permissions::from_mode(0o700)).expect("hanging mode");
+        assert_eq!(
+            fetch_help_output(failing.to_str().expect("failing path")),
+            CommandHelp::default()
+        );
+        assert_eq!(
+            fetch_help_output(hanging.to_str().expect("hanging path")),
+            CommandHelp::default()
+        );
+    }
+
+    #[test]
+    fn successful_help_script_is_parsed_end_to_end() {
+        let directory = tempfile::tempdir().expect("script directory");
+        let tool = directory.path().join("demotool");
+        fs::write(
+            &tool,
+            "#!/bin/sh\nprintf 'Commands:\\n  deploy   Ship it.\\n'\n",
+        )
+        .expect("help script");
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o700)).expect("script mode");
+        let help = fetch_help_output(tool.to_str().expect("script path"));
+        assert_eq!(help.subcommands.len(), 1);
+        assert_eq!(help.subcommands[0].name, "deploy");
+        assert_eq!(help.subcommands[0].description, "Ship it.");
     }
 
     #[test]

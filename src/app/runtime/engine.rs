@@ -128,15 +128,21 @@ pub(super) fn build_engine(
     Arc<CompletionEngine>,
     Arc<SpecRegistry>,
     Arc<CommandPathCache>,
+    Arc<CommandHelpCache>,
 ) {
     let specs = Arc::new(SpecRegistry::load(Some(&paths.specs_directory)));
     let commands = Arc::new(CommandPathCache::from_environment());
     let projects = Arc::new(ProjectCache::default());
     let help = Arc::new(CommandHelpCache::default());
+    let git_status = Arc::new(crate::project::GitStatusCache::default());
     let mut engine = CompletionEngine::new(config.completion.max_candidates, config.ui.max_rows)
         .with_local_timeout(Duration::from_millis(config.completion.local_timeout_ms));
     if config.history.enabled {
-        engine.register(HistoryProvider::new(history));
+        engine.register(HistoryProvider::new(
+            history,
+            Arc::clone(&commands),
+            Arc::clone(&specs),
+        ));
     }
     engine.register(CommandSpecProvider::new(
         Arc::clone(&specs),
@@ -148,10 +154,16 @@ pub(super) fn build_engine(
         Arc::clone(&help),
     ));
     engine.register(ProjectProvider::new(projects, Arc::clone(&commands)));
+    engine.register(crate::providers::GitProvider::new(
+        git_status,
+        Arc::new(crate::project::GitRefsCache::default()),
+        Arc::clone(&commands),
+    ));
+    engine.register(crate::providers::SshHostProvider::new());
     engine.register(FilesystemProvider::new(
         config.ui.show_hidden,
         Arc::clone(&specs),
-        help,
+        Arc::clone(&help),
     ));
     engine.register(PathCommandProvider::new(Arc::clone(&commands)));
     engine.register(ProcessProvider);
@@ -162,5 +174,5 @@ pub(super) fn build_engine(
         Arc::clone(&commands),
         Arc::clone(&specs),
     ));
-    (Arc::new(engine), specs, commands)
+    (Arc::new(engine), specs, commands, help)
 }

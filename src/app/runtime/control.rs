@@ -155,7 +155,7 @@ pub(super) fn handle_config_reload(
             );
             let (live, restart_required) = merge_live_config(config, *loaded);
             let live = Arc::new(live);
-            let (engine, _, _) = build_engine(paths, &live, Arc::clone(history));
+            let (engine, _, _, _) = build_engine(paths, &live, Arc::clone(history));
             worker.replace_engine(engine)?;
             state.cancel_ai();
             state.overlay_visible = false;

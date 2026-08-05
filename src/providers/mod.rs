@@ -2,21 +2,25 @@ mod ai_action;
 mod command_help;
 mod command_spec;
 mod filesystem;
+mod git;
 mod history;
 mod network_interface;
 mod path_command;
 mod process;
 mod project;
+mod ssh;
 
 pub use ai_action::{AiActionProvider, ai_error_candidate, ai_result_candidates};
 pub use command_help::{CommandHelpCache, CommandHelpProvider};
 pub use command_spec::CommandSpecProvider;
 pub use filesystem::FilesystemProvider;
+pub use git::GitProvider;
 pub use history::HistoryProvider;
 pub use network_interface::NetworkInterfaceProvider;
 pub use path_command::PathCommandProvider;
 pub use process::ProcessProvider;
 pub use project::ProjectProvider;
+pub use ssh::SshHostProvider;
 
 use crate::{completion::CompletionContext, parser::TokenKind};
 

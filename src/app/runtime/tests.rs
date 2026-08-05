@@ -31,6 +31,8 @@ fn runtime_state(directory: &Path) -> RuntimeState {
         "0123456789abcdef01234567".into(),
         None,
         Arc::new(CommandPathCache::default()),
+        Arc::new(crate::specs::SpecRegistry::default()),
+        Arc::new(crate::providers::CommandHelpCache::default()),
     )
 }
 
@@ -41,17 +43,20 @@ fn bare_executable_holds_suggestions_until_space() {
     let directory = tempfile::tempdir().expect("directory");
     let bin = directory.path().join("bin");
     std::fs::create_dir(&bin).expect("bin directory");
-    let executable = bin.join("kimi");
-    std::fs::write(&executable, b"#!/bin/sh\n").expect("write executable");
-    let mut permissions = std::fs::metadata(&executable)
-        .expect("metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&executable, permissions).expect("set mode");
+    for name in ["kimi", "git"] {
+        let executable = bin.join(name);
+        std::fs::write(&executable, b"#!/bin/sh\n").expect("write executable");
+        let mut permissions = std::fs::metadata(&executable)
+            .expect("metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).expect("set mode");
+    }
     let path = std::ffi::OsString::from(&bin);
     let commands = CommandPathCache::from_path(Some(&path));
-
-    let context_for = |text: &str| {
+    let specs = crate::specs::SpecRegistry::default();
+    let help = crate::providers::CommandHelpCache::default();
+    let awaiting = |text: &str| {
         let snapshot = BufferSnapshot::new(
             Arc::<str>::from(text),
             text.len(),
@@ -59,45 +64,44 @@ fn bare_executable_holds_suggestions_until_space() {
             SyncQuality::Exact,
         )
         .expect("snapshot");
-        CompletionContext::new(
+        let context = CompletionContext::new(
             QueryId::new(1),
             ShellKind::Zsh,
             directory.path().to_owned(),
             snapshot,
         )
-        .expect("context")
+        .expect("context");
+        executable_awaiting_arguments(&context, &commands, &specs, &help)
     };
 
     // Bare executable word, cursor on it: hold suggestions.
-    assert!(executable_awaiting_arguments(
-        &context_for("kimi"),
-        &commands
-    ));
-    // Same with the cursor mid-word: still the runnable command token.
-    let mut mid_word = context_for("kimi");
-    mid_word.buffer = BufferSnapshot::new(
-        Arc::<str>::from("kimi"),
-        2,
-        BufferRevision::ZERO,
-        SyncQuality::Exact,
-    )
-    .expect("snapshot");
-    mid_word.parsed = crate::parser::parse_line("kimi", 2).expect("parse");
-    assert!(executable_awaiting_arguments(&mid_word, &commands));
+    assert!(awaiting("kimi"));
     // A trailing space commits to arguments: suggestions resume.
-    assert!(!executable_awaiting_arguments(
-        &context_for("kimi "),
-        &commands
-    ));
+    assert!(!awaiting("kimi "));
     // Unknown prefix keeps path completion alive.
-    assert!(!executable_awaiting_arguments(
-        &context_for("kim"),
-        &commands
-    ));
+    assert!(!awaiting("kim"));
     // Executable as a later argument is unaffected.
-    assert!(!executable_awaiting_arguments(
-        &context_for("sudo kimi"),
-        &commands
+    assert!(!awaiting("sudo kimi"));
+    // A subcommand-style CLI cannot run standalone: no holding back.
+    assert!(!awaiting("git"));
+
+    // Same executable with the cursor mid-word: still the runnable token.
+    let mut mid_word = CompletionContext::new(
+        QueryId::new(1),
+        ShellKind::Zsh,
+        directory.path().to_owned(),
+        BufferSnapshot::new(
+            Arc::<str>::from("kimi"),
+            2,
+            BufferRevision::ZERO,
+            SyncQuality::Exact,
+        )
+        .expect("snapshot"),
+    )
+    .expect("context");
+    mid_word.parsed = crate::parser::parse_line("kimi", 2).expect("parse");
+    assert!(executable_awaiting_arguments(
+        &mid_word, &commands, &specs, &help
     ));
 }
 
@@ -421,7 +425,9 @@ fn enter_confirms_when_the_effective_risk_is_dangerous() {
         other => panic!("expected confirmation, got {}", enter_label(&other)),
     }
 
-    // Provider-assigned risk is stricter than the classified ReadOnly.
+    // A provider-flagged executable still executes directly: Unknown risk
+    // (opaque syntax, unclassified provenance) no longer gates confirmation —
+    // only High does.
     let flagged = enter_candidate(
         "ls",
         CandidateAction::Insert,
@@ -434,10 +440,7 @@ fn enter_confirms_when_the_effective_risk_is_dangerous() {
     };
     assert!(matches!(
         resolve_enter(&flagged, &activation),
-        EnterResolution::Confirm {
-            risk: RiskLevel::Unknown,
-            ..
-        }
+        EnterResolution::Execute(_)
     ));
 
     // Medium risk still executes without confirmation.
@@ -838,6 +841,35 @@ fn stale_ai_result_never_takes_the_active_request() {
             .collect::<Vec<_>>(),
         vec!["git commit -m wip"]
     );
+    output.restore_and_exit().expect("shutdown");
+    join.join().expect("actor joins").expect("actor exits");
+}
+
+#[test]
+fn unready_terminal_arms_repaint_retry_and_probe_recovery() {
+    let directory = tempfile::tempdir().expect("directory");
+    let mut state = runtime_state(directory.path());
+    let (output, join) = test_output();
+
+    state.buffer.set_exact("git ".into(), 4).expect("buffer");
+    refresh_context(&mut state, QueryId::new(1));
+    state.candidates = vec![history_candidate(QueryId::new(1), "git status")];
+
+    // A fresh output actor starts with `Unknown` readiness (a lost render
+    // gate lands here too): the frame cannot commit, so the owed repaint is
+    // armed for the main-loop retry and the cursor-probe re-anchor kicks in.
+    render_current(&mut state, &output).expect("render");
+    assert!(state.repaint_pending, "retry must be armed");
+    assert!(state.need_cpr, "cursor-probe recovery must be armed");
+
+    // Nothing to show at all: neither retry nor probe is armed.
+    state.candidates.clear();
+    state.repaint_pending = false;
+    state.need_cpr = false;
+    render_current(&mut state, &output).expect("render");
+    assert!(!state.repaint_pending);
+    assert!(!state.need_cpr);
+
     output.restore_and_exit().expect("shutdown");
     join.join().expect("actor joins").expect("actor exits");
 }

@@ -1133,6 +1133,36 @@ fn tab_fills_back_the_selected_candidate_without_executing() {
 }
 
 #[test]
+fn tab_without_a_selection_fills_the_top_candidate_and_selects_first_row() {
+    if !command_exists("zsh") {
+        return;
+    }
+    let mut terminal = TerminalSession::spawn();
+    terminal.wait_for_screen("HK> ");
+    terminal.settle(Duration::from_millis(300));
+
+    terminal.write(b"tar ");
+    terminal.wait_for_screen(TAG_SPEC);
+    assert!(
+        !terminal.screen_text().contains('▶'),
+        "no row may be pre-selected:\n{}",
+        terminal.screen_text()
+    );
+
+    // Tab with no explicit selection fills the top-ranked candidate…
+    terminal.write(b"\t");
+    terminal.wait_for_screen("HK> tar -czf");
+    // …and the refreshed list selects its first row automatically.
+    terminal.wait_for_screen("▶");
+    terminal.settle(Duration::from_millis(300));
+    let text = terminal.screen_text();
+    assert!(!text.contains("tar: "), "Tab must not execute:\n{text}");
+
+    terminal.exit_shell();
+    terminal.wait_until_exit();
+}
+
+#[test]
 fn overlay_opens_without_a_default_selection() {
     if !command_exists("zsh") {
         return;
@@ -1330,6 +1360,27 @@ fn bare_executable_waits_for_space_before_suggesting() {
 
     terminal.write(b" ");
     terminal.wait_for_screen(TAG_SPEC);
+
+    terminal.exit_shell();
+    terminal.wait_until_exit();
+}
+
+#[test]
+fn git_suggests_immediately_and_uses_repository_state() {
+    if !command_exists("zsh") || !command_exists("git") {
+        return;
+    }
+    let mut terminal = TerminalSession::spawn();
+    terminal.wait_for_screen("HK> ");
+    terminal.settle(Duration::from_millis(300));
+
+    // `git` cannot run standalone, so suggestions appear without waiting for
+    // a space — and outside a repository the top rows are init/clone, not
+    // push/commit.
+    terminal.write(b"git");
+    terminal.wait_for_screen("git init");
+    let text = terminal.screen_text();
+    assert!(text.contains("git clone"), "clone row missing:\n{text}");
 
     terminal.exit_shell();
     terminal.wait_until_exit();

@@ -11,8 +11,9 @@ use crate::{
     diagnostics::DebugLog,
     history::{HistoryCursor, HistoryEventV1},
     platform::CommandPathCache,
-    providers::argument_progress,
+    providers::{CommandHelpCache, argument_progress},
     shell::ShellKind,
+    specs::SpecRegistry,
     terminal::{
         BufferRevision, FrameRequest, FrameRevision, LatestFrameScheduler, QueryId, TerminalSize,
     },
@@ -32,6 +33,10 @@ pub(super) struct RuntimeState {
     pub(super) history_only: bool,
     pub(super) provider_pending: bool,
     pub(super) overlay_visible: bool,
+    /// Set when `render_current` had rows to show but the terminal was not
+    /// ready (render gate, anchor, or geometry) — the main loop retries the
+    /// repaint on every tick until it lands or the query moves on.
+    pub(super) repaint_pending: bool,
     pub(super) frame_revision: FrameRevision,
     pub(super) editing: bool,
     pub(super) pending_mirror_revision: Option<BufferRevision>,
@@ -44,6 +49,8 @@ pub(super) struct RuntimeState {
     pub(super) previous_command: Option<String>,
     pub(super) workspace_probe: crate::project::WorkspaceProbe,
     pub(super) commands: Arc<CommandPathCache>,
+    pub(super) specs: Arc<SpecRegistry>,
+    pub(super) help: Arc<CommandHelpCache>,
     pub(super) pending_confirm: Option<PendingConfirm>,
     pub(super) ai_query: Option<ActiveAiRequest>,
     /// Bumped for every AI request so a late result from a superseded request
@@ -85,6 +92,8 @@ impl RuntimeState {
         history_session_id: String,
         debug_log: Option<DebugLog>,
         commands: Arc<CommandPathCache>,
+        specs: Arc<SpecRegistry>,
+        help: Arc<CommandHelpCache>,
     ) -> Self {
         Self {
             shell,
@@ -103,6 +112,7 @@ impl RuntimeState {
             history_only: false,
             provider_pending: false,
             overlay_visible: false,
+            repaint_pending: false,
             frame_revision: FrameRevision::ZERO,
             editing: false,
             pending_mirror_revision: None,
@@ -113,6 +123,8 @@ impl RuntimeState {
             previous_command: None,
             workspace_probe: crate::project::WorkspaceProbe::default(),
             commands,
+            specs,
+            help,
             pending_confirm: None,
             ai_query: None,
             ai_generation: 0,
@@ -160,6 +172,7 @@ impl RuntimeState {
     pub(super) fn schedule_query(&mut self, worker: &ProviderWorker) -> crate::Result<()> {
         self.cancel_ai();
         self.ai_owns_candidates = false;
+        self.repaint_pending = false;
         self.status = None;
         self.pending_confirm = None;
         if self.buffer.sync == SyncQuality::Uncertain
@@ -197,7 +210,9 @@ impl RuntimeState {
         // trailing space) is already runnable — hold suggestions until the
         // user commits to arguments with a space instead of flashing rows
         // that all just complete the same command name.
-        if !self.history_only && executable_awaiting_arguments(&context, &self.commands) {
+        if !self.history_only
+            && executable_awaiting_arguments(&context, &self.commands, &self.specs, &self.help)
+        {
             self.context = None;
             self.candidates.clear();
             self.selected = None;
@@ -260,17 +275,85 @@ pub(super) fn visible_page_size(max_overlay_height: u16, terminal_size: Terminal
 }
 
 /// True while the cursor is still on the command token (no trailing
-/// whitespace) and the typed word is itself an executable on PATH — a bare
-/// `kimi`. The line is already runnable, so suggestions wait for the space
-/// that commits the user to typing arguments.
+/// whitespace) and the typed word is itself an executable on PATH that runs
+/// standalone — a bare `kimi`. The line is already runnable, so suggestions
+/// wait for the space that commits the user to typing arguments. Commands
+/// that do nothing useful without arguments (`git` and other subcommand-style
+/// CLIs, specs with `requires_arguments`, man pages with subcommands) are NOT
+/// held back: their suggestions are exactly what the user needs next.
 pub(super) fn executable_awaiting_arguments(
     context: &CompletionContext,
     commands: &CommandPathCache,
+    specs: &SpecRegistry,
+    help: &CommandHelpCache,
 ) -> bool {
     argument_progress(context).is_none()
-        && context
-            .command()
-            .is_some_and(|command| commands.contains(command))
+        && context.command().is_some_and(|command| {
+            commands.contains(command) && !requires_arguments(command, specs, help)
+        })
+}
+
+/// Commands that cannot run standalone. The PATH cache cannot express this,
+/// so combine three signals: a built-in list of subcommand-style CLIs, the
+/// spec registry's `requires_arguments` flag, and man-derived subcommand
+/// coverage when the help cache happens to be warm.
+fn requires_arguments(command: &str, specs: &SpecRegistry, help: &CommandHelpCache) -> bool {
+    const SUBCOMMAND_COMMANDS: &[&str] = &[
+        "ansible",
+        "apt",
+        "aws",
+        "az",
+        "brew",
+        "cargo",
+        "consul",
+        "dnf",
+        "docker",
+        "docker-compose",
+        "eksctl",
+        "firebase",
+        "flyctl",
+        "gem",
+        "gh",
+        "gcloud",
+        "go",
+        "helm",
+        "heroku",
+        "istioctl",
+        "kubectl",
+        "mise",
+        "nerdctl",
+        "nix",
+        "npm",
+        "oc",
+        "pacman",
+        "pip",
+        "pip3",
+        "pipx",
+        "pnpm",
+        "podman",
+        "railway",
+        "rustup",
+        "snap",
+        "supabase",
+        "systemctl",
+        "terraform",
+        "tmux",
+        "vagrant",
+        "vault",
+        "vercel",
+        "wrangler",
+        "yarn",
+        "bun",
+        "git",
+    ];
+    if SUBCOMMAND_COMMANDS.contains(&command) {
+        return true;
+    }
+    if let Some(spec) = specs.get(command) {
+        return spec.requires_arguments;
+    }
+    help.peek(command)
+        .is_some_and(|help| help.has_subcommands())
 }
 
 /// A navigation the user made against the overlay, kept across query changes.

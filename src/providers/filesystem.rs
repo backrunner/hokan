@@ -47,11 +47,7 @@ impl CandidateProvider for FilesystemProvider {
         };
         let prefix = context.parsed.current_prefix.as_str();
         let (directory_prefix, basename) = split_prefix(prefix);
-        let scan_directory = if directory_prefix.is_empty() {
-            context.cwd.as_ref().clone()
-        } else {
-            context.cwd.join(directory_prefix)
-        };
+        let scan_directory = scan_directory_for(&context.cwd, directory_prefix);
         let started = Instant::now();
         let entries = match fs::read_dir(&scan_directory) {
             Ok(entries) => entries,
@@ -157,6 +153,10 @@ impl CandidateProvider for FilesystemProvider {
                     (SlotKind::Executable, false, true, _) => 120,
                     (SlotKind::Executable, false, false, true) => 100,
                     (SlotKind::Executable, true, _, _) => 60,
+                    // Descending is the norm at path-like slots: keep
+                    // directories level with files instead of sinking them
+                    // below the siblings the user drills through.
+                    (SlotKind::Path | SlotKind::Directory | SlotKind::NewFile, true, _, _) => 80,
                     (_, true, _, _) => 50,
                     _ => 80,
                 };
@@ -196,10 +196,39 @@ impl FilesystemProvider {
             "lsof" if words.contains(&"+D") => Some(SlotKind::Directory),
             "lsof" => None,
             "kill" | "ifconfig" | "ip" | "ps" => None,
+            // Ref-taking git slots (`git checkout <…>`) belong to the git
+            // provider's branch/remote/tag rows; `git add <path>` keeps
+            // file completion.
+            "git" if at_git_ref_slot(&words, argument_position) => None,
+            // The ssh host slot belongs to the ssh-host provider.
+            "ssh" | "sftp" | "mosh"
+                if super::ssh::at_host_slot(
+                    command,
+                    &words,
+                    argument_position,
+                    &context.parsed.current_prefix,
+                ) =>
+            {
+                None
+            }
+            // Build-tool first arguments are target names, not paths.
+            "make" | "just" if argument_position == 0 => None,
             _ => {
                 // Spec-covered commands own their arguments.
                 if self.specs.get(command).is_some() {
                     return None;
+                }
+                // A flag immediately before the active slot decides what the
+                // slot wants: value flags (`git commit -m`, `ssh -p`) ask for
+                // literal text, so raw file rows would be noise; file flags
+                // (`curl -o`, `make -C`) want paths. `words[position]` is the
+                // word before the active slot in both the trailing-space and
+                // mid-typing cases (see `argument_progress`).
+                if let Some(slot) = flag_value_slot(
+                    command,
+                    words.get(argument_position).copied().unwrap_or_default(),
+                ) {
+                    return Some(slot);
                 }
                 // At the first-argument position a command whose man page
                 // documents subcommands (git-style) takes subcommand rows
@@ -222,6 +251,15 @@ impl FilesystemProvider {
     }
 }
 
+/// `git checkout <…>`-style slots take refs, not files — the git provider
+/// owns them (`git add <path>` keeps file completion).
+fn at_git_ref_slot(words: &[&str], argument_position: usize) -> bool {
+    argument_position >= 1
+        && words
+            .get(1)
+            .is_some_and(|subcommand| super::git::GIT_REF_SUBCOMMANDS.contains(subcommand))
+}
+
 fn tar_slot(words: &[&str], argument_position: usize) -> Option<SlotKind> {
     let operation = words.get(1).copied().unwrap_or_default();
     if argument_position == 0 || !operation.starts_with('-') {
@@ -239,10 +277,64 @@ fn tar_slot(words: &[&str], argument_position: usize) -> Option<SlotKind> {
     operation.contains('c').then_some(SlotKind::Path)
 }
 
+/// Well-known flags whose value is literal text (`Value` — no filesystem
+/// rows) versus a path (`Path`/`Directory`). Best-effort heuristics for the
+/// common commands; unknown flags fall through to the caller's default.
+fn flag_value_slot(command: &str, flag: &str) -> Option<SlotKind> {
+    if !flag.starts_with('-') {
+        return None;
+    }
+    match (command, flag) {
+        ("git", "-C" | "--git-dir" | "--work-tree") => Some(SlotKind::Directory),
+        ("git", "-F" | "--file") => Some(SlotKind::Path),
+        (
+            "git",
+            "-m" | "--message" | "-c" | "--author" | "--date" | "--format" | "--pretty" | "--grep",
+        ) => Some(SlotKind::Value),
+        (
+            "curl",
+            "-o" | "--output" | "-K" | "--config" | "--cacert" | "--cert" | "--key" | "-T"
+            | "--upload-file" | "--data-binary",
+        ) => Some(SlotKind::Path),
+        (
+            "curl",
+            "-d" | "--data" | "--data-raw" | "-H" | "--header" | "-X" | "--request" | "-u"
+            | "--user" | "-A" | "--user-agent" | "-e" | "--referer" | "-x" | "--proxy"
+            | "--connect-timeout" | "--max-time",
+        ) => Some(SlotKind::Value),
+        ("ssh", "-i" | "-F") | ("scp", "-i" | "-F") => Some(SlotKind::Path),
+        ("ssh", "-p" | "-l" | "-o" | "-L" | "-R" | "-D" | "-J" | "-W" | "-b" | "-c" | "-m")
+        | ("scp", "-P" | "-o" | "-l" | "-c") => Some(SlotKind::Value),
+        ("cargo", "--manifest-path") => Some(SlotKind::Path),
+        (
+            "cargo",
+            "-p" | "--package" | "--features" | "-j" | "--jobs" | "--target" | "--profile",
+        ) => Some(SlotKind::Value),
+        ("make", "-f" | "--file" | "-C" | "--directory") => Some(SlotKind::Directory),
+        ("make", "-j" | "--jobs") => Some(SlotKind::Value),
+        _ => None,
+    }
+}
+
 fn split_prefix(prefix: &str) -> (&str, &str) {
     prefix
         .rfind('/')
         .map_or(("", prefix), |index| prefix.split_at(index + 1))
+}
+
+/// The directory to scan for a typed path prefix. The shell expands `~/…`
+/// before executing, so tilde prefixes scan under the home directory while
+/// the literal `~/` spelling is kept for display and edits.
+fn scan_directory_for(cwd: &std::path::Path, directory_prefix: &str) -> std::path::PathBuf {
+    if directory_prefix.is_empty() {
+        return cwd.to_owned();
+    }
+    if let Some(rest) = directory_prefix.strip_prefix("~/")
+        && let Some(home) = std::env::home_dir()
+    {
+        return home.join(rest);
+    }
+    cwd.join(directory_prefix)
 }
 
 fn slot_accepts(slot: SlotKind, name: &str, directory: bool, metadata: &fs::Metadata) -> bool {
@@ -493,8 +585,123 @@ mod tests {
         );
     }
 
+    #[test]
+    fn tilde_prefix_scans_the_home_directory() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let home = std::env::home_dir().expect("home directory");
+        // `~/` resolves against $HOME, absolute and relative prefixes against cwd.
+        assert_eq!(scan_directory_for(cwd.path(), "~/"), home.clone());
+        assert_eq!(
+            scan_directory_for(cwd.path(), "~/Documents/"),
+            home.join("Documents")
+        );
+        assert_eq!(
+            scan_directory_for(cwd.path(), "src/"),
+            cwd.path().join("src")
+        );
+        assert_eq!(scan_directory_for(cwd.path(), ""), cwd.path().to_owned());
+    }
+
     fn provider(specs: Arc<SpecRegistry>) -> FilesystemProvider {
         FilesystemProvider::new(false, specs, Arc::new(CommandHelpCache::default()))
+    }
+
+    #[test]
+    fn value_flags_suppress_file_rows_and_path_flags_offer_them() {
+        let directory = tempfile::tempdir().expect("directory");
+        fs::write(directory.path().join("plain.txt"), b"plain").expect("file");
+        fs::create_dir(directory.path().join("nested")).expect("nested directory");
+        let provider = provider(Arc::new(SpecRegistry::default()));
+
+        // Literal-text slots: no filesystem rows at all.
+        for buffer in ["git commit -m ", "ssh -p ", "curl -H "] {
+            let context = context(directory.path(), buffer, 1);
+            let output = provider.complete(&context);
+            assert!(
+                output.candidates.is_empty(),
+                "{buffer:?} must not offer file rows: {:?}",
+                output
+                    .candidates
+                    .iter()
+                    .map(|candidate| candidate.display.primary.as_str())
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        // Path slots: files and directories are offered (trailing space and
+        // mid-typing alike).
+        for buffer in ["curl -o ", "curl -o pl"] {
+            let context = context(directory.path(), buffer, 1);
+            let output = provider.complete(&context);
+            assert!(
+                output
+                    .candidates
+                    .iter()
+                    .any(|candidate| candidate.display.primary == "plain.txt"),
+                "{buffer:?} must offer files"
+            );
+        }
+
+        // Directory-only slots.
+        let dir_context = context(directory.path(), "make -C ", 1);
+        let output = provider.complete(&dir_context);
+        assert!(
+            output
+                .candidates
+                .iter()
+                .any(|candidate| candidate.display.primary == "nested/")
+        );
+        assert!(
+            !output
+                .candidates
+                .iter()
+                .any(|candidate| candidate.display.primary == "plain.txt")
+        );
+
+        // The flag word itself is still a flag position, not its value.
+        let flag_context = context(directory.path(), "curl -", 1);
+        let output = provider.complete(&flag_context);
+        assert!(output.candidates.is_empty());
+    }
+
+    #[test]
+    fn ref_host_and_target_slots_suppress_file_rows() {
+        let directory = tempfile::tempdir().expect("directory");
+        fs::write(directory.path().join("plain.txt"), b"plain").expect("file");
+        let provider = provider(Arc::new(SpecRegistry::default()));
+
+        // Ref-taking git slots, the ssh host slot, and build-tool target
+        // slots produce no filesystem rows.
+        for buffer in [
+            "git checkout ma",
+            "git checkout ",
+            "git log ",
+            "ssh ",
+            "ssh de",
+            "sftp ",
+            "mosh ",
+            "make ",
+            "make b",
+            "just ",
+        ] {
+            let output = provider.complete(&context(directory.path(), buffer, 1));
+            assert!(
+                output.candidates.is_empty(),
+                "{buffer:?} must not offer file rows"
+            );
+        }
+
+        // Path-oriented slots still offer files.
+        for buffer in ["git add ", "git add ma", "ssh -i ", "scp "] {
+            let output = provider.complete(&context(directory.path(), buffer, 1));
+            assert!(
+                output
+                    .candidates
+                    .iter()
+                    .any(|candidate| candidate.display.primary == "plain.txt"),
+                "{buffer:?} must offer files"
+            );
+        }
     }
 
     fn context(directory: &std::path::Path, text: &str, query: u64) -> CompletionContext {
