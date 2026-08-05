@@ -22,8 +22,9 @@ agnoster）下 Nerd Font 字形逐字节透传；instant/transient prompt 下的
 - 自动混排并模糊检索 zsh、bash、fish history；`Ctrl-R` 切换 history 专注视图。
 - 为 `ls`、`df`、`tar`、`lsof`、`ifconfig`、`ps`、`kill` 等命令提供带释义、槽位和风险级别的配方。
 - 对没有内置规格的命令，从 man page 只读提取子命令和 flag 建议（`HELP` 来源）；flags 位和已被文档接管的首参数位不再做目录扫描。
-- 按当前命令槽位补齐文件、目录、可执行脚本、PID 和网络接口，正确处理空格、引号和 Unicode 路径。
-- 从最近的 `package.json` 补齐 `pnpm run`、`npm run`、`yarn run` 和 `bun run` 脚本。
+- 按当前命令槽位补齐文件、目录、可执行脚本、PID 和网络接口，正确处理空格、引号和 Unicode 路径；识别常见取值 flag 的槽位类型（`git commit -m`、`ssh -p` 等文本槽不再误推文件，`curl -o`、`make -C` 等路径槽正常推文件）。
+- 从最近的 `package.json` 补齐脚本，裸 `pnpm dev` 与 `pnpm run dev` 两种位置都与历史记录混排推荐（npm、yarn、bun 同样支持）。
+- `git` 按仓库实际状态推荐：非仓库目录首推 `git init`/`git clone`；有改动时给 `status`/`add`/`commit`/`diff`，有未推送提交才给 `push`，落后时才给 `pull`，干净时给 `log`/`branch`/`fetch`。裸 `git` 无需空格即可触发。
 - 本地识别自然语言；只有用户选中 AI 动作后才请求 OpenAI-compatible 接口，结果始终先回填、不会自动执行。
 - 提供配置、history 维护、用户规格校验、shell 集成安装和结构化 `doctor` 诊断。
 
@@ -91,8 +92,8 @@ Hokan 包装真实 zsh：内层 shell 照常加载你的 .zshrc，oh-my-zsh、po
 | --- | --- |
 | `Up` / `Down` | 移动选择 |
 | `PageUp` / `PageDown` | 翻页 |
-| `Tab` | 回填候选，永不执行 |
-| `Enter` | 无选中时执行当前输入；有选中时执行选中候选（High/Unknown 风险需二次确认） |
+| `Tab` | 回填候选，永不执行；无选中时回填最推荐的一项，并让刷新后的列表自动选中第一行 |
+| `Enter` | 无选中时执行当前输入；有选中时执行选中候选（仅 High 风险需二次确认） |
 | `Esc` | 关闭列表或取消 AI 请求 |
 | `Ctrl-R` | 切换 history 专注视图 |
 | `Shift-Tab` | 显示或关闭列表 |

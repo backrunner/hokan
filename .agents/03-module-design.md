@@ -425,7 +425,7 @@ pub enum DrainState {
 2. buffer revision/hash 是否匹配？否则刷新。
 3. action = RequestAi/ConfigureAi/Retry？执行对应 effect，不触碰 PTY Enter。
 4. action = Insert/InsertAndContinue？校验 edit，交给 shell adapter 回填。
-5. `Enter` 键的语义在激活门之外：无选中时直接透传给 shell；有选中且候选可执行时，对最终命令文本复核风险，≤ Medium 直接提交执行，High/Unknown 先进入二次确认态。任一不确定条件都降级为回填或拒绝。
+5. `Enter` 键的语义在激活门之外：无选中时直接透传给 shell；有选中且候选可执行时，对最终命令文本复核风险，低于 High 直接提交执行，仅 High 风险先进入二次确认态。任一不确定条件都降级为回填或拒绝。
 ```
 
 ## 4. `terminal` 与 `pty`

@@ -70,8 +70,8 @@ Hokan 在输入行下方使用内联 overlay，不进入全屏：
 | 键位 | 列表打开时 | 列表关闭时 |
 | --- | --- | --- |
 | `Up` / `Down` | 移动选中项 | 原样交给 shell |
-| `Tab` | 接受编辑，永不执行 | 原样交给 shell；若刚有候选可配置为打开并接受 |
-| `Enter` | 无选中：关闭列表并提交当前输入；有选中：执行选中候选（High/Unknown 先二次确认） | 原样提交给 shell |
+| `Tab` | 有选中：回填选中项；无选中：回填首项并让刷新后的列表自动选中第一行（永不执行） | 原样交给 shell；若刚有候选可配置为打开并接受 |
+| `Enter` | 无选中：关闭列表并提交当前输入；有选中：执行选中候选（仅 High 风险先二次确认） | 原样提交给 shell |
 | `Esc` | 关闭列表或取消 AI 请求 | 原样交给 shell |
 | `Ctrl-R` | Unified/HistoryOnly 切换 | 打开 HistoryOnly |
 | `Shift-Tab` | 关闭列表 | 打开列表 |
@@ -91,7 +91,7 @@ $ df▌
     [USE] df -h       使用易读单位
 ```
 
-有选中时 `Enter` 执行选中候选的完整命令文本：≤ Medium 风险直接执行，High/Unknown 先显示红色 EXEC 确认行（`Enter` 确认、`Esc` 取消）。仍需参数的候选（InsertAndContinue）选中后 `Enter` 退化为回填。亲手输入的命令永不触发确认。
+有选中时 `Enter` 执行选中候选的完整命令文本：低于 High 的风险（含 Unknown——普通可执行命令和分类器看不透的 opaque 语法不算危险）直接执行，仅 High 风险（如 `rm -rf` 类超高危命令）先显示红色 EXEC 确认行（`Enter` 确认、`Esc` 取消）。仍需参数的候选（InsertAndContinue）选中后 `Enter` 退化为回填。亲手输入的命令永不触发确认。
 
 ### 5.2 `Insert`
 
@@ -352,7 +352,7 @@ child output 永远优先且不能因 overlay 丢失或延迟。`OutputActor` �
 1. 输入 `ls`：无默认选中，`Enter` 执行原输入；`Down` 选中 recipe 后 `Enter` 直接执行该 recipe，`Tab` 则只回填。
 2. 输入 `lso`：无选中时 `Enter` 执行 `lso`（shell 报 command not found）；`Down` 选中 `lsof` 后 `Enter` 执行 `lsof`。
 3. 输入 `kill `：进程候选是 `InsertAndContinue`，选中后 `Enter` 退化为回填，不执行。
-4. 选中 High/Unknown 风险候选（如 history 中的 `rm -rf …`）后 `Enter`：先出现红色 EXEC 确认行，`Enter` 确认执行，`Esc` 取消返回列表。
+4. 选中 High 风险候选（如 history 中的 `rm -rf …`）后 `Enter`：先出现红色 EXEC 确认行，`Enter` 确认执行，`Esc` 取消返回列表。
 5. 输入 `bash bootstrap\ s`：选择带空格文件后 shell 得到一个正确 argv。
 6. 输入 `pnpm run bu`：只替换当前 token，结果为 `pnpm run build`。
 7. 打开 history、上下导航后异步文件结果到达：选中项不跳动。
