@@ -175,6 +175,27 @@ OAuth 登录过程错误（`OAuthError`）的稳定错误码：
 并对常见凭据格式再次脱敏。提交问题前仍应人工检查日志和 `doctor --json`，不要附上
 私有路径内容或任何凭据。问题复现结束后将 `enabled` 改回 `false` 并重启。
 
+临时诊断也可以不改配置：`HOKAN_DEBUG_LOG=1 hokan` 会在本次会话强制开启同一日志。
+
+## 更新失败排查
+
+`hokan upgrade` 与后台自动更新共用同一条链路，错误码如下：
+
+| 错误码 | 含义与处理 |
+| --- | --- |
+| `HK-UPD-CHANNEL` | 渠道名无效；只支持 `stable` / `beta` |
+| `HK-UPD-NET` / `HK-UPD-TIMEOUT` | 网络失败或超时；检查网络/代理后重试 |
+| `HK-UPD-HTTP` | GitHub API 拒绝请求（附状态码）；未认证限额为每 IP 每小时 60 次，稍后重试 |
+| `HK-UPD-JSON` | release 响应无法解析 |
+| `HK-UPD-ASSET` | 当前平台（target）的归档或 SHA256SUMS 不在该 release 中 |
+| `HK-UPD-HASH` | 下载的归档与 SHA256SUMS 不匹配；请重试，持续出现请上报 |
+| `HK-UPD-SMOKE` | 新二进制 `--version` 冒烟测试未通过，未替换 |
+| `HK-UPD-PLATFORM` | 不支持的 OS/架构组合 |
+| `HK-UPD-IO` | 本地文件读写失败；检查 `~/.cache/hokan` 权限 |
+
+替换失败时当前二进制不会被破坏：升级前会备份为 `hokan.bak`（位于 hokan 二进制
+旁）。路径不可写（系统包管理器安装）时 Hokan 只提示，请用原包管理器升级。
+
 ## History 损坏或体积过大
 
 ```bash

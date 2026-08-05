@@ -19,11 +19,11 @@ agnoster）下 Nerd Font 字形逐字节透传；instant/transient prompt 下的
 
 - 候选列表是跟随光标列的圆角边框盒子：Nerd Font 命令图标与来源图标（  /  / ）、已输入前缀高亮，分页与键位提示内嵌在边框中。
 - 排序融合失败惩罚（上次执行失败降权）、命令转移 bigram（如 `git add` 后提升 `git commit`）和项目上下文加成（git/Node/Cargo/Make/just）。
-- 自动混排并模糊检索 zsh、bash、fish history；`Ctrl-R` 切换 history 专注视图。
+- 自动混排并模糊检索 zsh、bash、fish history；`Ctrl-R` 切换 history 专注视图；识别 `.zshrc`/`.bashrc`/fish 配置中定义的别名、函数和缩写（含一级 `source` 引入），命令位直接推荐并展示展开内容，history 里的别名条目不会被误过滤。自定义函数的参数也能被理解：`proj() { cd ~/projects/$1 }` 这类定义会推断出参数槽位，`proj <Tab>` 直接补全 `~/projects` 下的目录。
 - 为 `ls`、`df`、`tar`、`lsof`、`ifconfig`、`ps`、`kill` 等命令提供带释义、槽位和风险级别的配方。
 - 对没有内置规格的命令，从 man page 只读提取子命令和 flag 建议（`HELP` 来源）；flags 位和已被文档接管的首参数位不再做目录扫描。
 - 按当前命令槽位补齐文件、目录、可执行脚本、PID 和网络接口，正确处理空格、引号和 Unicode 路径；识别常见取值 flag 的槽位类型（`git commit -m`、`ssh -p` 等文本槽不再误推文件，`curl -o`、`make -C` 等路径槽正常推文件）。
-- 从最近的 `package.json` 补齐脚本，裸 `pnpm dev` 与 `pnpm run dev` 两种位置都与历史记录混排推荐（npm、yarn、bun 同样支持）。
+- 从最近的 `package.json` 补齐脚本，按历史使用次数排序。pnpm/yarn/bun 直接回填 `pnpm dev` 原生形式；npm 先出 `install`/`run` 等子命令，`npm run` 后再出 scripts；deno 出 `task` 等子命令并支持 deno.json(c) tasks。pnpm workspace 还会补 `--filter` 成员名和成员自身的 scripts。发现机制不依赖 PATH 中的包管理器（nvm/volta/corepack 晚初始化也能工作）。
 - `git` 按仓库实际状态推荐：非仓库目录首推 `git init`/`git clone`；有改动时给 `status`/`add`/`commit`/`diff`，有未推送提交才给 `push`，落后时才给 `pull`，干净时给 `log`/`branch`/`fetch`。裸 `git` 无需空格即可触发。
 - 本地识别自然语言；只有用户选中 AI 动作后才请求 OpenAI-compatible 接口，结果始终先回填、不会自动执行。
 - 提供配置、history 维护、用户规格校验、shell 集成安装和结构化 `doctor` 诊断。
@@ -192,6 +192,33 @@ hokan spec list
 
 `hokan history clear` 必须显式加 `--yes`，且只清除 Hokan 自己的 store。故障恢复、
 权限修复和 tmux 降级说明见 [故障排查](docs/troubleshooting.md)。
+
+## 更新
+
+Hokan 默认开启无感自动更新：每次会话启动时派生一个后台进程（默认每 30 分钟
+一次 TTL 检查）查询 GitHub releases，发现新版本后自动下载、校验 SHA256、冒烟
+测试并原子替换二进制，下次启动生效；替换前会把当前二进制备份为 `hokan.bak`。
+系统包管理器安装的路径（不可写）只会提示，不会自动替换。
+
+```bash
+hokan upgrade            # 交互式检查并升级
+hokan upgrade --check    # 只查看是否有新版本
+hokan upgrade --channel beta  # 切换到 beta 渠道并升级（持久化）
+```
+
+两个发布渠道：`v0.2.0` 等正式 tag 对应 stable 渠道，`v0.2.0-beta.1` 等 tag 发布为
+GitHub Pre-release 对应 beta 渠道（beta 渠道取 prerelease 与 stable 中的较新者，
+永不自动降级）。配置与开关：
+
+```toml
+[update]
+enabled = true         # false 关闭自动更新
+channel = "stable"     # stable | beta
+interval_secs = 1800
+```
+
+`HOKAN_NO_AUTO_UPDATE=1` 可临时禁用一次会话的后台检查；`hokan doctor` 的 update
+段会显示渠道、最近检查到的版本和二进制可写性。
 
 ## 开发验证
 

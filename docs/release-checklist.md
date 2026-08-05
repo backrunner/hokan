@@ -2,6 +2,14 @@
 
 本清单是 `.agents/05-delivery-plan.md` 的执行入口。自动化通过不能替代真实终端认证。
 
+## 渠道与 tag
+
+- stable：`v<version>`（如 `v0.2.0`）→ GitHub 正式 release，stable 渠道用户看到。
+- beta：`v<version>-beta.<n>`（如 `v0.2.0-beta.1`）→ workflow 自动标记 Pre-release，
+  只有 `channel = "beta"` 的用户看到；beta 渠道取 prerelease 与 stable 的较新者。
+- 两种 tag 都必须与 `Cargo.toml` 的 `version` 完全一致（含 `-beta.N` 后缀），
+  workflow 会拒绝版本不一致。
+
 ## 自动化门槛
 
 ```bash

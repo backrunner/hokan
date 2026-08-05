@@ -83,6 +83,20 @@ per provider in credentials.toml with mode 0600; OAuth tokens refresh
 automatically before expiry. The wizard prompts inline and requires stdin and
 stdout to be a terminal; it refuses to run when they are not.
 .TP
+.BI "upgrade " [--check] [--channel stable|beta] [--force] [--yes]
+Check GitHub releases for a newer version and install it: download the
+target archive, verify it against SHA256SUMS, smoke-test the binary, back
+the current one up as hokan.bak, and atomically replace it. Without flags
+the command asks for confirmation interactively and requires a terminal.
+.B --check
+only reports availability;
+.B --channel
+persists the release channel (stable releases, or beta pre-releases)
+before upgrading. Automatic background updates use the same code path and
+are controlled by the
+.B [update]
+config section and the HOKAN_NO_AUTO_UPDATE environment variable.
+.TP
 .BI "history " import|stats|prune|repair|compact|clear
 Import and maintain Hokan's private history store. Clearing requires
 .BR --yes
