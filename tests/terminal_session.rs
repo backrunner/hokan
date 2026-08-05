@@ -1107,6 +1107,177 @@ fn enter_runs_ls_with_one_press_while_overlay_is_open() {
 }
 
 #[test]
+fn pnpm_offers_package_json_scripts() {
+    if !command_exists("zsh") || !command_exists("pnpm") {
+        return;
+    }
+    let (home, work) = fixture_directories();
+    fs::write(
+        work.path().join("package.json"),
+        r#"{"scripts":{"hkdev":"vite dev","hkbuild":"vite build"}}"#,
+    )
+    .expect("package.json");
+    let mut terminal = TerminalSession::spawn_hokan(home, work, 2);
+    terminal.wait_for_screen("HK> ");
+    terminal.settle(Duration::from_millis(300));
+
+    // Bare `pnpm ` mixes package.json scripts into the list, using pnpm's
+    // native direct-script form (no `run` keyword needed).
+    terminal.write(b"pnpm hk");
+    terminal.wait_for_screen("pnpm hkdev");
+    let text = terminal.screen_text();
+    assert!(text.contains("pnpm hkbuild"), "rows:\n{text}");
+
+    terminal.exit_shell();
+    terminal.wait_until_exit();
+}
+
+#[test]
+fn tui_recovery_debug_scratch() {
+    if !command_exists("zsh") {
+        return;
+    }
+    let (home, work) = fixture_directories();
+    fs::write(
+        home.path().join(".config/hokan/config.toml"),
+        "[logging]\nenabled = true\n",
+    )
+    .expect("debug config");
+    let log_path = home.path().join(".local/state/hokan/debug.log");
+    let fixture = work.path().join("tui.sh");
+    fs::write(
+        &fixture,
+        "#!/bin/sh\nprintf '\\033[?1049h\\033[?2026hTUI_DBG\\r\\n'\nIFS= read -r key\nprintf '\\033[?2026l\\033[?1049l'\n",
+    )
+    .expect("tui fixture");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&fixture).expect("metadata").permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&fixture, permissions).expect("chmod");
+    }
+    let mut terminal = TerminalSession::spawn_hokan(home, work, 2);
+    terminal.wait_for_screen("HK> ");
+    terminal.settle(Duration::from_millis(300));
+    terminal.write(b"sh ./tui.sh\r");
+    terminal.wait_for_screen("TUI_DBG");
+    terminal.write(b"x\r");
+    terminal.wait_for_screen("HK> ");
+    terminal.settle(Duration::from_millis(300));
+    terminal.write(b"ls ");
+    terminal.settle(Duration::from_millis(1500));
+    eprintln!("=== SCREEN ===\n{}", terminal.screen_text());
+    eprintln!(
+        "=== DEBUG LOG ===\n{}",
+        fs::read_to_string(&log_path).unwrap_or_else(|e| format!("<{e}>"))
+    );
+    terminal.exit_shell();
+    terminal.wait_until_exit();
+}
+
+#[test]
+fn overlay_recovers_after_fullscreen_apps_exit() {
+    if !command_exists("zsh") {
+        return;
+    }
+    // name, body written after the read — clean exit, leaked sync output,
+    // leaked alternate screen (crashed TUI).
+    for (name, exit_bytes) in [
+        ("clean", "\\033[?2026l\\033[?1049l"),
+        ("leaked-sync", "\\033[?1049l"),
+        ("leaked-alt", ""),
+    ] {
+        let mut terminal = TerminalSession::spawn();
+        terminal.wait_for_screen("HK> ");
+        terminal.settle(Duration::from_millis(300));
+        let fixture = terminal._work.path().join("tui.sh");
+        fs::write(
+            &fixture,
+            format!(
+                "#!/bin/sh\nprintf '\\033[?1049h\\033[?2026hTUI_{name}\\r\\n'\nIFS= read -r key\nprintf '{exit_bytes}'\n"
+            ),
+        )
+        .expect("tui fixture");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&fixture).expect("metadata").permissions();
+            permissions.set_mode(0o700);
+            fs::set_permissions(&fixture, permissions).expect("chmod");
+        }
+
+        terminal.write(b"sh ./tui.sh\r");
+        terminal.wait_for_screen("TUI_");
+        terminal.write(b"x\r");
+        terminal.wait_for_screen("HK> ");
+        terminal.settle(Duration::from_millis(300));
+
+        // Completions must come back after the app exits, whatever state it
+        // left the terminal in.
+        terminal.write(b"ls ");
+        terminal.wait_for_screen(TAG_SPEC);
+
+        terminal.exit_shell();
+        terminal.wait_until_exit();
+    }
+}
+
+#[test]
+fn aliases_from_zshrc_are_offered_at_the_command_position() {
+    if !command_exists("zsh") {
+        return;
+    }
+    let (home, work) = fixture_directories();
+    fs::write(
+        home.path().join(".zshrc"),
+        "PROMPT='HK> '\nRPROMPT=''\nsetopt no_beep\nalias hkll='ls -lah'\n",
+    )
+    .expect("zshrc with alias");
+    let mut terminal = TerminalSession::spawn_hokan(home, work, 2);
+    terminal.wait_for_screen("HK> ");
+    terminal.settle(Duration::from_millis(300));
+
+    // The alias defined in .zshrc completes like a command, with its
+    // expansion as the row description.
+    terminal.write(b"hkl");
+    terminal.wait_for_screen("hkll");
+    let text = terminal.screen_text();
+    assert!(text.contains("ls -lah"), "alias expansion missing:\n{text}");
+
+    terminal.exit_shell();
+    terminal.wait_until_exit();
+}
+
+#[test]
+fn custom_function_argument_completes_the_inferred_slot() {
+    if !command_exists("zsh") {
+        return;
+    }
+    let (home, work) = fixture_directories();
+    fs::create_dir_all(home.path().join("projects/api")).expect("api dir");
+    fs::create_dir_all(home.path().join("projects/web")).expect("web dir");
+    fs::write(
+        home.path().join(".zshrc"),
+        "PROMPT='HK> '\nRPROMPT=''\nsetopt no_beep\nproj() { cd $HOME/projects/$1; }\n",
+    )
+    .expect("zshrc with function");
+    let mut terminal = TerminalSession::spawn_hokan(home, work, 2);
+    terminal.wait_for_screen("HK> ");
+    terminal.settle(Duration::from_millis(300));
+
+    // `proj ` completes directories under the base inferred from the
+    // function body (`cd $HOME/projects/$1`).
+    terminal.write(b"proj ");
+    terminal.wait_for_screen("api");
+    let text = terminal.screen_text();
+    assert!(text.contains("web"), "rows:\n{text}");
+
+    terminal.exit_shell();
+    terminal.wait_until_exit();
+}
+
+#[test]
 fn tab_fills_back_the_selected_candidate_without_executing() {
     if !command_exists("zsh") {
         return;
@@ -1349,17 +1520,25 @@ fn bare_executable_waits_for_space_before_suggesting() {
         return;
     }
     let mut terminal = TerminalSession::spawn();
+    fs::write(
+        terminal._work.path().join("HKWHOAMI_MARKER.txt"),
+        b"marker\n",
+    )
+    .expect("marker file");
     terminal.wait_for_screen("HK> ");
     terminal.settle(Duration::from_millis(300));
 
-    // A bare executable word is already runnable: suggestions hold off until
-    // the user commits to typing arguments with a space.
-    terminal.write(b"ls");
+    // A bare executable word with no spec coverage is already runnable:
+    // suggestions hold off until the user commits to typing arguments with a
+    // space.
+    terminal.write(b"whoami");
     terminal.settle(Duration::from_millis(500));
     assert_no_overlay_rows(&terminal);
 
+    // After the space, argument completion kicks in (filesystem rows, since
+    // `whoami` has no spec): the overlay box appears.
     terminal.write(b" ");
-    terminal.wait_for_screen(TAG_SPEC);
+    terminal.wait_for_screen("╭");
 
     terminal.exit_shell();
     terminal.wait_until_exit();

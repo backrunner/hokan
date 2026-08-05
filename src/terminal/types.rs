@@ -140,12 +140,8 @@ impl RenderReadiness {
     pub fn admits(self, ticket: FrameTicket, now: Instant) -> bool {
         match self {
             Self::Ready {
-                buffer_revision,
-                screen_revision,
-            } => {
-                buffer_revision == ticket.buffer_revision
-                    && screen_revision == ticket.screen_revision
-            }
+                buffer_revision, ..
+            } => buffer_revision == ticket.buffer_revision,
             Self::AwaitingRedisplay { deadline, .. } if now >= deadline => false,
             Self::AwaitingPromptMarker { .. } | Self::AwaitingRedisplay { .. } | Self::Unknown => {
                 false

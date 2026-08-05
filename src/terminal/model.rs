@@ -249,6 +249,14 @@ impl TerminalModel {
         self.confidence
     }
 
+    /// Sync ownership can only be cleared by child bytes (`?2026l` via the
+    /// observer); a TUI that leaked a sync transaction never sends it, so the
+    /// trusted prompt boundary force-resets it here after writing `?2026l`
+    /// to the terminal itself.
+    pub fn reset_sync_ownership(&mut self) {
+        self.sync_ownership = SyncOwnership::None;
+    }
+
     #[must_use]
     pub const fn sync_ownership(&self) -> SyncOwnership {
         self.sync_ownership

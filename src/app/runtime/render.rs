@@ -23,16 +23,18 @@ pub(super) fn render_current(state: &mut RuntimeState, output: &OutputHandle) ->
         return Ok(());
     }
     let output_state = output.state().map_err(output_error)?;
+    // The readiness proof is matched on the buffer revision only: the screen
+    // model legitimately advances after a gate converges (probe bytes,
+    // trailing redraw output), and the commit path already re-checks the
+    // frame ticket against the CURRENT model revision. Requiring the proof's
+    // screen revision to equal the live model would strand the overlay once
+    // anything advances the model without arming a new gate.
     if output_state.foreground
         || output_state.alternate_screen
         || output_state.confidence == crate::terminal::AnchorConfidence::Unknown
         || !matches!(
             output_state.readiness,
-            RenderReadiness::Ready {
-                buffer_revision,
-                screen_revision
-            } if buffer_revision == state.buffer.revision
-                && screen_revision == output_state.screen_revision
+            RenderReadiness::Ready { buffer_revision, .. } if buffer_revision == state.buffer.revision
         )
     {
         // The terminal is not ready for a frame (render gate, anchor probe,

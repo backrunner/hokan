@@ -21,6 +21,23 @@ pub(super) struct RedisplayConvergence {
 
 impl<W: Write> OutputActor<W> {
     pub(super) fn arm_prompt_gate(&mut self, boundary_id: BoundaryId) -> Result<(), OutputError> {
+        if self.model.alternate_screen() {
+            // A TUI that exited without restoring the alternate screen (a
+            // crash, or restoring only the main modes) leaves the shell's
+            // prompt inside it: force-close it so the model and the overlay
+            // agree with what the user actually sees. No prompt event fires
+            // while a full-screen app legitimately owns the screen, so this
+            // can only trigger after the child is gone.
+            self.guard.write_control(b"\x1b[?1049l")?;
+            self.model.apply_hokan_frame(b"\x1b[?1049l");
+        }
+        if self.model.sync_ownership() == super::super::SyncOwnership::External {
+            // Same leak class for synchronized output: the child's open
+            // ?2026 transaction can never belong to the shell at a prompt,
+            // so close it ourselves and reclaim ownership.
+            self.guard.write_control(b"\x1b[?2026l")?;
+            self.model.reset_sync_ownership();
+        }
         let observed_position = self.recent_boundaries.iter().rposition(|observed| {
             matches!(
                 observed.event,
