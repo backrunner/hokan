@@ -115,9 +115,33 @@ pub fn classify_command(command: &str) -> RiskAssessment {
     assessment(level, reasons)
 }
 
+/// The effective command word of the first segment, after peeling variable
+/// assignments and wrapper commands (`sudo`/`env`/`command`/`builtin`/
+/// `nohup`/`xargs`), exactly as the risk classifier sees it. The word is
+/// returned as written (no `basename` normalization) so callers can still
+/// recognize explicit paths. `None` when the line cannot be parsed, uses
+/// opaque substitutions, or has no command word — callers filtering "clearly
+/// wrong" commands must treat `None` as "unknown", not as "invalid".
+#[must_use]
+pub(crate) fn effective_command_word(command: &str) -> Option<String> {
+    let parsed = crate::parser::parse_line(command, command.len()).ok()?;
+    if parsed
+        .tokens
+        .iter()
+        .any(|token| token.quote == crate::parser::QuoteContext::Opaque)
+    {
+        return None;
+    }
+    let segments = command_segments(&parsed.tokens);
+    command_view(segments.first()?.as_slice()).map(|view| view.raw_name.to_owned())
+}
+
 #[derive(Clone, Copy)]
 struct CommandView<'a> {
     name: &'a str,
+    /// The command word as written, before `basename` normalization — the
+    /// history provider needs it to recognize explicit paths (`./run.sh`).
+    raw_name: &'a str,
     args: &'a [&'a str],
     privileged: bool,
 }
@@ -177,15 +201,28 @@ fn command_view<'a>(words: &'a [&'a str]) -> Option<CommandView<'a>> {
                     words,
                     &mut index,
                     &[
-                        "-E", "-e", "-I", "-L", "-n", "-P", "-s", "-S", "--eof",
-                        "--replace", "--max-lines", "--max-args", "--max-procs",
-                        "--max-chars", "--delimiter",
+                        "-E",
+                        "-e",
+                        "-I",
+                        "-L",
+                        "-n",
+                        "-P",
+                        "-s",
+                        "-S",
+                        "--eof",
+                        "--replace",
+                        "--max-lines",
+                        "--max-args",
+                        "--max-procs",
+                        "--max-chars",
+                        "--delimiter",
                     ],
                 );
             }
             _ => {
                 return Some(CommandView {
                     name: basename(words[index]),
+                    raw_name: words[index],
                     args: &words[index + 1..],
                     privileged,
                 });
@@ -417,8 +454,7 @@ fn classify_redirects(
 ) {
     for (index, token) in tokens.iter().enumerate() {
         let text = &source[token.range.clone()];
-        if token.kind != TokenKind::Redirect || !(text.starts_with('>') || text.starts_with("&>"))
-        {
+        if token.kind != TokenKind::Redirect || !(text.starts_with('>') || text.starts_with("&>")) {
             continue;
         }
         let target = tokens[index + 1..]
@@ -597,11 +633,11 @@ mod tests {
     fn sees_through_xargs_to_the_wrapped_command() {
         assert_eq!(classify_command("xargs rm -rf /").level, RiskLevel::High);
         assert_eq!(classify_command("xargs rm file").level, RiskLevel::Medium);
-        assert_eq!(classify_command("xargs -I{} rm {}").level, RiskLevel::Medium);
         assert_eq!(
-            classify_command("xargs -0 rm -f").level,
-            RiskLevel::High
+            classify_command("xargs -I{} rm {}").level,
+            RiskLevel::Medium
         );
+        assert_eq!(classify_command("xargs -0 rm -f").level, RiskLevel::High);
         assert_eq!(
             classify_command("xargs -n 1 rm -r dir").level,
             RiskLevel::High

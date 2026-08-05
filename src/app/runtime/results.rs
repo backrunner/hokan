@@ -62,10 +62,11 @@ pub(super) fn resolve_enter(candidate: &Candidate, activation: &Activation) -> E
     };
     let assessed = classify_command(text);
     let risk = stricter_risk(candidate.risk, assessed.level);
-    if matches!(
-        risk,
-        crate::terminal::RiskLevel::High | crate::terminal::RiskLevel::Unknown
-    ) {
+    // Only the highest-risk commands (recursive/force destructive operations
+    // and the like) gate execution behind a confirmation. Merely running an
+    // executable — including opaque lines the classifier cannot see through
+    // (`$(...)`, `eval`, substitutions) — is not dangerous by itself.
+    if matches!(risk, crate::terminal::RiskLevel::High) {
         EnterResolution::Confirm {
             text: text.clone(),
             risk,
