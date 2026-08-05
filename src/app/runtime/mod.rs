@@ -75,6 +75,23 @@ pub fn run_session(options: SessionOptions) -> crate::Result<u8> {
     let terminal_size = current_terminal_size()?;
     let overlay_height = u16::try_from(config.ui.max_rows).unwrap_or(u16::MAX).max(1);
     let debug_log = DebugLog::from_config(&paths.state_directory, &config.logging)?;
+    // Support diagnostics shortcut: `HOKAN_DEBUG_LOG=1` forces the bounded
+    // JSONL debug log on without editing the config file.
+    let debug_log = debug_log.or_else(|| {
+        (std::env::var_os("HOKAN_DEBUG_LOG").is_some_and(|value| value != "0"))
+            .then(|| {
+                DebugLog::from_config(
+                    &paths.state_directory,
+                    &crate::config::LoggingConfig {
+                        enabled: true,
+                        ..config.logging.clone()
+                    },
+                )
+                .ok()
+                .flatten()
+            })
+            .flatten()
+    });
     if let Some(log) = &debug_log {
         log.session_started(shell, terminal_size);
     }

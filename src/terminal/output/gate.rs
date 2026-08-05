@@ -118,12 +118,17 @@ impl<W: Write> OutputActor<W> {
             if marker_cycle > read_cycle {
                 break;
             }
-            if epoch != self.model.screen_epoch()
-                || !self.scanner.is_safe()
-                || self.model.alternate_screen()
-            {
+            if epoch != self.model.screen_epoch() || self.model.alternate_screen() {
                 self.pending_redisplays.pop_front();
                 continue;
+            }
+            if !self.scanner.is_safe() {
+                // The marker raced one of hokan's own frames (a sync-output
+                // transaction or an erase): the redraw bytes are still being
+                // consumed, so defer rather than drop. The drain is re-attempted
+                // after every commit and pump batch, and the convergence is
+                // recorded as soon as the scanner is safe again.
+                break;
             }
             if self.model.screen_revision() <= marker_revision {
                 break;

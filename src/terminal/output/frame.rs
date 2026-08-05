@@ -53,6 +53,9 @@ impl<W: Write> OutputActor<W> {
         self.compositor.commit(prepared)?;
         self.last_committed_ticket = Some(frame.ticket);
         self.report.committed_frames = self.report.committed_frames.saturating_add(1);
+        // Our own frame may have closed the sync-output window a deferred
+        // redisplay marker was waiting for.
+        self.observe_drain(self.last_read_cycle);
         Ok(())
     }
 
@@ -102,6 +105,9 @@ impl<W: Write> OutputActor<W> {
         self.guard.write_staged(prepared.staged())?;
         self.model.apply_hokan_frame(&prepared.staged().bytes);
         self.compositor.commit(prepared)?;
+        // Same deferred-drain kick as after a frame commit: the erase closes
+        // the sync-output window that held the redisplay marker.
+        self.observe_drain(self.last_read_cycle);
         Ok(())
     }
 

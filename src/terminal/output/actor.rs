@@ -41,6 +41,9 @@ pub struct OutputActor<W: Write> {
     pub(super) size: TerminalSize,
     pub(super) report: OutputReport,
     pub(super) debug_log: Option<DebugLog>,
+    /// Most recent pump read cycle seen from the child; lets hokan's own
+    /// commits re-attempt deferred redisplay drains.
+    pub(super) last_read_cycle: u64,
 }
 
 impl<W: Write> OutputActor<W> {
@@ -85,6 +88,7 @@ impl<W: Write> OutputActor<W> {
             size,
             report: OutputReport::default(),
             debug_log: None,
+            last_read_cycle: 0,
         }
     }
 
@@ -271,6 +275,7 @@ impl<W: Write> OutputActor<W> {
     }
 
     fn handle_child(&mut self, batch: ChildOutputBatch) -> Result<(), OutputError> {
+        self.last_read_cycle = batch.read_cycle;
         let overlay_before = self
             .compositor
             .current_key()
