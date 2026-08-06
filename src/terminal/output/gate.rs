@@ -67,9 +67,13 @@ impl<W: Write> OutputActor<W> {
         self.cursor_probe_ready = observed_position.is_some();
         self.cursor_probe_revision = None;
         self.readiness = RenderReadiness::AwaitingPromptMarker { boundary_id };
-        if observed_position.is_some() {
-            self.scanner.reset_at_trusted_boundary();
-        }
+        // The control-channel PROMPT is the trusted anchor: heal any scanner
+        // desynchronization (an overlong/invalid sequence from a crashed TUI)
+        // and drop the decoder's withheld partial marker unconditionally —
+        // not just when the prompt marker was observed, since the desync case
+        // is exactly the one where no marker can be observed anymore.
+        self.scanner.reset_at_trusted_boundary();
+        self.decoder.reset_at_trusted_boundary();
         Ok(())
     }
 

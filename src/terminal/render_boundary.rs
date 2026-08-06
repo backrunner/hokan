@@ -110,6 +110,20 @@ impl RenderBoundaryDecoder {
         };
     }
 
+    /// A fresh prompt announced over the trusted control channel is the one
+    /// place a wedge may be cleared: drop any withheld partial marker and heal
+    /// a desynchronized scanner. Without this a crashed TUI that emitted an
+    /// overlong/invalid sequence leaves the scanner `Desynchronized` forever,
+    /// every later marker passes through invisibly, and the overlay never
+    /// recovers. The withheld fragment is DROPPED, not flushed: it is an
+    /// unterminated control string the screen model never saw, so writing it
+    /// through would put the real terminal into string-swallow mode while the
+    /// model disagrees about what is on screen.
+    pub fn reset_at_trusted_boundary(&mut self) {
+        self.scanner.reset_at_trusted_boundary();
+        self.candidate.clear();
+    }
+
     pub fn feed(&mut self, bytes: &[u8]) -> DecodedChildOutput {
         let mut decoded = DecodedChildOutput::default();
         for &byte in bytes {
@@ -205,19 +219,22 @@ impl RenderBoundaryDecoder {
 
         let boundary_id = BoundaryId::new(id);
         match kind {
-            "prompt" if boundary_id == self.next_prompt => {
-                let Some(next) = self.next_prompt.checked_next() else {
+            // An AUTHENTICATED marker id ahead of the counter means markers
+            // were swallowed while the scanner was desynchronized (or raced
+            // their control message): fast-forward instead of rejecting, or
+            // the counter would never resynchronize. Ids behind the counter
+            // are replays (the prompt reprints its marker on redisplay).
+            "prompt" if boundary_id >= self.next_prompt => {
+                let Some(next) = boundary_id.checked_next() else {
                     return MarkerOutcome::Invalid;
                 };
                 self.next_prompt = next;
                 self.phase = ShellPhase::Prompt;
                 MarkerOutcome::Event(RenderBoundaryEvent::PromptRendered { boundary_id })
             }
-            "prompt" if boundary_id.checked_next() == Some(self.next_prompt) => {
-                MarkerOutcome::Consume
-            }
-            "redisplay" if boundary_id == self.next_redisplay => {
-                let Some(next) = self.next_redisplay.checked_next() else {
+            "prompt" => MarkerOutcome::Consume,
+            "redisplay" if boundary_id >= self.next_redisplay => {
+                let Some(next) = boundary_id.checked_next() else {
                     return MarkerOutcome::Invalid;
                 };
                 self.next_redisplay = next;
@@ -227,9 +244,7 @@ impl RenderBoundaryDecoder {
                     MarkerOutcome::Consume
                 }
             }
-            "redisplay" if boundary_id.checked_next() == Some(self.next_redisplay) => {
-                MarkerOutcome::Consume
-            }
+            "redisplay" => MarkerOutcome::Consume,
             _ => MarkerOutcome::Invalid,
         }
     }
@@ -300,7 +315,7 @@ mod tests {
     }
 
     #[test]
-    fn wrong_token_checksum_phase_and_id_are_byte_exact_passthrough() {
+    fn wrong_token_checksum_and_phase_are_byte_exact_passthrough() {
         let valid = encode_marker(
             &token(),
             RenderBoundaryEvent::PostRedisplay {
@@ -321,15 +336,6 @@ mod tests {
             assert!(output.boundaries.is_empty());
         }
 
-        let id_two = encode_marker(
-            &token(),
-            RenderBoundaryEvent::PromptRendered {
-                boundary_id: BoundaryId::new(2),
-            },
-        );
-        let mut decoder = RenderBoundaryDecoder::new(token());
-        assert_eq!(decoder.feed(&id_two).passthrough, id_two);
-
         let mut foreground = RenderBoundaryDecoder::new(token());
         foreground.set_foreground(true);
         let discarded = foreground.feed(&valid);
@@ -347,6 +353,33 @@ mod tests {
         let repeated = duplicate.feed(&prompt);
         assert!(repeated.passthrough.is_empty());
         assert!(repeated.boundaries.is_empty());
+    }
+
+    #[test]
+    fn authenticated_id_gaps_fast_forward_and_replays_are_consumed() {
+        let mut decoder = RenderBoundaryDecoder::new(token());
+        // Markers 1-4 were swallowed while the scanner was desynchronized:
+        // the next authenticated marker fast-forwards the counter instead of
+        // being rejected as out of order.
+        let marker = encode_marker(
+            &token(),
+            RenderBoundaryEvent::PostRedisplay {
+                boundary_id: BoundaryId::new(5),
+            },
+        );
+        assert_eq!(decoder.feed(&marker).boundaries.len(), 1);
+        // A replay behind the counter is consumed silently.
+        let replayed = decoder.feed(&marker);
+        assert!(replayed.passthrough.is_empty());
+        assert!(replayed.boundaries.is_empty());
+        // The counter keeps advancing from the fast-forwarded position.
+        let next = encode_marker(
+            &token(),
+            RenderBoundaryEvent::PostRedisplay {
+                boundary_id: BoundaryId::new(7),
+            },
+        );
+        assert_eq!(decoder.feed(&next).boundaries.len(), 1);
     }
 
     #[test]
@@ -372,5 +405,65 @@ mod tests {
         let mut decoder = RenderBoundaryDecoder::new(token());
         assert!(decoder.feed(b"\x1b]6973;").passthrough.is_empty());
         assert_eq!(decoder.finish(), b"\x1b]6973;");
+    }
+
+    #[test]
+    fn trusted_boundary_reset_heals_desynchronization_and_reanchors_ids() {
+        let mut decoder = RenderBoundaryDecoder::new(token());
+        // An invalid raw byte desynchronizes the scanner; while desynced every
+        // marker — even a valid, authenticated one — passes through invisibly.
+        assert!(decoder.feed(&[0xf5]).boundaries.is_empty());
+        let lost = encode_marker(
+            &token(),
+            RenderBoundaryEvent::PromptRendered {
+                boundary_id: BoundaryId::new(1),
+            },
+        );
+        let swallowed = decoder.feed(&lost);
+        assert_eq!(swallowed.passthrough, lost);
+        assert!(swallowed.boundaries.is_empty());
+
+        // The shell moved on: its next prompt carries id 2. The reset heals
+        // the scanner, and the authenticated id gap fast-forwards the
+        // counter, so the marker decodes.
+        let marker = encode_marker(
+            &token(),
+            RenderBoundaryEvent::PromptRendered {
+                boundary_id: BoundaryId::new(2),
+            },
+        );
+        decoder.reset_at_trusted_boundary();
+        let decoded = decoder.feed(&marker);
+        assert!(decoded.passthrough.is_empty());
+        let events: Vec<_> = decoded
+            .boundaries
+            .into_iter()
+            .map(|boundary| boundary.event)
+            .collect();
+        assert_eq!(
+            events,
+            vec![RenderBoundaryEvent::PromptRendered {
+                boundary_id: BoundaryId::new(2)
+            }]
+        );
+    }
+
+    #[test]
+    fn trusted_boundary_reset_drops_withheld_partial_marker() {
+        let marker = encode_marker(
+            &token(),
+            RenderBoundaryEvent::PromptRendered {
+                boundary_id: BoundaryId::new(1),
+            },
+        );
+        let mut decoder = RenderBoundaryDecoder::new(token());
+        // Withhold the marker head, then drop it at the trusted boundary: the
+        // remaining bytes must not reassemble into a marker afterwards.
+        let split = MARKER_PREFIX.len() + 4;
+        assert!(decoder.feed(&marker[..split]).passthrough.is_empty());
+        decoder.reset_at_trusted_boundary();
+        let rest = decoder.feed(&marker[split..]);
+        assert_eq!(rest.passthrough, marker[split..]);
+        assert!(rest.boundaries.is_empty());
     }
 }

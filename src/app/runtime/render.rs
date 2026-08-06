@@ -46,11 +46,17 @@ pub(super) fn render_current(state: &mut RuntimeState, output: &OutputHandle) ->
         // A gate whose redisplay convergence was lost (e.g. the marker raced
         // a hokan frame and was dropped) expires into `Unknown` and never
         // recovers on its own: re-anchor with a cursor probe, the same
-        // recovery path used for an idle prompt without a gate. Re-arm on
-        // every retry: `allow_cursor_probe` only enables the probe once the
+        // recovery path used for an idle prompt without a gate. The anchor
+        // confidence can ALSO be lost independently (a desynchronized byte
+        // stream invalidates the screen model while the render gate still
+        // converges), so arm the probe on either signal — gating on
+        // readiness alone deadlocks exactly that case. Re-arm on every
+        // retry: `allow_cursor_probe` only enables the probe once the
         // scanner is safe again, and this is the sole path that re-evaluates
         // it, so guarding on `need_cpr` would deadlock the recovery.
-        if matches!(output_state.readiness, RenderReadiness::Unknown) {
+        if matches!(output_state.readiness, RenderReadiness::Unknown)
+            || output_state.confidence == crate::terminal::AnchorConfidence::Unknown
+        {
             output
                 .allow_cursor_probe(state.buffer.revision)
                 .map_err(output_error)?;

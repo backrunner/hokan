@@ -11,6 +11,8 @@ use crate::{
     specs::SpecRegistry,
 };
 
+use super::argument_progress;
+
 pub struct HistoryProvider {
     index: Arc<RwLock<HistoryIndex>>,
     commands: Arc<CommandPathCache>,
@@ -50,8 +52,25 @@ impl CandidateProvider for HistoryProvider {
         };
         let now_ms = crate::history_now_ms();
         let matches = index.search(&context.buffer.text, &context.cwd, now_ms, 50);
+        // Past the command token a history row replaces the WHOLE buffer, so
+        // it is only relevant when the recorded command actually continues
+        // what is typed; substring/subsequence hits there (`docker build …`
+        // matching `kimi `) are unrelated commands and must not appear.
+        let anchor = argument_progress(context)
+            .is_some()
+            .then(|| context.buffer.text.trim_end().to_lowercase());
         let candidates = matches
             .into_iter()
+            .filter(|matched| {
+                anchor.as_ref().is_none_or(|anchor| {
+                    matched
+                        .record
+                        .command
+                        .trim()
+                        .to_lowercase()
+                        .starts_with(anchor.as_str())
+                })
+            })
             .filter(|matched| self.plausible_command(context, &matched.record.command))
             .map(|matched| {
                 let shell = matched.record.shell.to_string();
@@ -319,6 +338,55 @@ mod tests {
             .find(|candidate| candidate.display.primary == "make build")
             .expect("build candidate");
         assert_eq!(build.score.failed_penalty, 0);
+    }
+
+    #[test]
+    fn argument_position_history_must_continue_the_typed_words() {
+        let policy = HistoryPolicy::new(1024, &[]).expect("policy");
+        let mut index = HistoryIndex::default();
+        // The only row that genuinely continues `kimi `.
+        index.ingest("kimi web", 1_000, ShellKind::Zsh, None, Some(0), &policy);
+        // Contains `kimi ` as a substring, but is an unrelated command.
+        index.ingest(
+            "echo kimi rocks",
+            2_000,
+            ShellKind::Zsh,
+            None,
+            Some(0),
+            &policy,
+        );
+        // Matches `kimi ` only as a subsequence (k…i…m…i…space).
+        index.ingest(
+            "docker build -t myimage .",
+            3_000,
+            ShellKind::Zsh,
+            None,
+            Some(0),
+            &policy,
+        );
+        let provider = provider_with_executables(index, &["kimi", "docker"]);
+
+        let primaries = |text: &str| {
+            let context = context(text, None);
+            let mut primaries: Vec<_> = provider
+                .complete(&context)
+                .candidates
+                .into_iter()
+                .map(|candidate| candidate.display.primary)
+                .collect();
+            primaries.sort();
+            primaries
+        };
+
+        // Past the command token only the continuing row may surface.
+        assert_eq!(primaries("kimi "), vec!["kimi web"]);
+        assert_eq!(primaries("kimi w"), vec!["kimi web"]);
+        // On the command token itself the anchor does not apply: fuzzy
+        // history recall keeps working there.
+        assert_eq!(
+            primaries("kim"),
+            vec!["docker build -t myimage .", "echo kimi rocks", "kimi web"]
+        );
     }
 
     #[test]

@@ -1181,12 +1181,18 @@ fn overlay_recovers_after_fullscreen_apps_exit() {
     if !command_exists("zsh") {
         return;
     }
-    // name, body written after the read — clean exit, leaked sync output,
-    // leaked alternate screen (crashed TUI).
-    for (name, exit_bytes) in [
-        ("clean", "\\033[?2026l\\033[?1049l"),
-        ("leaked-sync", "\\033[?1049l"),
-        ("leaked-alt", ""),
+    // name, bytes emitted while the TUI runs, bytes emitted at exit — clean
+    // exit, leaked sync output, leaked alternate screen (crashed TUI), and an
+    // overlong control string that desynchronizes the boundary scanner.
+    for (name, during_bytes, exit_bytes) in [
+        ("clean", "", "\\033[?2026l\\033[?1049l"),
+        ("leaked-sync", "", "\\033[?1049l"),
+        ("leaked-alt", "", ""),
+        (
+            "desync",
+            "big=$(head -c 70000 /dev/zero | tr '\\0' 'a')\nprintf '\\033]52;c;%s\\007' \"$big\"\n",
+            "\\033[?2026l\\033[?1049l",
+        ),
     ] {
         let mut terminal = TerminalSession::spawn();
         terminal.wait_for_screen("HK> ");
@@ -1195,7 +1201,7 @@ fn overlay_recovers_after_fullscreen_apps_exit() {
         fs::write(
             &fixture,
             format!(
-                "#!/bin/sh\nprintf '\\033[?1049h\\033[?2026hTUI_{name}\\r\\n'\nIFS= read -r key\nprintf '{exit_bytes}'\n"
+                "#!/bin/sh\nprintf '\\033[?1049h\\033[?2026hTUI_{name}\\r\\n'\n{during_bytes}IFS= read -r key\nprintf '{exit_bytes}'\n"
             ),
         )
         .expect("tui fixture");
@@ -1545,6 +1551,42 @@ fn bare_executable_waits_for_space_before_suggesting() {
 }
 
 #[test]
+fn argument_position_excludes_unrelated_history_commands() {
+    if !command_exists("zsh") {
+        return;
+    }
+    let mut terminal = TerminalSession::spawn();
+    fs::write(terminal._work.path().join("HKARG_MARKER.txt"), b"marker\n").expect("marker file");
+    terminal.wait_for_screen("HK> ");
+    terminal.settle(Duration::from_millis(300));
+
+    // Seed an unrelated history line that matches `whoami ` only as a fuzzy
+    // subsequence (w…h…o…a…m…i…space). It must never surface as an argument
+    // of `whoami`.
+    terminal.write(b"echo who am i HKARG_JUNK\r");
+    terminal.wait_for_bare_row("who am i HKARG_JUNK");
+
+    terminal.write(b"whoami ");
+    // Argument completion kicks in: the cwd marker file appears as a row.
+    terminal.wait_for_screen("HKARG_MARKER.txt");
+    terminal.settle(Duration::from_millis(300));
+
+    let text = terminal.screen_text();
+    let overlay_rows: Vec<_> = text.lines().filter(|line| line.contains('│')).collect();
+    assert!(
+        !overlay_rows.is_empty(),
+        "expected overlay rows after `whoami `:\n{text}"
+    );
+    assert!(
+        overlay_rows.iter().all(|line| !line.contains("HKARG_JUNK")),
+        "unrelated history command leaked into the argument list:\n{text}"
+    );
+
+    terminal.exit_shell();
+    terminal.wait_until_exit();
+}
+
+#[test]
 fn git_suggests_immediately_and_uses_repository_state() {
     if !command_exists("zsh") || !command_exists("git") {
         return;
@@ -1584,6 +1626,66 @@ fn deleting_to_an_empty_buffer_hides_the_overlay() {
         text.contains("HK> "),
         "prompt must still be present:\n{text}"
     );
+
+    terminal.exit_shell();
+    terminal.wait_until_exit();
+}
+
+#[test]
+fn rapid_typing_and_backspacing_still_surfaces_the_overlay() {
+    if !command_exists("zsh") {
+        return;
+    }
+    let mut terminal = TerminalSession::spawn();
+    terminal.wait_for_screen("HK> ");
+    terminal.settle(Duration::from_millis(300));
+
+    // Seed two history rows so every burst below has a prefix-matchable
+    // candidate at its final buffer.
+    terminal.write(b"echo HKBURST_alpha\r");
+    terminal.wait_for_bare_row("HKBURST_alpha");
+    terminal.write(b"echo HKBURST_beta\r");
+    terminal.wait_for_bare_row("HKBURST_beta");
+    terminal.settle(Duration::from_millis(300));
+
+    // Bursts that mix fast typing and backspacing arrive as batched pty
+    // input: buffer events, gates, queries and provider results race. Once
+    // the burst ends on a completable buffer the overlay must reliably come
+    // back — a lost gate or a swallowed repaint leaves it invisible.
+    for round in 0..6 {
+        // One write: type "ls -la", erase it entirely, retype "ls ".
+        terminal.write(b"ls -la\x7f\x7f\x7f\x7f\x7f\x7fls ");
+        terminal.wait_for_screen(TAG_SPEC);
+        let text = terminal.screen_text();
+        assert!(
+            text.contains("HK> ls"),
+            "round {round}: edit line lost:\n{text}"
+        );
+        terminal.write(b"\x15");
+        terminal.settle(Duration::from_millis(200));
+
+        // Per-byte writes with no pacing: fast manual typing with a typo and
+        // a backspace correction; lands on a history prefix.
+        for byte in b"echo HKBURST_alx\x7fp" {
+            terminal.write(std::slice::from_ref(byte));
+        }
+        terminal.wait_for_screen("echo HKBURST_alpha");
+        terminal.write(b"\x15");
+        terminal.settle(Duration::from_millis(200));
+
+        // Empty the buffer mid-burst, then retype in one write.
+        terminal.write(b"echo HKB\x7f\x7f\x7f\x7f\x7f\x7f\x7fecho HKBURST_b");
+        terminal.wait_for_screen("echo HKBURST_beta");
+        terminal.write(b"\x15");
+        terminal.settle(Duration::from_millis(200));
+
+        // End the burst ON backspaces: overshoot the target, erase back to a
+        // completable prefix.
+        terminal.write(b"echo HKBURST_beta\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f");
+        terminal.wait_for_screen("echo HKBURST_beta");
+        terminal.write(b"\x15");
+        terminal.settle(Duration::from_millis(200));
+    }
 
     terminal.exit_shell();
     terminal.wait_until_exit();

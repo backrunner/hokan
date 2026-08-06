@@ -182,9 +182,13 @@ impl CandidateProvider for CommandHelpProvider {
         let candidates = entries
             .iter()
             .map(|entry| {
+                // The edit inserts only the bare word, but the row displays
+                // the full command line (`kimi export`) so the list reads as
+                // arguments of THIS command — bare words (`export`) look like
+                // unrelated commands next to history rows.
                 Candidate::new(
                     context.query_id,
-                    entry.name.as_str(),
+                    format!("{command} {}", entry.name),
                     entry.description.as_str(),
                     Some(TextEdit {
                         range: context.parsed.replacement.clone(),
@@ -1115,7 +1119,7 @@ Options:
         let checkout = output
             .candidates
             .iter()
-            .find(|candidate| candidate.display.primary == "checkout")
+            .find(|candidate| candidate.display.primary == "git checkout")
             .expect("checkout candidate");
         assert_eq!(checkout.source, CandidateSource::CommandHelp);
         assert!(matches!(
@@ -1132,7 +1136,7 @@ Options:
         let flag = output
             .candidates
             .iter()
-            .find(|candidate| candidate.display.primary == "--paginate")
+            .find(|candidate| candidate.display.primary == "git --paginate")
             .expect("flag candidate");
         assert!(matches!(flag.action, CandidateAction::Insert));
         assert_eq!(flag.edit.as_ref().expect("edit").range, 4..7);
