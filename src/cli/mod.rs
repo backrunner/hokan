@@ -2,6 +2,7 @@ mod ai;
 mod config;
 mod doctor;
 mod history;
+mod install;
 mod integration;
 mod specs;
 mod upgrade;
@@ -39,19 +40,29 @@ enum Command {
         shell: ShellKind,
     },
 
-    /// Add the integration block to a shell rc file, with a backup.
-    Setup {
+    /// Install Hokan for the selected shell, with an rc-file backup.
+    #[command(visible_alias = "setup")]
+    Install {
+        /// Write integration to this file instead of the shell default.
         #[arg(long)]
         rc_file: Option<PathBuf>,
-        /// Install only an `hk` alias instead of auto-starting Hokan.
+        /// Install only an `hk` command instead of auto-starting Hokan.
         #[arg(long)]
         on_demand: bool,
+        /// Record a release-installer-owned binary for complete uninstallation.
+        #[arg(long, hide = true)]
+        managed_install: bool,
+        /// Man page owned by the release installer.
+        #[arg(long, hide = true, requires = "managed_install")]
+        man_page: Option<PathBuf>,
     },
 
-    /// Remove only Hokan's integration block, with a backup.
+    /// Remove Hokan; installer-managed binaries are removed, while user data is preserved.
     Uninstall {
+        /// Remove shell integration only, preserving the executable.
         #[arg(long)]
         integration_only: bool,
+        /// Remove integration from this file instead of the shell default.
         #[arg(long)]
         rc_file: Option<PathBuf>,
     },
@@ -186,21 +197,27 @@ pub fn run<W: Write>(cli: Cli, output: &mut W) -> crate::Result<Option<SessionOp
             output.write_all(crate::shell::init_script(shell).as_bytes())?;
             Ok(None)
         }
-        Some(Command::Setup { rc_file, on_demand }) => {
-            integration::setup(output, session.shell, rc_file.as_deref(), on_demand)?;
+        Some(Command::Install {
+            rc_file,
+            on_demand,
+            managed_install,
+            man_page,
+        }) => {
+            install::run_install(
+                output,
+                session.shell,
+                rc_file.as_deref(),
+                on_demand,
+                managed_install,
+                man_page.as_deref(),
+            )?;
             Ok(None)
         }
         Some(Command::Uninstall {
             integration_only,
             rc_file,
         }) => {
-            if !integration_only {
-                return Err(crate::Error::Config(
-                    "uninstall requires --integration-only; data is never removed implicitly"
-                        .into(),
-                ));
-            }
-            integration::uninstall(output, session.shell, rc_file.as_deref())?;
+            install::run_uninstall(output, session.shell, rc_file.as_deref(), integration_only)?;
             Ok(None)
         }
         Some(Command::Doctor { json }) => {
@@ -275,6 +292,34 @@ mod tests {
         let output = String::from_utf8(output).expect("UTF-8 script");
         assert!(output.contains("protocol 2"));
         assert!(output.contains("BUFFER"));
+    }
+
+    #[test]
+    fn install_is_primary_and_setup_remains_an_alias() {
+        for command in ["install", "setup"] {
+            let cli = Cli::try_parse_from(["hokan", command, "--on-demand"])
+                .expect("install command should parse");
+            assert!(matches!(
+                cli.command,
+                Some(Command::Install {
+                    on_demand: true,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn uninstall_no_longer_requires_integration_only() {
+        let cli =
+            Cli::try_parse_from(["hokan", "uninstall"]).expect("plain uninstall should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Uninstall {
+                integration_only: false,
+                ..
+            })
+        ));
     }
 
     #[test]

@@ -12,32 +12,49 @@ use crate::shell::{PROTOCOL_VERSION, ShellKind};
 pub(crate) const START: &str = "# >>> hokan integration >>>";
 pub(crate) const END: &str = "# <<< hokan integration <<<";
 // Legacy markers written by the pre-rename `hokann` beta. New installs always
-// use the `hokan` markers above, but `setup`/`uninstall` must still recognize
+// use the `hokan` markers above, but install/uninstall must still recognize
 // these so beta users who ran the old `hokann setup` are not stranded with an
 // unremovable block.
 const LEGACY_START: &str = "# >>> hokann integration >>>";
 const LEGACY_END: &str = "# <<< hokann integration <<<";
 const SHELL_RC_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
-pub fn setup(
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct IntegrationTarget {
+    pub shell: ShellKind,
+    pub path: PathBuf,
+}
+
+#[cfg(test)]
+pub fn install(
     output: &mut dyn Write,
     requested_shell: Option<ShellKind>,
     requested_path: Option<&Path>,
     on_demand: bool,
-) -> crate::Result<()> {
+) -> crate::Result<IntegrationTarget> {
+    install_with_executable(
+        output,
+        requested_shell,
+        requested_path,
+        on_demand,
+        &env::current_exe()?,
+    )
+}
+
+pub(crate) fn install_with_executable(
+    output: &mut dyn Write,
+    requested_shell: Option<ShellKind>,
+    requested_path: Option<&Path>,
+    on_demand: bool,
+    executable: &Path,
+) -> crate::Result<IntegrationTarget> {
     let shell = resolve_shell(requested_shell, requested_path)?;
-    if on_demand && shell == ShellKind::Fish {
-        return Err(crate::Error::Config(
-            "--on-demand is not supported for fish yet; run `hokan setup --shell fish` without it"
-                .into(),
-        ));
-    }
     let requested_path = requested_path
         .map(Path::to_owned)
         .map_or_else(|| default_rc_path(shell), Ok)?;
     let path = resolve_rc_target(&requested_path)?;
     let original = read_optional_utf8(&path)?;
-    let block = integration_block(shell, &env::current_exe()?, on_demand);
+    let block = integration_block(shell, executable, &path, on_demand);
     let existing = block_range(&original)?;
     let action = if existing.is_some() {
         "updated"
@@ -45,30 +62,15 @@ pub fn setup(
         "installed"
     };
     let mut updated = original.clone();
-    if shell == ShellKind::Zsh {
-        if let Some(range) = existing {
-            updated.replace_range(range, "");
-        }
-        updated.insert_str(0, &block);
-    } else if let Some(range) = existing {
-        let replacement = if updated[range.clone()].starts_with('\n') {
-            format!("\n{block}")
-        } else {
-            block
-        };
-        updated.replace_range(range, &replacement);
-    } else {
-        if !updated.is_empty() && !updated.ends_with('\n') {
-            updated.push('\n');
-        }
-        if !updated.is_empty() {
-            updated.push('\n');
-        }
-        updated.push_str(&block);
+    if let Some(range) = existing {
+        updated.replace_range(range, "");
     }
+    // Auto-start must run before user configuration in every supported shell.
+    // The Hokan child then loads the user's rc file once with HOKAN_ACTIVE set.
+    updated.insert_str(0, &block);
     if updated == original {
         writeln!(output, "already installed: {}", path.display())?;
-        return Ok(());
+        return Ok(IntegrationTarget { shell, path });
     }
     let backup = backup_existing(&path)?;
     atomic_write(&path, updated.as_bytes())?;
@@ -84,18 +86,18 @@ pub fn setup(
     } else {
         writeln!(
             output,
-            "tip: `hokan setup --shell {} --on-demand` installs an `hk` alias instead of auto-starting Hokan",
+            "tip: `hokan install --shell {} --on-demand` installs an `hk` command instead of auto-starting Hokan",
             shell.name()
         )?;
     }
-    Ok(())
+    Ok(IntegrationTarget { shell, path })
 }
 
 pub fn uninstall(
     output: &mut dyn Write,
     requested_shell: Option<ShellKind>,
     requested_path: Option<&Path>,
-) -> crate::Result<()> {
+) -> crate::Result<IntegrationTarget> {
     let shell = resolve_shell(requested_shell, requested_path)?;
     let requested_path = requested_path
         .map(Path::to_owned)
@@ -104,7 +106,7 @@ pub fn uninstall(
     let original = read_optional_utf8(&path)?;
     let Some(range) = block_range(&original)? else {
         writeln!(output, "integration not present: {}", path.display())?;
-        return Ok(());
+        return Ok(IntegrationTarget { shell, path });
     };
 
     let mut updated = original;
@@ -118,7 +120,7 @@ pub fn uninstall(
     if let Some(backup) = backup {
         writeln!(output, "backup: {}", backup.display())?;
     }
-    Ok(())
+    Ok(IntegrationTarget { shell, path })
 }
 
 fn resolve_shell(
@@ -153,39 +155,79 @@ fn default_rc_path(shell: ShellKind) -> crate::Result<PathBuf> {
     let home = env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| crate::Error::Config("$HOME is not set".into()))?;
-    Ok(match shell {
-        ShellKind::Zsh => home.join(".zshrc"),
-        ShellKind::Bash => home.join(".bashrc"),
-        ShellKind::Fish => env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".config"))
-            .join("fish/config.fish"),
-    })
+    let config_home = env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".config"));
+    let zdotdir = env::var_os("ZDOTDIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.clone());
+    Ok(default_rc_path_for(
+        shell,
+        &home,
+        &config_home,
+        &zdotdir,
+        cfg!(target_os = "macos"),
+    ))
 }
 
-fn integration_block(shell: ShellKind, executable: &Path, on_demand: bool) -> String {
+fn default_rc_path_for(
+    shell: ShellKind,
+    home: &Path,
+    config_home: &Path,
+    zdotdir: &Path,
+    macos: bool,
+) -> PathBuf {
+    match shell {
+        ShellKind::Zsh => zdotdir.join(".zshrc"),
+        ShellKind::Bash if macos => home.join(".bash_profile"),
+        ShellKind::Bash => home.join(".bashrc"),
+        ShellKind::Fish => config_home.join("fish/config.fish"),
+    }
+}
+
+fn integration_block(
+    shell: ShellKind,
+    executable: &Path,
+    rc_file: &Path,
+    on_demand: bool,
+) -> String {
     if on_demand {
-        // Non-invasive mode: only an `hk` alias, no exec, no shell replacement.
-        // The absolute binary path is pinned the same way the auto-exec block
-        // pins `__hokan_setup_bin`. Fish is rejected by `setup` before this.
-        let alias_value = format!("{} --shell {}", executable.to_string_lossy(), shell.name());
-        return format!(
-            "{START}\n# protocol {PROTOCOL_VERSION}; managed by `hokan setup` (on-demand)\nalias hk='{}'\n{END}\n",
-            alias_value.replace('\'', "'\\''")
-        );
+        return on_demand_block(shell, executable, rc_file);
     }
     let executable = quote_shell_word(executable);
+    let rc_file = quote_shell_word(rc_file);
     let command = match shell {
         ShellKind::Fish => format!(
-            "set -l __hokan_setup_bin {executable}\n\
-             if set -q HOKAN_BIN\n\
-               command \"$HOKAN_BIN\" init fish | source\n\
-             else\n\
-               command \"$__hokan_setup_bin\" init fish | source\n\
+            "begin\n\
+               set -l __hokan_setup_bin {executable}\n\
+               set -l __hokan_setup_dir (path dirname \"$__hokan_setup_bin\")\n\
+               contains -- \"$__hokan_setup_dir\" $PATH; or set -gx PATH \"$__hokan_setup_dir\" $PATH\n\
+               set -l __hokan_bin \"$__hokan_setup_bin\"\n\
+               if set -q HOKAN_BIN; and test -n \"$HOKAN_BIN\"\n\
+                 set __hokan_bin \"$HOKAN_BIN\"\n\
+               end\n\
+               set -l __hokan_active ''\n\
+               set -q HOKAN_ACTIVE; and set __hokan_active \"$HOKAN_ACTIVE\"\n\
+               set -l __hokan_auto_start 1\n\
+               set -q HOKAN_AUTO_START; and set __hokan_auto_start \"$HOKAN_AUTO_START\"\n\
+               set -l __hokan_term dumb\n\
+               set -q TERM; and set __hokan_term \"$TERM\"\n\
+               if test \"$__hokan_auto_start\" != 0\n\
+                 and test -z \"$__hokan_active\"\n\
+                 and status is-interactive\n\
+                 and isatty stdin\n\
+                 and isatty stdout\n\
+                 and test \"$__hokan_term\" != dumb\n\
+                 and test -x \"$__hokan_bin\"\n\
+                 exec \"$__hokan_bin\" --shell fish\n\
+               end\n\
              end"
         ),
         ShellKind::Zsh => format!(
             "__hokan_setup_bin={executable}\n\
+             __hokan_setup_dir=${{__hokan_setup_bin:h}}\n\
+             [[ -d \"$__hokan_setup_dir\" ]] && path=(\"$__hokan_setup_dir\" ${{path:#\"$__hokan_setup_dir\"}})\n\
              __hokan_bin=${{HOKAN_BIN:-$__hokan_setup_bin}}\n\
              if [[ ${{HOKAN_AUTO_START:-1}} != 0\n\
                    && -z ${{HOKAN_ACTIVE:-}}\n\
@@ -197,15 +239,78 @@ fn integration_block(shell: ShellKind, executable: &Path, on_demand: bool) -> St
                    && -x \"$__hokan_bin\" ]]; then\n\
                exec \"$__hokan_bin\" --shell zsh\n\
              fi\n\
-             unset __hokan_bin __hokan_setup_bin"
+             unset __hokan_bin __hokan_setup_dir __hokan_setup_bin"
         ),
         ShellKind::Bash => format!(
             "__hokan_setup_bin={executable}\n\
-             eval \"$(\"${{HOKAN_BIN:-$__hokan_setup_bin}}\" init bash)\"\n\
-             unset __hokan_setup_bin"
+             __hokan_setup_rc={rc_file}\n\
+             __hokan_setup_dir=${{__hokan_setup_bin%/*}}\n\
+             case :$PATH: in\n\
+               *:\"$__hokan_setup_dir\":*) ;;\n\
+               *) export PATH=\"$__hokan_setup_dir:$PATH\" ;;\n\
+             esac\n\
+             __hokan_bin=${{HOKAN_BIN:-$__hokan_setup_bin}}\n\
+             if [[ ${{HOKAN_AUTO_START:-1}} != 0\n\
+                   && -z ${{HOKAN_ACTIVE:-}}\n\
+                   && $- == *i*\n\
+                   && -z ${{BASH_EXECUTION_STRING:-}}\n\
+                   && -t 0\n\
+                   && -t 1\n\
+                   && ${{TERM:-dumb}} != dumb\n\
+                   && -x \"$__hokan_bin\" ]]; then\n\
+               export HOKAN_BASH_STARTUP_FILE=\"$__hokan_setup_rc\"\n\
+               exec \"$__hokan_bin\" --shell bash\n\
+             fi\n\
+             unset __hokan_bin __hokan_setup_dir __hokan_setup_rc __hokan_setup_bin"
         ),
     };
-    format!("{START}\n# protocol {PROTOCOL_VERSION}; managed by `hokan setup`\n{command}\n{END}\n")
+    format!(
+        "{START}\n# protocol {PROTOCOL_VERSION}; managed by `hokan install`\n{command}\n{END}\n"
+    )
+}
+
+fn on_demand_block(shell: ShellKind, executable: &Path, rc_file: &Path) -> String {
+    let executable = quote_shell_word(executable);
+    let rc_file = quote_shell_word(rc_file);
+    let command = match shell {
+        ShellKind::Fish => format!(
+            "begin\n\
+               set -l __hokan_setup_bin {executable}\n\
+               set -l __hokan_setup_dir (path dirname \"$__hokan_setup_bin\")\n\
+               contains -- \"$__hokan_setup_dir\" $PATH; or set -gx PATH \"$__hokan_setup_dir\" $PATH\n\
+               function hk --description 'Start Hokan'\n\
+                 command {executable} --shell fish $argv\n\
+               end\n\
+             end"
+        ),
+        ShellKind::Zsh => format!(
+            "__hokan_setup_bin={executable}\n\
+             __hokan_setup_dir=${{__hokan_setup_bin%/*}}\n\
+             case :$PATH: in\n\
+               *:\"$__hokan_setup_dir\":*) ;;\n\
+               *) export PATH=\"$__hokan_setup_dir:$PATH\" ;;\n\
+             esac\n\
+             hk() {{\n\
+               command {executable} --shell zsh \"$@\"\n\
+             }}\n\
+             unset __hokan_setup_dir __hokan_setup_bin"
+        ),
+        ShellKind::Bash => format!(
+            "__hokan_setup_bin={executable}\n\
+             __hokan_setup_dir=${{__hokan_setup_bin%/*}}\n\
+             case :$PATH: in\n\
+               *:\"$__hokan_setup_dir\":*) ;;\n\
+               *) export PATH=\"$__hokan_setup_dir:$PATH\" ;;\n\
+             esac\n\
+             hk() {{\n\
+               HOKAN_BASH_STARTUP_FILE={rc_file} command {executable} --shell bash \"$@\"\n\
+             }}\n\
+             unset __hokan_setup_dir __hokan_setup_bin"
+        ),
+    };
+    format!(
+        "{START}\n# protocol {PROTOCOL_VERSION}; managed by `hokan install` (on-demand)\n{command}\n{END}\n"
+    )
 }
 
 fn quote_shell_word(path: &Path) -> String {
@@ -374,12 +479,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn setup_is_idempotent_and_uninstall_restores_user_content() {
+    fn install_is_idempotent_and_uninstall_restores_user_content() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = directory.path().join(".zshrc");
         fs::write(&path, "export USER_VALUE=1\n").expect("fixture");
         let mut output = Vec::new();
-        setup(&mut output, Some(ShellKind::Zsh), Some(&path), false).expect("setup");
+        install(&mut output, Some(ShellKind::Zsh), Some(&path), false).expect("install");
         let once = fs::read_to_string(&path).expect("installed file");
         assert!(once.starts_with(START));
         assert!(once.find(END) < once.find("export USER_VALUE=1"));
@@ -387,7 +492,7 @@ mod tests {
         assert!(!once.contains("init zsh"));
         assert!(once.contains("HOKAN_AUTO_START"));
         assert!(once.contains(r#"exec "$__hokan_bin" --shell zsh"#));
-        setup(&mut output, Some(ShellKind::Zsh), Some(&path), false).expect("idempotent setup");
+        install(&mut output, Some(ShellKind::Zsh), Some(&path), false).expect("idempotent install");
         assert_eq!(fs::read_to_string(&path).expect("same file"), once);
         uninstall(&mut output, Some(ShellKind::Zsh), Some(&path)).expect("uninstall");
         assert_eq!(
@@ -399,7 +504,7 @@ mod tests {
     }
 
     #[test]
-    fn setup_upgrades_managed_blocks_and_preserves_symlinked_rc_files() {
+    fn install_upgrades_managed_blocks_and_preserves_symlinked_rc_files() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let target = directory.path().join("dotfiles/zshrc");
         fs::create_dir(target.parent().expect("target parent")).expect("target directory");
@@ -414,7 +519,7 @@ mod tests {
         std::os::unix::fs::symlink(&target, &path).expect("rc symlink");
 
         let mut output = Vec::new();
-        setup(&mut output, Some(ShellKind::Zsh), Some(&path), false).expect("upgrade setup");
+        install(&mut output, Some(ShellKind::Zsh), Some(&path), false).expect("upgrade install");
         assert!(
             fs::symlink_metadata(&path)
                 .expect("symlink")
@@ -433,7 +538,7 @@ mod tests {
     }
 
     #[test]
-    fn setup_never_follows_or_overwrites_an_existing_backup_path() {
+    fn install_never_follows_or_overwrites_an_existing_backup_path() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = directory.path().join(".zshrc");
         fs::write(&path, "export USER_VALUE=1\n").expect("fixture");
@@ -442,7 +547,7 @@ mod tests {
         std::os::unix::fs::symlink(&symlink_target, &first_backup)
             .expect("dangling backup symlink");
 
-        setup(&mut Vec::new(), Some(ShellKind::Zsh), Some(&path), false).expect("setup");
+        install(&mut Vec::new(), Some(ShellKind::Zsh), Some(&path), false).expect("install");
 
         assert!(
             fs::symlink_metadata(&first_backup)
@@ -460,7 +565,7 @@ mod tests {
         let path = directory.path().join("config.fish");
         fs::write(&path, format!("{START}\nmissing end\n")).expect("fixture");
         let before = fs::read(&path).expect("before");
-        assert!(setup(&mut Vec::new(), Some(ShellKind::Fish), Some(&path), false).is_err());
+        assert!(install(&mut Vec::new(), Some(ShellKind::Fish), Some(&path), false).is_err());
         assert_eq!(fs::read(&path).expect("after"), before);
     }
 
@@ -483,7 +588,7 @@ mod tests {
             "export USER_VALUE=1\n"
         );
 
-        // `setup` must also upgrade a legacy-marked block in place, replacing
+        // `install` must also upgrade a legacy-marked block in place, replacing
         // the old `hokann` markers with the current ones.
         fs::write(
             &path,
@@ -492,7 +597,8 @@ mod tests {
             ),
         )
         .expect("legacy integration fixture");
-        setup(&mut output, Some(ShellKind::Zsh), Some(&path), false).expect("setup over legacy");
+        install(&mut output, Some(ShellKind::Zsh), Some(&path), false)
+            .expect("install over legacy");
         let upgraded = fs::read_to_string(&path).expect("upgraded content");
         assert!(upgraded.starts_with(START));
         assert!(!upgraded.contains(LEGACY_START));
@@ -510,19 +616,19 @@ mod tests {
     }
 
     #[test]
-    fn on_demand_setup_installs_alias_only_block() {
+    fn on_demand_install_installs_command_only_block() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = directory.path().join(".zshrc");
         fs::write(&path, "export USER_VALUE=1\n").expect("fixture");
 
         let mut output = Vec::new();
-        setup(&mut output, Some(ShellKind::Zsh), Some(&path), true).expect("on-demand setup");
+        install(&mut output, Some(ShellKind::Zsh), Some(&path), true).expect("on-demand install");
         let installed = fs::read_to_string(&path).expect("installed file");
         assert!(installed.starts_with(START));
         let block = &installed[..installed.find(END).expect("end marker") + END.len()];
         assert!(block.contains("(on-demand)"));
-        assert!(block.contains("alias hk='"));
-        assert!(block.contains(" --shell zsh'\n"));
+        assert!(block.contains("hk() {"));
+        assert!(block.contains("--shell zsh"));
         assert!(!block.contains("exec"));
         assert!(!block.contains("HOKAN_AUTO_START"));
         // User content below the block is untouched.
@@ -539,26 +645,26 @@ mod tests {
     }
 
     #[test]
-    fn setup_switches_between_auto_exec_and_on_demand_modes() {
+    fn install_switches_between_auto_exec_and_on_demand_modes() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = directory.path().join(".zshrc");
         fs::write(&path, "export USER_VALUE=1\n").expect("fixture");
         let mut output = Vec::new();
 
-        setup(&mut output, Some(ShellKind::Zsh), Some(&path), false).expect("auto-exec setup");
+        install(&mut output, Some(ShellKind::Zsh), Some(&path), false).expect("auto-exec install");
         let auto_exec = fs::read_to_string(&path).expect("auto-exec file");
         assert!(auto_exec.contains(r#"exec "$__hokan_bin" --shell zsh"#));
-        assert!(!auto_exec.contains("alias hk="));
+        assert!(!auto_exec.contains("hk() {"));
 
         // Downgrade to on-demand: the managed block is replaced, user content kept.
-        setup(&mut output, Some(ShellKind::Zsh), Some(&path), true).expect("on-demand setup");
+        install(&mut output, Some(ShellKind::Zsh), Some(&path), true).expect("on-demand install");
         let on_demand = fs::read_to_string(&path).expect("on-demand file");
-        assert!(on_demand.contains("alias hk='"));
+        assert!(on_demand.contains("hk() {"));
         assert!(!on_demand.contains("exec \"$__hokan_bin\""));
         assert!(on_demand.ends_with("export USER_VALUE=1\n"));
 
         // Upgrade back to auto-exec.
-        setup(&mut output, Some(ShellKind::Zsh), Some(&path), false).expect("auto-exec again");
+        install(&mut output, Some(ShellKind::Zsh), Some(&path), false).expect("auto-exec again");
         assert_eq!(
             fs::read_to_string(&path).expect("auto-exec restored"),
             auto_exec
@@ -566,22 +672,75 @@ mod tests {
     }
 
     #[test]
-    fn on_demand_setup_supports_bash_and_rejects_fish() {
+    fn on_demand_install_supports_bash_and_fish() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let bashrc = directory.path().join(".bashrc");
         fs::write(&bashrc, "export USER_VALUE=1\n").expect("fixture");
-        setup(&mut Vec::new(), Some(ShellKind::Bash), Some(&bashrc), true)
-            .expect("bash on-demand setup");
+        install(&mut Vec::new(), Some(ShellKind::Bash), Some(&bashrc), true)
+            .expect("bash on-demand install");
         let installed = fs::read_to_string(&bashrc).expect("installed bashrc");
-        assert!(installed.contains("alias hk='"));
-        assert!(installed.contains(" --shell bash'\n"));
+        assert!(installed.contains("hk() {"));
+        assert!(installed.contains("--shell bash"));
+        assert!(installed.contains("HOKAN_BASH_STARTUP_FILE="));
 
         let fishrc = directory.path().join("config.fish");
         fs::write(&fishrc, "set USER_VALUE 1\n").expect("fixture");
-        let before = fs::read(&fishrc).expect("before");
-        let error = setup(&mut Vec::new(), Some(ShellKind::Fish), Some(&fishrc), true)
-            .expect_err("fish on-demand must be rejected");
-        assert!(error.to_string().contains("--on-demand"));
-        assert_eq!(fs::read(&fishrc).expect("after"), before);
+        install(&mut Vec::new(), Some(ShellKind::Fish), Some(&fishrc), true)
+            .expect("fish on-demand install");
+        let installed = fs::read_to_string(&fishrc).expect("installed fish config");
+        assert!(installed.starts_with(START));
+        assert!(installed.contains("function hk"));
+        assert!(installed.contains("--shell fish $argv"));
+        assert!(installed.ends_with("set USER_VALUE 1\n"));
+    }
+
+    #[test]
+    fn auto_start_is_installed_before_user_config_for_every_shell() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        for (shell, name, expected) in [
+            (ShellKind::Zsh, ".zshrc", "--shell zsh"),
+            (ShellKind::Bash, ".bashrc", "--shell bash"),
+            (ShellKind::Fish, "config.fish", "--shell fish"),
+        ] {
+            let path = directory.path().join(name);
+            fs::write(&path, "USER_CONFIG_SENTINEL\n").expect("fixture");
+            install(&mut Vec::new(), Some(shell), Some(&path), false).expect("install");
+            let installed = fs::read_to_string(&path).expect("installed config");
+            assert!(installed.starts_with(START));
+            assert!(installed.contains(expected));
+            assert!(installed.contains("HOKAN_ACTIVE"));
+            if shell == ShellKind::Bash {
+                assert!(installed.contains("HOKAN_BASH_STARTUP_FILE="));
+                assert!(
+                    installed.contains(path.to_string_lossy().as_ref()),
+                    "expected rc path {} in {installed:?}",
+                    path.display()
+                );
+            }
+            assert!(installed.ends_with("USER_CONFIG_SENTINEL\n"));
+        }
+    }
+
+    #[test]
+    fn default_paths_cover_macos_linux_zdotdir_and_xdg_fish() {
+        let home = Path::new("/home/tester");
+        let config = Path::new("/xdg/config");
+        let zdotdir = Path::new("/dotfiles/zsh");
+        assert_eq!(
+            default_rc_path_for(ShellKind::Zsh, home, config, zdotdir, false),
+            zdotdir.join(".zshrc")
+        );
+        assert_eq!(
+            default_rc_path_for(ShellKind::Bash, home, config, zdotdir, false),
+            home.join(".bashrc")
+        );
+        assert_eq!(
+            default_rc_path_for(ShellKind::Bash, home, config, zdotdir, true),
+            home.join(".bash_profile")
+        );
+        assert_eq!(
+            default_rc_path_for(ShellKind::Fish, home, config, zdotdir, false),
+            config.join("fish/config.fish")
+        );
     }
 }

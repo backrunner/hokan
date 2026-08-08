@@ -197,8 +197,11 @@ impl ShellSession {
     ) -> crate::Result<()> {
         let rc_path = self.directory.path().join("bashrc");
         let mut script = String::new();
-        if source_user_config && let Some(home) = home_directory() {
-            let original = home.join(".bashrc");
+        if source_user_config
+            && let Some(original) = env::var_os("HOKAN_BASH_STARTUP_FILE")
+                .map(PathBuf::from)
+                .or_else(|| home_directory().map(|home| home.join(".bashrc")))
+        {
             script.push_str(&source_if_readable(&original, "source"));
         }
         script.push_str(&source_if_readable(&self.init_path, "source"));

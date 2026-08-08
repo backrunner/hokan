@@ -138,8 +138,8 @@ pub fn run_session(options: SessionOptions) -> crate::Result<u8> {
 
     let (history_store, history_index, history_policy, history_cursor) =
         load_history(&paths, &config, shell)?;
-    let (engine, specs, commands, _help) =
-        build_engine(&paths, &config, Arc::clone(&history_index));
+    let (engine, specs, commands, help, aliases) =
+        build_engine(&paths, &config, Arc::clone(&history_index), None);
     let worker = ProviderWorker::start(engine, debug_log.clone())?;
     let (ai_sender, ai_receiver) = unbounded();
     let mut state = RuntimeState::new(
@@ -153,7 +153,9 @@ pub fn run_session(options: SessionOptions) -> crate::Result<u8> {
         new_history_session_id()?,
         debug_log,
         commands,
+        aliases,
         specs,
+        help,
     );
     let mut decoder = InputDecoder::default();
     let mut reply_router = TerminalReplyRouter::default();
@@ -267,6 +269,7 @@ pub fn run_session(options: SessionOptions) -> crate::Result<u8> {
             )?;
         }
         maybe_probe_cursor(&mut state, &mut reply_router, output.handle())?;
+        state.refresh_help_results(&worker)?;
         flush_scheduled_frame(&mut state, output.handle())?;
         flush_pending_history(&mut state, &history_store)?;
         handle_config_reload(

@@ -265,6 +265,20 @@ impl HistoryIndex {
 
     #[must_use]
     pub fn search(&self, query: &str, cwd: &Path, now_ms: i64, limit: usize) -> Vec<HistoryMatch> {
+        self.search_filtered(query, cwd, now_ms, limit, |_| true)
+    }
+
+    /// Search history after removing records that cannot participate in the
+    /// current completion context. Filtering before the bounded top-k keeps
+    /// noisy or stale rows from crowding relevant candidates out.
+    pub(crate) fn search_filtered(
+        &self,
+        query: &str,
+        cwd: &Path,
+        now_ms: i64,
+        limit: usize,
+        mut predicate: impl FnMut(&HistoryRecord) -> bool,
+    ) -> Vec<HistoryMatch> {
         if limit == 0 {
             return Vec::new();
         }
@@ -276,6 +290,9 @@ impl HistoryIndex {
             .filter_map(|record| {
                 let quality = match_quality_folded(&query, &record.search_key);
                 if !query.is_empty() && quality == 0 {
+                    return None;
+                }
+                if !predicate(record) {
                     return None;
                 }
                 let age_hours = now_ms.saturating_sub(record.last_used_ms).max(0) / 3_600_000;
@@ -628,6 +645,39 @@ mod tests {
             index.search("git", Path::new("/"), 100, 1)[0].record.count,
             3
         );
+    }
+
+    #[test]
+    fn filtered_search_checks_only_textually_matching_records() {
+        let policy = HistoryPolicy::new(1024, &[]).expect("policy");
+        let mut index = HistoryIndex::default();
+        for number in 0..100 {
+            index.ingest(
+                &format!("unrelated-command-{number}"),
+                number,
+                ShellKind::Zsh,
+                None,
+                Some(0),
+                &policy,
+            );
+        }
+        index.ingest(
+            "needle-command",
+            1_000,
+            ShellKind::Zsh,
+            None,
+            Some(0),
+            &policy,
+        );
+
+        let mut checks = 0;
+        let rows = index.search_filtered("needle", Path::new("/"), 2_000, 10, |_| {
+            checks += 1;
+            true
+        });
+        assert_eq!(checks, 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].record.command, "needle-command");
     }
 
     #[test]

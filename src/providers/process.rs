@@ -4,7 +4,7 @@ use crate::{
     completion::{
         Candidate, CandidateAction, CandidateKind, CandidateProvider, CandidateSource,
         Completeness, CompletionContext, CursorPlacement, ProviderDiagnostic, ProviderOutput,
-        TextEdit,
+        SlotKind, TextEdit,
     },
     terminal::RiskLevel,
 };
@@ -25,7 +25,7 @@ impl CandidateProvider for ProcessProvider {
     }
 
     fn applies(&self, context: &CompletionContext) -> bool {
-        context.command() == Some("kill") && is_argument_position(context)
+        context.command() == Some("kill") && process_slot(context)
     }
 
     fn complete(&self, context: &CompletionContext) -> ProviderOutput {
@@ -43,9 +43,11 @@ impl CandidateProvider for ProcessProvider {
             }
         };
         let current_pid = std::process::id();
+        let prefix = context.parsed.current_prefix.as_str();
         let candidates = processes
             .into_iter()
             .filter(|process| process.pid != current_pid && process.ppid != current_pid)
+            .filter(|process| process_matches(prefix, process))
             .take(500)
             .map(|process| {
                 Candidate::new(
@@ -57,10 +59,14 @@ impl CandidateProvider for ProcessProvider {
                         replacement: process.pid.to_string(),
                         cursor_after: CursorPlacement::End,
                     }),
-                    CandidateAction::Insert,
+                    CandidateAction::InsertAndContinue {
+                        next_slot: SlotKind::Process,
+                    },
                     CandidateSource::Process,
                     CandidateKind::Process,
-                    Completeness::Runnable,
+                    Completeness::NeedsInput {
+                        slot: SlotKind::Process,
+                    },
                     RiskLevel::Medium,
                     format!("process:{}", process.pid),
                 )
@@ -71,6 +77,16 @@ impl CandidateProvider for ProcessProvider {
             diagnostics: Vec::new(),
         }
     }
+}
+
+fn process_matches(prefix: &str, process: &ProcessInfo) -> bool {
+    if prefix.is_empty() {
+        return true;
+    }
+    let pid = process.pid.to_string();
+    let display = format!("{pid} {}", process.command);
+    crate::completion::match_quality(prefix, &pid) > 0
+        || crate::completion::match_quality(prefix, &display) > 0
 }
 
 fn process_list() -> Result<Vec<ProcessInfo>, String> {
@@ -163,23 +179,30 @@ fn parse_ps_line(line: &str) -> Option<ProcessInfo> {
     })
 }
 
-fn is_argument_position(context: &CompletionContext) -> bool {
-    let Some(command) = context.parsed.tokens.iter().find(|token| {
-        token.kind == crate::parser::TokenKind::Word
-            && token.range.start >= context.parsed.active_segment.start
-    }) else {
+fn process_slot(context: &CompletionContext) -> bool {
+    if context.parsed.current_prefix.starts_with('-') {
+        return false;
+    }
+    let Some((words, position)) = crate::providers::argument_progress(context) else {
         return false;
     };
-    context.buffer.cursor > command.range.end
-        || context.buffer.text[..context.buffer.cursor]
-            .chars()
-            .next_back()
-            .is_some_and(char::is_whitespace)
+    let before = words.get(1..=position).unwrap_or_default();
+    if before.iter().any(|word| matches!(*word, "-l" | "-L")) {
+        return false;
+    }
+    !matches!(words.get(position).copied(), Some("-s" | "--signal" | "-n"))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
+    use crate::{
+        completion::{BufferSnapshot, SyncQuality},
+        shell::ShellKind,
+        terminal::{BufferRevision, QueryId},
+    };
 
     #[test]
     fn parses_ps_without_leaking_columns_into_pid() {
@@ -192,5 +215,62 @@ mod tests {
                 command: "/usr/bin/demo --flag".into()
             })
         );
+    }
+
+    #[test]
+    fn process_rows_only_appear_at_pid_slots() {
+        let context = |text: &str| {
+            CompletionContext::new(
+                QueryId::new(1),
+                ShellKind::Zsh,
+                PathBuf::from("/tmp"),
+                BufferSnapshot::new(text, text.len(), BufferRevision::new(1), SyncQuality::Exact)
+                    .expect("buffer"),
+            )
+            .expect("context")
+        };
+        for text in ["kill ", "kill 12", "kill -9 ", "sudo kill -TERM "] {
+            assert!(
+                process_slot(&context(text)),
+                "expected PID slot for {text:?}"
+            );
+        }
+        for text in [
+            "kill",
+            "kill -",
+            "kill -s ",
+            "kill --signal TER",
+            "kill -l ",
+        ] {
+            assert!(
+                !process_slot(&context(text)),
+                "unexpected PID slot for {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn process_cap_is_applied_after_matching_pid_or_command() {
+        let mut processes: Vec<_> = (1..=550)
+            .map(|pid| ProcessInfo {
+                pid,
+                ppid: 0,
+                owner: "alice".into(),
+                command: "ordinary".into(),
+            })
+            .collect();
+        processes.push(ProcessInfo {
+            pid: 9_999,
+            ppid: 0,
+            owner: "alice".into(),
+            command: "release-worker".into(),
+        });
+        let matched: Vec<_> = processes
+            .into_iter()
+            .filter(|process| process_matches("release", process))
+            .take(500)
+            .collect();
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].pid, 9_999);
     }
 }

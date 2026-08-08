@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::{
     completion::{
@@ -15,11 +15,57 @@ pub fn rank_and_dedupe(
     limit: usize,
 ) -> Vec<Candidate> {
     let query = context.parsed.current_prefix.as_str();
+    let direct_command_match = !query.is_empty()
+        && candidates.iter().any(|candidate| {
+            candidate.query_id == context.query_id
+                && has_valid_edit(context, candidate)
+                && candidate.source == crate::completion::CandidateSource::PathCommand
+                && candidate.kind == CandidateKind::Command
+                && candidate_match_signal(query, candidate).priority >= 3
+        });
+    // Token-oriented domains used to leave fuzzy siblings behind after their
+    // exact row was removed as a no-op (`kill 123` -> unrelated processes
+    // whose command happened to contain 123, `ssh dev` -> substring hosts,
+    // or an exact executable path -> scattered files). Once an exact token is
+    // already present, keep only genuinely longer prefixes from that domain.
+    let exact_token_sources: HashSet<_> = if query.is_empty() {
+        HashSet::new()
+    } else {
+        candidates
+            .iter()
+            .filter(|candidate| {
+                candidate.query_id == context.query_id
+                    && has_valid_edit(context, candidate)
+                    && exact_token_domain(candidate)
+                    && candidate
+                        .edit
+                        .as_ref()
+                        .is_some_and(|edit| edit.range == context.parsed.replacement)
+                    && produces_current_buffer(context, candidate)
+            })
+            .map(|candidate| candidate.source)
+            .collect()
+    };
     let mut deduped: HashMap<(usize, usize, String), Candidate> = HashMap::new();
     for mut candidate in candidates {
         if candidate.query_id != context.query_id || !has_valid_edit(context, &candidate) {
             continue;
         }
+        if direct_command_match
+            && candidate.source == crate::completion::CandidateSource::PathCommand
+            && candidate.kind == CandidateKind::Command
+            && candidate_match_signal(query, &candidate).priority < 3
+        {
+            continue;
+        }
+        if exact_token_sources.contains(&candidate.source)
+            && exact_token_domain(&candidate)
+            && !produces_current_buffer(context, &candidate)
+            && candidate_match_signal(query, &candidate).priority < 3
+        {
+            continue;
+        }
+        sanitize_display(&mut candidate);
         if produces_current_buffer(context, &candidate) {
             continue;
         }
@@ -29,8 +75,20 @@ pub fn rank_and_dedupe(
             .map_or(candidate.display.primary.as_str(), |edit| {
                 edit.replacement.as_str()
             });
-        candidate.score.match_quality = match_quality(query, replacement_target)
-            .max(match_quality(query, &candidate.display.primary));
+        let replacement_match = match_signal(query, replacement_target);
+        let display_match = match_signal(query, &candidate.display.primary);
+        let continuation_match = history_continuation_match(context, &candidate);
+        let best_match = continuation_match
+            .unwrap_or(MatchSignal {
+                priority: 0,
+                quality: 0,
+            })
+            .max(replacement_match)
+            .max(display_match);
+        candidate.score.match_priority = best_match.priority;
+        candidate.score.continuation_priority = u8::from(continuation_match.is_some());
+        candidate.score.command_priority = command_priority(context, &candidate);
+        candidate.score.match_quality = best_match.quality;
         if !query.is_empty() && candidate.score.match_quality == 0 {
             if matches!(
                 candidate.source,
@@ -62,7 +120,7 @@ pub fn rank_and_dedupe(
         );
         match deduped.get_mut(&key) {
             Some(existing) => {
-                if candidate.score.total() > existing.score.total() {
+                if ranking_key(&candidate) > ranking_key(existing) {
                     let stricter = stricter_risk(existing.risk, candidate.risk);
                     *existing = candidate;
                     existing.risk = stricter;
@@ -85,8 +143,21 @@ pub fn rank_and_dedupe(
     candidates.sort_by(|left, right| {
         right
             .score
-            .total()
-            .cmp(&left.score.total())
+            .match_priority
+            .cmp(&left.score.match_priority)
+            .then_with(|| {
+                right
+                    .score
+                    .continuation_priority
+                    .cmp(&left.score.continuation_priority)
+            })
+            .then_with(|| {
+                right
+                    .score
+                    .command_priority
+                    .cmp(&left.score.command_priority)
+            })
+            .then_with(|| right.score.total().cmp(&left.score.total()))
             .then_with(|| left.source.order().cmp(&right.source.order()))
             .then_with(|| left.display.primary.cmp(&right.display.primary))
             .then_with(|| left.provenance.cmp(&right.provenance))
@@ -95,11 +166,113 @@ pub fn rank_and_dedupe(
     candidates
 }
 
+fn candidate_match_signal(query: &str, candidate: &Candidate) -> MatchSignal {
+    let replacement = candidate
+        .edit
+        .as_ref()
+        .map_or(candidate.display.primary.as_str(), |edit| {
+            edit.replacement.as_str()
+        });
+    match_signal(query, replacement).max(match_signal(query, &candidate.display.primary))
+}
+
+fn exact_token_domain(candidate: &Candidate) -> bool {
+    matches!(
+        candidate.kind,
+        CandidateKind::File
+            | CandidateKind::Directory
+            | CandidateKind::Process
+            | CandidateKind::Interface
+    ) || (candidate.source == crate::completion::CandidateSource::Project
+        && candidate.kind == CandidateKind::Command)
+}
+
+fn sanitize_display(candidate: &mut Candidate) {
+    candidate.display.primary = escape_control_characters(&candidate.display.primary);
+    candidate.display.description = escape_control_characters(&candidate.display.description);
+    if let Some(annotation) = candidate.display.annotation.as_mut() {
+        *annotation = escape_control_characters(annotation);
+    }
+}
+
+fn escape_control_characters(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        if character.is_control() {
+            escaped.extend(character.escape_default());
+        } else {
+            escaped.push(character);
+        }
+    }
+    escaped
+}
+
+fn ranking_key(candidate: &Candidate) -> (u8, u8, u8, i32) {
+    (
+        candidate.score.match_priority,
+        candidate.score.continuation_priority,
+        candidate.score.command_priority,
+        candidate.score.total(),
+    )
+}
+
+/// A history row replaces the whole line, while ordinary argument candidates
+/// replace only the active token. Match a validated history continuation
+/// against the typed line prefix as well as the active token; otherwise
+/// `proj s` sees `proj skillscat` as a weak substring and lets a directory
+/// named `skillscat` incorrectly outrank it.
+fn history_continuation_match(
+    context: &CompletionContext,
+    candidate: &Candidate,
+) -> Option<MatchSignal> {
+    if candidate.source != crate::completion::CandidateSource::History
+        || crate::providers::executable_position_open(context)
+    {
+        return None;
+    }
+    let edit = candidate.edit.as_ref()?;
+    if edit.range.start != 0 || edit.range.end != context.buffer.text.len() {
+        return None;
+    }
+
+    let before_cursor = &context.buffer.text[..context.buffer.cursor];
+    let mut prefix = before_cursor.to_lowercase();
+    if context.buffer.cursor == context.buffer.text.len() {
+        let trimmed = before_cursor.trim_end();
+        prefix = trimmed.to_lowercase();
+        if trimmed.len() < before_cursor.len() {
+            prefix.push(' ');
+        }
+    }
+    if prefix.is_empty() {
+        return None;
+    }
+
+    let replacement = edit.replacement.trim().to_lowercase();
+    if !replacement.starts_with(&prefix) {
+        return None;
+    }
+    if context.buffer.cursor < context.buffer.text.len() {
+        let suffix = context.buffer.text[context.parsed.replacement.end..].to_lowercase();
+        if !replacement.ends_with(&suffix) {
+            return None;
+        }
+    }
+    Some(match_signal(&prefix, &replacement))
+}
+
+fn command_priority(context: &CompletionContext, candidate: &Candidate) -> u8 {
+    u8::from(
+        crate::providers::executable_position_open(context)
+            && candidate.source == crate::completion::CandidateSource::PathCommand
+            && candidate.kind == CandidateKind::Command,
+    )
+}
+
 /// A candidate whose FULL resulting buffer equals what is already typed adds
-/// nothing — accepting it would rewrite the edit line to itself (the classic
-/// case is the spec "bare command" row duplicating the user's input). The
-/// comparison is trim-normalized so trailing-whitespace near-misses count as
-/// identical too.
+/// nothing: accepting it would rewrite the edit line to itself. The comparison
+/// is trim-normalized so trailing-whitespace near-misses count as identical
+/// too. A completed line stays open only when a provider has a real next step.
 fn produces_current_buffer(context: &CompletionContext, candidate: &Candidate) -> bool {
     let resulting = match candidate.edit.as_ref() {
         Some(edit) => match apply_edit(&context.buffer.text, edit.range.clone(), &edit.replacement)
@@ -143,6 +316,49 @@ pub fn match_quality(query: &str, candidate: &str) -> i16 {
     let query = query.to_lowercase();
     let candidate = candidate.to_lowercase();
     match_quality_folded(&query, &candidate)
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct MatchSignal {
+    priority: u8,
+    quality: i16,
+}
+
+fn match_signal(query: &str, candidate: &str) -> MatchSignal {
+    if query.is_empty() {
+        return MatchSignal {
+            priority: 0,
+            quality: 500,
+        };
+    }
+    let query = query.to_lowercase();
+    let candidate = candidate.to_lowercase();
+    if candidate == query {
+        MatchSignal {
+            priority: 4,
+            quality: 1000,
+        }
+    } else if candidate.starts_with(&query) {
+        MatchSignal {
+            priority: 3,
+            quality: 900_i16.saturating_sub((candidate.len() - query.len()).min(200) as i16),
+        }
+    } else if let Some(index) = candidate.find(&query) {
+        MatchSignal {
+            priority: 2,
+            quality: 700_i16.saturating_sub(index.min(200) as i16),
+        }
+    } else if is_subsequence(&query, &candidate) {
+        MatchSignal {
+            priority: 1,
+            quality: 450,
+        }
+    } else {
+        MatchSignal {
+            priority: 0,
+            quality: 0,
+        }
+    }
 }
 
 #[must_use]
@@ -306,6 +522,23 @@ mod tests {
         assert_eq!(ranked[0].display.primary, "x-safe");
     }
 
+    #[test]
+    fn escapes_control_characters_in_every_rendered_candidate_field() {
+        let context = buffer_context("x");
+        let mut candidate = history_candidate(&context, "x-safe", 1);
+        candidate.display.primary = "x\nprimary".into();
+        candidate.display.description = "line\tdescription".into();
+        candidate.display.annotation = Some("origin\u{1b}".into());
+
+        let ranked = rank_and_dedupe(&context, vec![candidate], 10);
+        assert_eq!(ranked[0].display.primary, "x\\nprimary");
+        assert_eq!(ranked[0].display.description, "line\\tdescription");
+        assert_eq!(
+            ranked[0].display.annotation.as_deref(),
+            Some("origin\\u{1b}")
+        );
+    }
+
     fn buffer_context(text: &str) -> CompletionContext {
         let buffer =
             BufferSnapshot::new(text, text.len(), BufferRevision::new(1), SyncQuality::Exact)
@@ -348,11 +581,8 @@ mod tests {
         let ranked = rank_and_dedupe(
             &context,
             vec![
-                // Spec-style bare command duplicating the typed buffer.
                 history_candidate(&context, "git status", 10),
-                // Trim-normalized near-miss: trailing space still counts as identical.
                 history_candidate(&context, "git status ", 10),
-                // Genuinely different completion stays.
                 history_candidate(&context, "git status --short", 10),
             ],
             10,
@@ -391,6 +621,198 @@ mod tests {
         let ranked = rank_and_dedupe(&context, vec![editless, different], 10);
         assert_eq!(ranked.len(), 1);
         assert_eq!(ranked[0].display.primary, "make build release");
+    }
+
+    #[test]
+    fn strong_prefix_beats_highly_personalized_fuzzy_history() {
+        let context = buffer_context("cod");
+        let mut fuzzy = history_candidate(&context, "cargo doc", 3);
+        fuzzy.score.cwd_affinity = 100;
+        fuzzy.score.frecency = 200;
+        fuzzy.score.transition = 200;
+        let direct = Candidate::new(
+            context.query_id,
+            "codex",
+            "PATH command",
+            Some(TextEdit {
+                range: 0..3,
+                replacement: "codex".into(),
+                cursor_after: CursorPlacement::End,
+            }),
+            CandidateAction::Insert,
+            CandidateSource::PathCommand,
+            CandidateKind::Command,
+            Completeness::Runnable,
+            RiskLevel::Unknown,
+            "path:codex",
+        );
+
+        let ranked = rank_and_dedupe(&context, vec![fuzzy, direct], 10);
+        assert_eq!(ranked[0].display.primary, "codex");
+        assert!(ranked[0].score.match_priority > ranked[1].score.match_priority);
+    }
+
+    #[test]
+    fn direct_command_prefix_removes_fuzzy_rows_from_other_command_sources() {
+        let context = buffer_context("cod");
+        let command = |name: &str, provenance: &str| {
+            Candidate::new(
+                context.query_id,
+                name,
+                "command",
+                Some(TextEdit {
+                    range: 0..3,
+                    replacement: name.into(),
+                    cursor_after: CursorPlacement::End,
+                }),
+                CandidateAction::Insert,
+                CandidateSource::PathCommand,
+                CandidateKind::Command,
+                Completeness::Runnable,
+                RiskLevel::Unknown,
+                provenance,
+            )
+        };
+
+        let ranked = rank_and_dedupe(
+            &context,
+            vec![
+                command("code", "path:code"),
+                command("codex", "path:codex"),
+                command("cargo-doc", "alias:cargo-doc"),
+            ],
+            10,
+        );
+        let names: Vec<_> = ranked
+            .iter()
+            .map(|candidate| candidate.display.primary.as_str())
+            .collect();
+        assert_eq!(names, ["code", "codex"]);
+    }
+
+    #[test]
+    fn executable_name_beats_same_family_history_at_the_command_slot() {
+        let context = buffer_context("cod");
+        let mut history = history_candidate(&context, "codex --resume latest", 3);
+        history.score.cwd_affinity = 100;
+        history.score.frecency = 200;
+        history.score.transition = 200;
+        let executable = Candidate::new(
+            context.query_id,
+            "codex",
+            "PATH command",
+            Some(TextEdit {
+                range: 0..3,
+                replacement: "codex".into(),
+                cursor_after: CursorPlacement::End,
+            }),
+            CandidateAction::Insert,
+            CandidateSource::PathCommand,
+            CandidateKind::Command,
+            Completeness::Runnable,
+            RiskLevel::Unknown,
+            "path:codex",
+        );
+
+        let ranked = rank_and_dedupe(&context, vec![history, executable], 10);
+        assert_eq!(ranked[0].display.primary, "codex");
+        assert_eq!(ranked[0].score.command_priority, 1);
+        assert_eq!(ranked[1].score.command_priority, 0);
+    }
+
+    #[test]
+    fn executable_name_beats_full_line_history_in_an_executable_argument_slot() {
+        let context = buffer_context("which co");
+        let history = history_candidate(&context, "which codex", context.buffer.text.len());
+        let executable = Candidate::new(
+            context.query_id,
+            "which codex",
+            "PATH command",
+            Some(TextEdit {
+                range: context.parsed.replacement.clone(),
+                replacement: "codex".into(),
+                cursor_after: CursorPlacement::End,
+            }),
+            CandidateAction::Insert,
+            CandidateSource::PathCommand,
+            CandidateKind::Command,
+            Completeness::Runnable,
+            RiskLevel::Unknown,
+            "path:codex",
+        );
+
+        let ranked = rank_and_dedupe(&context, vec![history, executable], 10);
+        assert_eq!(ranked[0].source, CandidateSource::PathCommand);
+        assert_eq!(ranked[0].score.command_priority, 1);
+        assert_eq!(ranked[1].score.continuation_priority, 0);
+    }
+
+    #[test]
+    fn exact_token_suppresses_scattered_fuzzy_rows_but_keeps_longer_prefixes() {
+        let context = buffer_context("./run");
+        let path = |name: &str| {
+            Candidate::new(
+                context.query_id,
+                name,
+                "filesystem",
+                Some(TextEdit {
+                    range: context.parsed.replacement.clone(),
+                    replacement: name.into(),
+                    cursor_after: CursorPlacement::End,
+                }),
+                CandidateAction::Insert,
+                CandidateSource::Filesystem,
+                CandidateKind::File,
+                Completeness::Runnable,
+                RiskLevel::Low,
+                format!("filesystem:{name}"),
+            )
+        };
+
+        let ranked = rank_and_dedupe(
+            &context,
+            vec![path("./run"), path("./runner"), path("./around")],
+            10,
+        );
+        let rows: Vec<_> = ranked
+            .iter()
+            .map(|candidate| candidate.display.primary.as_str())
+            .collect();
+        assert_eq!(rows, ["./runner"]);
+    }
+
+    #[test]
+    fn exact_project_token_suppresses_substring_hosts() {
+        let context = buffer_context("ssh dev");
+        let host = |name: &str| {
+            Candidate::new(
+                context.query_id,
+                name,
+                "SSH host",
+                Some(TextEdit {
+                    range: context.parsed.replacement.clone(),
+                    replacement: name.into(),
+                    cursor_after: CursorPlacement::End,
+                }),
+                CandidateAction::Insert,
+                CandidateSource::Project,
+                CandidateKind::Command,
+                Completeness::Runnable,
+                RiskLevel::Low,
+                format!("ssh:{name}"),
+            )
+        };
+
+        let ranked = rank_and_dedupe(
+            &context,
+            vec![host("dev"), host("developer"), host("prod-dev")],
+            10,
+        );
+        let rows: Vec<_> = ranked
+            .iter()
+            .map(|candidate| candidate.display.primary.as_str())
+            .collect();
+        assert_eq!(rows, ["developer"]);
     }
 
     #[test]

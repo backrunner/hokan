@@ -3,6 +3,8 @@ use std::time::{Duration, Instant};
 use super::{CellPos, QueryId, SyncOutputCapability};
 
 const MAX_REPLY_BYTES: usize = 64;
+const LATE_REPLY_GRACE: Duration = Duration::from_secs(2);
+const LATE_REPLY_PREFIX_TIMEOUT: Duration = Duration::from_millis(32);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TerminalQueryKind {
@@ -46,11 +48,19 @@ struct OutstandingQuery {
     deadline: Instant,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct LateQuery {
+    kind: TerminalQueryKind,
+    deadline: Instant,
+}
+
 #[derive(Debug, Default)]
 pub struct TerminalReplyRouter {
     next_query_id: QueryId,
     outstanding: Option<OutstandingQuery>,
+    late: Vec<LateQuery>,
     candidate: Vec<u8>,
+    candidate_started: Option<Instant>,
 }
 
 impl TerminalReplyRouter {
@@ -65,6 +75,7 @@ impl TerminalReplyRouter {
         now: Instant,
         timeout: Duration,
     ) -> crate::Result<RegisteredQuery> {
+        self.late.retain(|query| now < query.deadline);
         if self.outstanding.is_some() {
             return Err(crate::Error::TerminalProtocol(
                 "a terminal query is already outstanding".into(),
@@ -91,72 +102,145 @@ impl TerminalReplyRouter {
     pub fn route(&mut self, bytes: &[u8], now: Instant) -> RoutedInput {
         let mut routed = self.expire(now);
         for &byte in bytes {
-            self.push_byte(byte, &mut routed);
+            self.push_byte(byte, now, &mut routed);
         }
         routed
     }
 
     pub fn expire(&mut self, now: Instant) -> RoutedInput {
         let mut routed = RoutedInput::default();
-        let Some(outstanding) = self.outstanding else {
-            if !self.candidate.is_empty() {
-                routed.input.append(&mut self.candidate);
+        self.late.retain(|query| now < query.deadline);
+        if let Some(outstanding) = self.outstanding
+            && now >= outstanding.deadline
+        {
+            let partial_reply = !self.candidate.is_empty()
+                && matches!(
+                    classify(outstanding.kind, &self.candidate),
+                    CandidateState::Potential
+                );
+            routed.replies.push(TerminalReply::Timeout {
+                query_id: outstanding.id,
+                kind: outstanding.kind,
+            });
+            self.outstanding = None;
+            self.remember_late(outstanding.kind, now);
+            if partial_reply {
+                self.candidate_started = Some(now);
             }
-            return routed;
-        };
-        if now < outstanding.deadline {
-            return routed;
         }
-
-        routed.input.append(&mut self.candidate);
-        routed.replies.push(TerminalReply::Timeout {
-            query_id: outstanding.id,
-            kind: outstanding.kind,
-        });
-        self.outstanding = None;
+        self.flush_stale_candidate(now, &mut routed);
         routed
     }
 
     pub fn cancel(&mut self) -> Vec<u8> {
         self.outstanding = None;
+        self.late.clear();
+        self.candidate_started = None;
         std::mem::take(&mut self.candidate)
     }
 
-    fn push_byte(&mut self, byte: u8, routed: &mut RoutedInput) {
-        let Some(outstanding) = self.outstanding else {
+    fn push_byte(&mut self, byte: u8, now: Instant, routed: &mut RoutedInput) {
+        self.late.retain(|query| now < query.deadline);
+        if self.outstanding.is_none() && self.late.is_empty() {
             routed.input.push(byte);
             return;
-        };
+        }
 
         if self.candidate.is_empty() && byte != 0x1b {
             routed.input.push(byte);
             return;
         }
+        if self.candidate.is_empty() {
+            self.candidate_started = Some(now);
+        }
         self.candidate.push(byte);
         if self.candidate.len() > MAX_REPLY_BYTES {
             routed.input.append(&mut self.candidate);
+            self.candidate_started = None;
             return;
         }
 
-        match classify(outstanding.kind, &self.candidate) {
-            CandidateState::Potential => {}
-            CandidateState::Invalid => routed.input.append(&mut self.candidate),
-            CandidateState::Complete(parsed) => {
-                let reply = match parsed {
-                    ParsedReply::Cursor(position) => TerminalReply::CursorPosition {
-                        query_id: outstanding.id,
-                        position,
-                    },
-                    ParsedReply::SyncStatus(raw_status) => TerminalReply::SynchronizedOutput {
-                        query_id: outstanding.id,
-                        raw_status,
-                        capability: capability_for_status(raw_status),
-                    },
-                };
-                self.candidate.clear();
-                self.outstanding = None;
-                routed.replies.push(reply);
+        let mut potential = false;
+        if let Some(outstanding) = self.outstanding {
+            match classify(outstanding.kind, &self.candidate) {
+                CandidateState::Potential => potential = true,
+                CandidateState::Invalid => {}
+                CandidateState::Complete(parsed) => {
+                    let reply = match parsed {
+                        ParsedReply::Cursor(position) => TerminalReply::CursorPosition {
+                            query_id: outstanding.id,
+                            position,
+                        },
+                        ParsedReply::SyncStatus(raw_status) => TerminalReply::SynchronizedOutput {
+                            query_id: outstanding.id,
+                            raw_status,
+                            capability: capability_for_status(raw_status),
+                        },
+                    };
+                    self.candidate.clear();
+                    self.candidate_started = None;
+                    self.outstanding = None;
+                    routed.replies.push(reply);
+                    return;
+                }
             }
+        }
+
+        let mut late_complete = None;
+        for (index, query) in self.late.iter().enumerate() {
+            match classify(query.kind, &self.candidate) {
+                CandidateState::Potential => potential = true,
+                CandidateState::Invalid => {}
+                CandidateState::Complete(_) => {
+                    late_complete = Some(index);
+                    break;
+                }
+            }
+        }
+        if let Some(index) = late_complete {
+            self.late.swap_remove(index);
+            self.candidate.clear();
+            self.candidate_started = None;
+            return;
+        }
+
+        if !potential {
+            routed.input.append(&mut self.candidate);
+            self.candidate_started = None;
+        }
+    }
+
+    fn remember_late(&mut self, kind: TerminalQueryKind, now: Instant) {
+        self.late.retain(|query| query.kind != kind);
+        self.late.push(LateQuery {
+            kind,
+            deadline: now + LATE_REPLY_GRACE,
+        });
+    }
+
+    fn flush_stale_candidate(&mut self, now: Instant, routed: &mut RoutedInput) {
+        if self.candidate.is_empty() {
+            self.candidate_started = None;
+            return;
+        }
+        let outstanding_potential = self.outstanding.is_some_and(|query| {
+            matches!(
+                classify(query.kind, &self.candidate),
+                CandidateState::Potential
+            )
+        });
+        let late_potential = self.late.iter().any(|query| {
+            matches!(
+                classify(query.kind, &self.candidate),
+                CandidateState::Potential
+            )
+        });
+        let late_prefix_expired = self.candidate_started.is_some_and(|started| {
+            now.saturating_duration_since(started) >= LATE_REPLY_PREFIX_TIMEOUT
+        });
+        if !outstanding_potential && (!late_potential || late_prefix_expired) {
+            routed.input.append(&mut self.candidate);
+            self.candidate_started = None;
         }
     }
 }
@@ -354,7 +438,7 @@ mod tests {
             .expect("query should register");
         assert!(timed_out.route(b"\x1b[12", now).input.is_empty());
         let routed = timed_out.expire(now + Duration::from_millis(2));
-        assert_eq!(routed.input, b"\x1b[12");
+        assert!(routed.input.is_empty());
         assert_eq!(
             routed.replies,
             vec![TerminalReply::Timeout {
@@ -362,5 +446,64 @@ mod tests {
                 kind: TerminalQueryKind::CursorPosition,
             }]
         );
+        let released = timed_out.expire(now + Duration::from_millis(2) + LATE_REPLY_PREFIX_TIMEOUT);
+        assert_eq!(released.input, b"\x1b[12");
+    }
+
+    #[test]
+    fn late_sync_reply_is_discarded_while_a_cursor_query_is_outstanding() {
+        let started = Instant::now();
+        let mut router = TerminalReplyRouter::default();
+        let sync = router
+            .register(
+                TerminalQueryKind::SynchronizedOutput,
+                started,
+                Duration::from_millis(1),
+            )
+            .expect("sync query");
+        assert_eq!(
+            router.expire(started + Duration::from_millis(2)).replies,
+            vec![TerminalReply::Timeout {
+                query_id: sync.id,
+                kind: TerminalQueryKind::SynchronizedOutput,
+            }]
+        );
+
+        let now = started + Duration::from_millis(2);
+        let cursor = router
+            .register(
+                TerminalQueryKind::CursorPosition,
+                now,
+                Duration::from_secs(1),
+            )
+            .expect("cursor query");
+        let routed = router.route(b"\x1b[?2026;2$y\x1b[12;34Rhello", now);
+        assert_eq!(routed.input, b"hello");
+        assert_eq!(
+            routed.replies,
+            vec![TerminalReply::CursorPosition {
+                query_id: cursor.id,
+                position: CellPos::new(11, 33),
+            }]
+        );
+    }
+
+    #[test]
+    fn late_reply_filter_releases_an_ambiguous_escape_key_quickly() {
+        let started = Instant::now();
+        let mut router = TerminalReplyRouter::default();
+        router
+            .register(
+                TerminalQueryKind::SynchronizedOutput,
+                started,
+                Duration::from_millis(1),
+            )
+            .expect("sync query");
+        let timed_out = started + Duration::from_millis(2);
+        router.expire(timed_out);
+
+        assert!(router.route(b"\x1b", timed_out).input.is_empty());
+        let routed = router.expire(timed_out + LATE_REPLY_PREFIX_TIMEOUT);
+        assert_eq!(routed.input, b"\x1b");
     }
 }

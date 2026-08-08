@@ -968,8 +968,8 @@ send_cwd_basename = true
 ```text
 hokan [--shell zsh] [--login]
 hokan init <zsh|bash|fish>
-hokan setup [--shell ...]
-hokan uninstall --integration-only
+hokan install [--shell ...]      # setup 是兼容别名
+hokan uninstall [--integration-only]
 hokan doctor [--json]
 hokan config <path|show|validate|init>
 hokan config ai
@@ -980,7 +980,7 @@ hokan ipc <emit|take>            # internal, hidden from normal help
 hokan --version
 ```
 
-`setup`、`uninstall`、`history clear` 涉及写入或删除，必须精确显示目标并保持可恢复性。`uninstall --integration-only` 不删除 history/config。
+`install`、`uninstall`、`history clear` 涉及写入或删除，必须精确显示目标并保持可恢复性。`uninstall` 只删除安装器拥有的 binary/man page，始终保留 history/config；`--integration-only` 连 binary 也保留。
 
 ## 15. 错误与诊断
 

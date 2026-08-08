@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use crate::completion::{Candidate, CompletionContext, rank_and_dedupe};
+use crate::completion::{Candidate, CompletionContext, CompletionMode, rank_and_dedupe};
 
 #[derive(Clone, Copy, Debug)]
 pub struct ProviderMetric {
@@ -29,6 +29,9 @@ pub struct ProviderOutput {
 
 pub trait CandidateProvider: Send + Sync {
     fn id(&self) -> &'static str;
+    fn supports_mode(&self, mode: CompletionMode) -> bool {
+        mode == CompletionMode::Normal
+    }
     fn applies(&self, context: &CompletionContext) -> bool;
     fn complete(&self, context: &CompletionContext) -> ProviderOutput;
 }
@@ -87,10 +90,20 @@ impl CompletionEngine {
             emit(ProviderOutput::default(), true);
             return;
         }
+        if context.parsed.tokens.iter().any(|token| {
+            token.kind == crate::parser::TokenKind::Comment
+                && context.buffer.cursor >= token.range.start
+                && context.buffer.cursor <= token.range.end
+        }) {
+            emit(ProviderOutput::default(), true);
+            return;
+        }
         let mut combined = ProviderOutput::default();
         let mut providers = Vec::new();
         for provider in &self.providers {
-            match catch_unwind(AssertUnwindSafe(|| provider.applies(context))) {
+            match catch_unwind(AssertUnwindSafe(|| {
+                provider.supports_mode(context.mode) && provider.applies(context)
+            })) {
                 Ok(true) => providers.push(provider),
                 Ok(false) => {}
                 Err(_) => combined.diagnostics.push(provider_panic(provider.id())),
@@ -106,7 +119,11 @@ impl CompletionEngine {
             if cancelled() {
                 return;
             }
-            if index > 0 && started.elapsed() >= self.local_timeout {
+            if index > 0
+                && started.elapsed() >= self.local_timeout
+                && !rank_and_dedupe(context, combined.candidates.clone(), self.max_candidates)
+                    .is_empty()
+            {
                 combined.diagnostics.push(ProviderDiagnostic {
                     provider: "engine",
                     code: "HK-CMP-001",
@@ -190,7 +207,13 @@ mod tests {
         primary: &'static str,
     }
 
+    struct EmptyProvider;
+
     struct PanickingProvider;
+
+    struct PanickingModeProvider;
+
+    struct HistoryOnlyProvider;
 
     impl CandidateProvider for ManyProvider {
         fn id(&self) -> &'static str {
@@ -221,6 +244,20 @@ mod tests {
                     .collect(),
                 diagnostics: Vec::new(),
             }
+        }
+    }
+
+    impl CandidateProvider for EmptyProvider {
+        fn id(&self) -> &'static str {
+            "empty"
+        }
+
+        fn applies(&self, _: &CompletionContext) -> bool {
+            true
+        }
+
+        fn complete(&self, _: &CompletionContext) -> ProviderOutput {
+            ProviderOutput::default()
         }
     }
 
@@ -263,6 +300,56 @@ mod tests {
 
         fn complete(&self, _: &CompletionContext) -> ProviderOutput {
             panic!("provider payload must not reach diagnostics")
+        }
+    }
+
+    impl CandidateProvider for PanickingModeProvider {
+        fn id(&self) -> &'static str {
+            "panicking_mode"
+        }
+
+        fn supports_mode(&self, _: CompletionMode) -> bool {
+            panic!("mode payload must stay private")
+        }
+
+        fn applies(&self, _: &CompletionContext) -> bool {
+            true
+        }
+
+        fn complete(&self, _: &CompletionContext) -> ProviderOutput {
+            ProviderOutput::default()
+        }
+    }
+
+    impl CandidateProvider for HistoryOnlyProvider {
+        fn id(&self) -> &'static str {
+            "history_only"
+        }
+
+        fn supports_mode(&self, _: CompletionMode) -> bool {
+            true
+        }
+
+        fn applies(&self, _: &CompletionContext) -> bool {
+            true
+        }
+
+        fn complete(&self, context: &CompletionContext) -> ProviderOutput {
+            ProviderOutput {
+                candidates: vec![Candidate::new(
+                    context.query_id,
+                    "history row",
+                    "history",
+                    None,
+                    CandidateAction::None,
+                    CandidateSource::History,
+                    CandidateKind::History,
+                    Completeness::Runnable,
+                    RiskLevel::Low,
+                    "history_only",
+                )],
+                diagnostics: Vec::new(),
+            }
         }
     }
 
@@ -312,6 +399,52 @@ mod tests {
     }
 
     #[test]
+    fn history_only_mode_excludes_normal_providers_before_ranking() {
+        let context = CompletionContext::new(
+            QueryId::new(1),
+            ShellKind::Zsh,
+            PathBuf::from("/tmp"),
+            BufferSnapshot::new("", 0, BufferRevision::new(1), SyncQuality::Exact).expect("buffer"),
+        )
+        .expect("context")
+        .with_mode(CompletionMode::HistoryOnly);
+        let mut engine = CompletionEngine::new(1, 1);
+        engine.register(OneProvider {
+            id: "normal",
+            primary: "normal row",
+        });
+        engine.register(HistoryOnlyProvider);
+
+        let output = engine.complete(&context);
+        assert_eq!(output.candidates.len(), 1);
+        assert_eq!(output.candidates[0].source, CandidateSource::History);
+        assert_eq!(output.candidates[0].display.primary, "history row");
+    }
+
+    #[test]
+    fn shell_comments_do_not_produce_candidates() {
+        let context = CompletionContext::new(
+            QueryId::new(1),
+            ShellKind::Zsh,
+            PathBuf::from("/tmp"),
+            BufferSnapshot::new(
+                "echo ok # unfinished note",
+                "echo ok # unfinished note".len(),
+                BufferRevision::new(1),
+                SyncQuality::Exact,
+            )
+            .expect("buffer"),
+        )
+        .expect("context");
+        let mut engine = CompletionEngine::new(100, 3);
+        engine.register(OneProvider {
+            id: "always",
+            primary: "must-not-appear",
+        });
+        assert!(engine.complete(&context).candidates.is_empty());
+    }
+
+    #[test]
     fn local_budget_stops_before_the_next_provider() {
         let context = context();
         let mut engine = CompletionEngine::new(100, 3).with_local_timeout(Duration::ZERO);
@@ -339,10 +472,26 @@ mod tests {
     }
 
     #[test]
+    fn local_budget_does_not_finalize_an_empty_result_before_a_later_provider() {
+        let context = context();
+        let mut engine = CompletionEngine::new(100, 3).with_local_timeout(Duration::ZERO);
+        engine.register(EmptyProvider);
+        engine.register(OneProvider {
+            id: "fallback",
+            primary: "x-fallback",
+        });
+
+        let output = engine.complete(&context);
+        assert_eq!(output.candidates.len(), 1);
+        assert_eq!(output.candidates[0].display.primary, "x-fallback");
+    }
+
+    #[test]
     fn provider_panics_are_isolated_without_exposing_the_payload() {
         let context = context();
         let mut engine = CompletionEngine::new(100, 3);
         engine.register(PanickingProvider);
+        engine.register(PanickingModeProvider);
         engine.register(OneProvider {
             id: "healthy",
             primary: "x-healthy",
@@ -355,10 +504,17 @@ mod tests {
         let diagnostic = output
             .diagnostics
             .iter()
-            .find(|diagnostic| diagnostic.code == "HK-CMP-002")
+            .find(|diagnostic| diagnostic.provider == "panicking")
             .expect("panic diagnostic");
-        assert_eq!(diagnostic.provider, "panicking");
+        assert_eq!(diagnostic.code, "HK-CMP-002");
         assert!(!diagnostic.message.contains("payload"));
+        let mode_diagnostic = output
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.provider == "panicking_mode")
+            .expect("mode panic diagnostic");
+        assert_eq!(mode_diagnostic.code, "HK-CMP-002");
+        assert!(!mode_diagnostic.message.contains("payload"));
     }
 
     #[test]

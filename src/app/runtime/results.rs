@@ -199,11 +199,16 @@ pub(super) fn handle_provider_result(
         .filter(|id| state.candidates.iter().any(|candidate| candidate.id == *id))
         .or_else(|| {
             let intent = state.selection_intent.as_ref()?;
-            state
-                .candidates
-                .iter()
-                .find(|candidate| intent.key.matches(candidate))
-                .map(|candidate| candidate.id)
+            intent
+                .key
+                .as_ref()
+                .and_then(|key| {
+                    state
+                        .candidates
+                        .iter()
+                        .find(|candidate| key.matches(candidate))
+                        .map(|candidate| candidate.id)
+                })
                 .or_else(|| {
                     (!state.candidates.is_empty()).then(|| {
                         let index =

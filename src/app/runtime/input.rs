@@ -8,7 +8,7 @@ use super::{
         AiResult, EnterResolution, SelectedActivation, resolve_enter, resolve_selected_activation,
         start_ai_request,
     },
-    state::{PendingConfirm, RuntimeState, move_selection, selected_candidate},
+    state::{PendingConfirm, RuntimeState, defer_selection, move_selection, selected_candidate},
     worker::ProviderWorker,
 };
 use crate::{
@@ -147,19 +147,27 @@ pub(super) fn handle_input_event(
             hide_overlay_if_query_suppressed(state, output)?;
             return Ok(());
         }
+    } else if config.history.enabled
+        && (config.keys.up.matches(&event.kind) || config.keys.down.matches(&event.kind))
+    {
+        // At an idle prompt Hokan owns the arrow key before it reaches the
+        // child shell. This opens the private history list without installing
+        // or replacing any zle/readline/fish bindings. Shell mappings remain
+        // untouched, and non-editing input still passes through above.
+        let delta = if config.keys.up.matches(&event.kind) {
+            -1
+        } else {
+            1
+        };
+        state.history_only = true;
+        state.schedule_query(worker)?;
+        defer_selection(state, delta);
+        arm_hidden_overlay_query(state, output)?;
+        return Ok(());
     } else if config.keys.history.matches(&event.kind) || config.keys.toggle.matches(&event.kind) {
         state.history_only = config.keys.history.matches(&event.kind);
         state.schedule_query(worker)?;
-        if state.provider_pending {
-            // These keys write nothing to the shell, so no redisplay follows
-            // and no render gate opens on an idle prompt — re-anchor with a
-            // cursor probe (same path as `pending_reanchor`) so the result
-            // frame can actually be admitted.
-            output
-                .allow_cursor_probe(state.buffer.revision)
-                .map_err(output_error)?;
-            state.need_cpr = true;
-        }
+        arm_hidden_overlay_query(state, output)?;
         return Ok(());
     }
 
@@ -216,6 +224,19 @@ pub(super) fn handle_input_event(
             output.hide_overlay().map_err(output_error)?;
         }
         MirrorOutcome::Submitted | MirrorOutcome::Unchanged => {}
+    }
+    Ok(())
+}
+
+fn arm_hidden_overlay_query(state: &mut RuntimeState, output: &OutputHandle) -> crate::Result<()> {
+    if state.provider_pending {
+        // Keys consumed by Hokan write nothing to the shell, so no redisplay
+        // follows and no render gate opens on an idle prompt. Re-anchor with a
+        // cursor probe so the provider result frame can be admitted.
+        output
+            .allow_cursor_probe(state.buffer.revision)
+            .map_err(output_error)?;
+        state.need_cpr = true;
     }
     Ok(())
 }

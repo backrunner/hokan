@@ -163,7 +163,7 @@ impl TerminalSession {
         Self::spawn_hokan(home, work, 2)
     }
 
-    fn spawn_via_zsh_setup() -> Self {
+    fn spawn_via_zsh_install() -> Self {
         let (home, work) = fixture_directories();
         let rc_path = home.path().join(".zshrc");
         fs::write(
@@ -179,17 +179,17 @@ impl TerminalSession {
         let output = Command::new(hokan_test_bin())
             .arg("--shell")
             .arg("zsh")
-            .arg("setup")
+            .arg("install")
             .arg("--rc-file")
             .arg(&rc_path)
             .env("HOME", home.path())
             .env_remove("HOKAN_ACTIVE")
             .env_remove("HOKAN_BIN")
             .output()
-            .expect("run hokan setup");
+            .expect("run hokan install");
         assert!(
             output.status.success(),
-            "setup failed: stdout={:?}, stderr={:?}",
+            "install failed: stdout={:?}, stderr={:?}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
@@ -609,7 +609,7 @@ fn real_session_keeps_overlay_and_terminal_lifecycle_stable() {
     // first SPEC label: early frames show item rows before the full box —
     // including its bottom edge — has been painted.
     terminal.wait_for_screen("Tab 回填 · Enter 执行 · Esc 关闭");
-    assert!(terminal.screen_text().contains("HK> ls"));
+    terminal.wait_for_screen("HK> ls");
     let text = terminal.screen_text();
     assert!(text.contains('╭'), "overlay top border missing:\n{text}");
     assert!(
@@ -973,11 +973,11 @@ fn transient_prompt_rewrite_reanchors_overlay_on_return_to_prompt() {
 }
 
 #[test]
-fn zsh_setup_auto_starts_hokan_and_restores_the_terminal() {
+fn zsh_install_auto_starts_hokan_and_restores_the_terminal() {
     if !command_exists("zsh") {
         return;
     }
-    let mut terminal = TerminalSession::spawn_via_zsh_setup();
+    let mut terminal = TerminalSession::spawn_via_zsh_install();
     terminal.wait_for_screen("HK1> ");
     terminal.write(b"ls ");
     terminal.wait_for_screen(TAG_SPEC);
@@ -1265,7 +1265,7 @@ fn custom_function_argument_completes_the_inferred_slot() {
     fs::create_dir_all(home.path().join("projects/web")).expect("web dir");
     fs::write(
         home.path().join(".zshrc"),
-        "PROMPT='HK> '\nRPROMPT=''\nsetopt no_beep\nproj() { cd $HOME/projects/$1; }\n",
+        "PROMPT='HK> '\nRPROMPT=''\nsetopt no_beep\nproj() {\n  if [ -n \"$1\" ]; then\n    cd \"$HOME/projects/$1\"\n  else\n    cd \"$HOME/projects\"\n  fi\n}\n",
     )
     .expect("zshrc with function");
     let mut terminal = TerminalSession::spawn_hokan(home, work, 2);
@@ -1315,6 +1315,8 @@ fn tab_without_a_selection_fills_the_top_candidate_and_selects_first_row() {
         return;
     }
     let mut terminal = TerminalSession::spawn();
+    fs::create_dir(terminal._work.path().join("archive-dir"))
+        .expect("archive navigation directory");
     terminal.wait_for_screen("HK> ");
     terminal.settle(Duration::from_millis(300));
 
@@ -1541,10 +1543,138 @@ fn bare_executable_waits_for_space_before_suggesting() {
     terminal.settle(Duration::from_millis(500));
     assert_no_overlay_rows(&terminal);
 
-    // After the space, argument completion kicks in (filesystem rows, since
-    // `whoami` has no spec): the overlay box appears.
+    // A generic empty argument slot stays quiet: scanning the cwd here would
+    // produce unrelated file noise for a command that does not take paths.
     terminal.write(b" ");
-    terminal.wait_for_screen("╭");
+    terminal.settle(Duration::from_millis(300));
+    assert_no_overlay_rows(&terminal);
+
+    // Explicit path syntax is an unambiguous request for filesystem rows.
+    terminal.write(b"./HKWHOAMI_");
+    terminal.wait_for_screen("HKWHOAMI_MARKER.txt");
+
+    terminal.exit_shell();
+    terminal.wait_until_exit();
+}
+
+#[test]
+fn exact_executable_waits_for_space_then_uses_dynamic_help() {
+    if !command_exists("zsh") {
+        return;
+    }
+    let (home, work) = empty_fixture_directories();
+    let bin = home.path().join("rc-bin");
+    fs::create_dir(&bin).expect("rc bin");
+    for (name, body) in [
+        (
+            "codex-fixture",
+            "#!/bin/sh\nif [ \"${1-}\" = \"--help\" ]; then\n  printf '%s\\n' 'Usage: codex-fixture <COMMAND>' 'Commands:' '  resume    Resume a session' '  review    Review changes'\nfi\n",
+        ),
+        ("codex-fixture-helper", "#!/bin/sh\nexit 0\n"),
+    ] {
+        let executable = bin.join(name);
+        fs::write(&executable, body).expect("fixture executable");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
+                .expect("fixture mode");
+        }
+    }
+    fs::write(
+        home.path().join(".zshrc"),
+        format!(
+            "export PATH={}:$PATH\nPROMPT='HK> '\nRPROMPT=''\nsetopt no_beep\n",
+            bin.display()
+        ),
+    )
+    .expect("fixture zshrc");
+    let mut terminal = TerminalSession::spawn_hokan(home, work, 2);
+    terminal.wait_for_screen("HK> ");
+
+    // The exact runnable executable is final even though a longer executable
+    // shares its prefix. No PATH, history, or help rows remain visible.
+    terminal.write(b"codex-fixture");
+    terminal.settle(Duration::from_millis(500));
+    assert_no_overlay_rows(&terminal);
+
+    // A space opens the argument grammar. The cold dynamic-help fetch runs in
+    // the background and then refreshes the same buffer with subcommands.
+    terminal.write(b" ");
+    terminal.wait_for_screen("codex-fixture resume");
+    let text = terminal.screen_text();
+    assert!(
+        text.contains("Resume a session"),
+        "dynamic help row missing:\n{text}"
+    );
+
+    terminal.write(b"\x15");
+    terminal.settle(Duration::from_millis(200));
+
+    // Before an exact token, ordinary executable-name completion still works.
+    terminal.write(b"codex-fixture-h");
+    terminal.wait_for_screen("codex-fixture-helper");
+    terminal.write(b"elper");
+    terminal.settle(Duration::from_millis(500));
+    assert_no_overlay_rows(&terminal);
+
+    terminal.exit_shell();
+    terminal.wait_until_exit();
+}
+
+#[test]
+fn imported_history_subcommand_typos_are_filtered_by_dynamic_help() {
+    if !command_exists("zsh") {
+        return;
+    }
+    let (home, work) = empty_fixture_directories();
+    let bin = home.path().join("rc-bin");
+    fs::create_dir(&bin).expect("rc bin");
+    let executable = bin.join("history-fixture");
+    fs::write(
+        &executable,
+        "#!/bin/sh\nif [ \"${1-}\" = \"--help\" ]; then\n  printf '%s\\n' 'Usage: history-fixture <COMMAND>' 'Commands:' '  resume    Resume a session' '  review    Review changes'\nfi\n",
+    )
+    .expect("fixture executable");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).expect("fixture mode");
+    }
+    fs::write(
+        home.path().join(".zshrc"),
+        format!(
+            "export PATH={}:$PATH\nPROMPT='HK> '\nRPROMPT=''\nsetopt no_beep\n",
+            bin.display()
+        ),
+    )
+    .expect("fixture zshrc");
+    fs::write(
+        home.path().join(".zsh_history"),
+        "history-fixture resume\nhistory-fixture resumx\nhistory-fixture upgrad\n",
+    )
+    .expect("fixture history");
+
+    let mut terminal = TerminalSession::spawn_hokan(home, work, 2);
+    terminal.wait_for_screen("HK> ");
+    terminal.write(b"history-fixture ");
+    terminal.wait_for_screen("history-fixture resume");
+    let text = terminal.screen_text();
+    assert!(!text.contains("history-fixture resumx"), "{text}");
+    assert!(!text.contains("history-fixture upgrad"), "{text}");
+
+    terminal.write(b"\x15");
+    terminal.settle(Duration::from_millis(200));
+    terminal.write(b"history-fixture resu");
+    terminal.wait_for_screen("history-fixture resume");
+    let text = terminal.screen_text();
+    assert!(!text.contains("history-fixture resumx"), "{text}");
+
+    terminal.write(b"\x15");
+    terminal.settle(Duration::from_millis(200));
+    terminal.write(b"history-fixture upg");
+    terminal.settle(Duration::from_millis(500));
+    assert_no_overlay_rows(&terminal);
 
     terminal.exit_shell();
     terminal.wait_until_exit();
@@ -1565,9 +1695,11 @@ fn argument_position_excludes_unrelated_history_commands() {
     // of `whoami`.
     terminal.write(b"echo who am i HKARG_JUNK\r");
     terminal.wait_for_bare_row("who am i HKARG_JUNK");
+    terminal.settle(Duration::from_millis(300));
 
-    terminal.write(b"whoami ");
-    // Argument completion kicks in: the cwd marker file appears as a row.
+    terminal.write(b"whoami ./HKARG_");
+    // Explicit path intent produces the cwd marker file without reopening
+    // broad fuzzy history at this argument position.
     terminal.wait_for_screen("HKARG_MARKER.txt");
     terminal.settle(Duration::from_millis(300));
 
@@ -1575,7 +1707,7 @@ fn argument_position_excludes_unrelated_history_commands() {
     let overlay_rows: Vec<_> = text.lines().filter(|line| line.contains('│')).collect();
     assert!(
         !overlay_rows.is_empty(),
-        "expected overlay rows after `whoami `:\n{text}"
+        "expected overlay rows after an explicit whoami path:\n{text}"
     );
     assert!(
         overlay_rows.iter().all(|line| !line.contains("HKARG_JUNK")),
@@ -1724,6 +1856,60 @@ fn ctrl_r_on_an_empty_buffer_opens_the_history_view() {
     terminal.write(b"\x12");
     terminal.wait_for_screen(TAG_HIS);
     assert!(terminal.screen_text().contains("echo HK_HIST_SEED"));
+
+    terminal.exit_shell();
+    terminal.wait_until_exit();
+}
+
+#[test]
+fn arrows_open_history_without_invoking_zsh_arrow_widgets() {
+    if !command_exists("zsh") {
+        return;
+    }
+    let (home, work) = empty_fixture_directories();
+    fs::write(
+        home.path().join(".zshrc"),
+        "PROMPT='HK> '\nRPROMPT=''\nsetopt no_beep\nbindkey -e\n\
+         function fixture_native_up() { BUFFER='echo HK_NATIVE_UP'; CURSOR=${#BUFFER}; zle redisplay }\n\
+         function fixture_native_down() { BUFFER='echo HK_NATIVE_DOWN'; CURSOR=${#BUFFER}; zle redisplay }\n\
+         zle -N fixture_native_up\n\
+         zle -N fixture_native_down\n\
+         bindkey $'\\e[A' fixture_native_up\n\
+         bindkey $'\\eOA' fixture_native_up\n\
+         bindkey $'\\e[B' fixture_native_down\n\
+         bindkey $'\\eOB' fixture_native_down\n",
+    )
+    .expect("zsh arrow widget fixture");
+    let mut terminal = TerminalSession::spawn_hokan(home, work, 2);
+    terminal.wait_for_screen("HK> ");
+    terminal.settle(Duration::from_millis(300));
+
+    terminal.write(b"echo HK_ARROW_HISTORY_SEED\r");
+    terminal.wait_for_bare_row("HK_ARROW_HISTORY_SEED");
+    terminal.settle(Duration::from_millis(300));
+
+    // Application-cursor Up must be decoded by Hokan and open its history
+    // list. The deliberately conflicting zle widget must never see the key.
+    terminal.write(b"\x1bOA");
+    terminal.wait_for_screen(TAG_HIS);
+    terminal.wait_for_screen("echo HK_ARROW_HISTORY_SEED");
+    terminal.wait_for_screen("▶");
+    let text = terminal.screen_text();
+    assert!(!text.contains("HK_NATIVE_UP"), "zle Up widget ran:\n{text}");
+
+    terminal.write(b"\x1b");
+    terminal.settle(Duration::from_millis(300));
+    assert_no_overlay_rows(&terminal);
+
+    // Standard CSI Down follows the same entry path after the list is closed.
+    terminal.write(b"\x1b[B");
+    terminal.wait_for_screen(TAG_HIS);
+    terminal.wait_for_screen("▶");
+    let text = terminal.screen_text();
+    assert!(
+        !text.contains("HK_NATIVE_DOWN"),
+        "zle Down widget ran:\n{text}"
+    );
 
     terminal.exit_shell();
     terminal.wait_until_exit();

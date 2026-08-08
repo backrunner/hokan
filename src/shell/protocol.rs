@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{ffi::OsString, path::PathBuf};
 
 use super::ShellKind;
 use crate::terminal::BoundaryId;
@@ -7,6 +7,9 @@ const MAX_FRAME_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ShellEvent {
+    PathChanged {
+        path: OsString,
+    },
     Prompt {
         boundary_id: BoundaryId,
         cwd: PathBuf,
@@ -94,6 +97,27 @@ impl ShellProtocolDecoder {
     }
 
     fn decode_frame(&mut self, frame: &[u8], output: &mut DecodedShellEvents) {
+        // PATH is an OS string, not shell text. Unix permits arbitrary
+        // non-NUL bytes in it, so decode this event before requiring UTF-8 for
+        // the text-bearing protocol events.
+        if let Some(payload) = frame.strip_prefix(b"HKP2\tPATH\t") {
+            push_decoded(
+                output,
+                "PATH",
+                os_string_from_bytes(payload, "PATH").map(|path| ShellEvent::PathChanged { path }),
+            );
+            return;
+        }
+        if let Some(payload) = frame.strip_prefix(b"HKP2\tPROMPT\t") {
+            let decoded = self.decode_prompt_bytes(payload);
+            push_decoded(output, "PROMPT", decoded);
+            return;
+        }
+        if let Some(payload) = frame.strip_prefix(b"HKP2\tEND\t") {
+            let decoded = self.decode_end_bytes(payload);
+            push_decoded(output, "END", decoded);
+            return;
+        }
         let Ok(frame) = std::str::from_utf8(frame) else {
             output.buffer_uncertain = true;
             output.diagnostics.push(ProtocolDiagnostic {
@@ -113,6 +137,9 @@ impl ShellProtocolDecoder {
         let event = envelope.next().unwrap_or_default();
         let payload = envelope.next().unwrap_or_default();
         let decoded = match event {
+            "PATH" => Ok(ShellEvent::PathChanged {
+                path: OsString::from(payload),
+            }),
             "PROMPT" => self.decode_prompt(payload),
             "BUFFER" => self.decode_buffer(payload),
             "START" => self.decode_start(payload),
@@ -122,33 +149,38 @@ impl ShellProtocolDecoder {
                 format!("ignored unknown shell event {event:?}"),
             )),
         };
-        match decoded {
-            Ok(event) => output.events.push(event),
-            Err((code, message)) => {
-                if event == "BUFFER" {
-                    output.buffer_uncertain = true;
-                }
-                output
-                    .diagnostics
-                    .push(ProtocolDiagnostic { code, message });
-            }
-        }
+        push_decoded(output, event, decoded);
     }
 
     fn decode_prompt(&mut self, payload: &str) -> Result<ShellEvent, (&'static str, String)> {
-        let (id, payload) = payload.split_once('\t').ok_or_else(|| {
+        self.decode_prompt_bytes(payload.as_bytes())
+    }
+
+    fn decode_prompt_bytes(
+        &mut self,
+        payload: &[u8],
+    ) -> Result<ShellEvent, (&'static str, String)> {
+        let (id, payload) = split_once_byte(payload, b'\t').ok_or_else(|| {
             (
                 "HK-SHL-010",
                 "prompt event is missing its working directory".into(),
             )
         })?;
+        let id = std::str::from_utf8(id)
+            .map_err(|_| ("HK-SHL-010", "prompt id is not valid UTF-8".into()))?;
         let id = parse_monotonic_id(Some(id), self.last_prompt_id, "prompt")?;
         let (cwd, history_control) = match self.shell {
             ShellKind::Bash => {
-                let (history_control, cwd) = payload.split_once('\t').ok_or_else(|| {
+                let (history_control, cwd) = split_once_byte(payload, b'\t').ok_or_else(|| {
                     (
                         "HK-SHL-010",
                         "bash prompt event is missing its working directory".into(),
+                    )
+                })?;
+                let history_control = std::str::from_utf8(history_control).map_err(|_| {
+                    (
+                        "HK-SHL-010",
+                        "bash history control is not valid UTF-8".into(),
                     )
                 })?;
                 (
@@ -162,7 +194,7 @@ impl ShellProtocolDecoder {
         self.active_command = None;
         Ok(ShellEvent::Prompt {
             boundary_id: BoundaryId::new(id),
-            cwd: PathBuf::from(cwd),
+            cwd: PathBuf::from(os_string_from_bytes(cwd, "prompt cwd")?),
             history_control,
         })
     }
@@ -209,12 +241,18 @@ impl ShellProtocolDecoder {
     }
 
     fn decode_end(&mut self, payload: &str) -> Result<ShellEvent, (&'static str, String)> {
-        let (exit_code, cwd) = payload.split_once('\t').ok_or_else(|| {
+        self.decode_end_bytes(payload.as_bytes())
+    }
+
+    fn decode_end_bytes(&mut self, payload: &[u8]) -> Result<ShellEvent, (&'static str, String)> {
+        let (exit_code, cwd) = split_once_byte(payload, b'\t').ok_or_else(|| {
             (
                 "HK-SHL-009",
                 "command end event is missing its working directory".into(),
             )
         })?;
+        let exit_code = std::str::from_utf8(exit_code)
+            .map_err(|_| ("HK-SHL-009", "command exit code is not valid UTF-8".into()))?;
         let exit_code = exit_code
             .parse::<i32>()
             .map_err(|_| ("HK-SHL-009", "command exit code is not an integer".into()))?;
@@ -226,9 +264,46 @@ impl ShellProtocolDecoder {
         })?;
         Ok(ShellEvent::CommandEnd {
             exit_code,
-            cwd: PathBuf::from(cwd),
+            cwd: PathBuf::from(os_string_from_bytes(cwd, "command cwd")?),
             command,
         })
+    }
+}
+
+fn push_decoded(
+    output: &mut DecodedShellEvents,
+    event: &str,
+    decoded: Result<ShellEvent, (&'static str, String)>,
+) {
+    match decoded {
+        Ok(event) => output.events.push(event),
+        Err((code, message)) => {
+            if event == "BUFFER" {
+                output.buffer_uncertain = true;
+            }
+            output
+                .diagnostics
+                .push(ProtocolDiagnostic { code, message });
+        }
+    }
+}
+
+fn split_once_byte(bytes: &[u8], delimiter: u8) -> Option<(&[u8], &[u8])> {
+    let index = bytes.iter().position(|byte| *byte == delimiter)?;
+    Some((&bytes[..index], &bytes[index + 1..]))
+}
+
+fn os_string_from_bytes(bytes: &[u8], _field: &str) -> Result<OsString, (&'static str, String)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        Ok(OsString::from_vec(bytes.to_vec()))
+    }
+    #[cfg(not(unix))]
+    {
+        std::str::from_utf8(bytes)
+            .map(OsString::from)
+            .map_err(|_| ("HK-SHL-005", format!("shell {_field} was not valid UTF-8")))
     }
 }
 
@@ -309,6 +384,88 @@ mod tests {
                 cwd: PathBuf::from("/tmp"),
                 history_control: Some("ignoreboth:erasedups".into()),
             }]
+        );
+    }
+
+    #[test]
+    fn decodes_child_shell_path_as_an_opaque_payload() {
+        let mut decoder = ShellProtocolDecoder::new(ShellKind::Zsh);
+        assert_eq!(
+            decoder
+                .feed(b"HKP2\tPATH\t/opt/bin:/tmp/with\t-tab\0")
+                .events,
+            vec![ShellEvent::PathChanged {
+                path: "/opt/bin:/tmp/with\t-tab".into(),
+            }]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preserves_non_utf8_bytes_in_child_shell_path() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut frame = b"HKP2\tPATH\t/opt/bin:/tmp/non-utf8-".to_vec();
+        frame.push(0xff);
+        frame.push(0);
+        let mut expected = b"/opt/bin:/tmp/non-utf8-".to_vec();
+        expected.push(0xff);
+
+        let mut decoder = ShellProtocolDecoder::new(ShellKind::Zsh);
+        let output = decoder.feed(&frame);
+        assert!(!output.buffer_uncertain);
+        assert!(output.diagnostics.is_empty());
+        assert_eq!(
+            output.events,
+            vec![ShellEvent::PathChanged {
+                path: OsString::from_vec(expected),
+            }]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preserves_non_utf8_bytes_in_prompt_and_command_cwds() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut cwd = b"/tmp/non-utf8-".to_vec();
+        cwd.push(0xfe);
+        let expected = PathBuf::from(OsString::from_vec(cwd.clone()));
+
+        let mut prompt = b"HKP2\tPROMPT\t1\t".to_vec();
+        prompt.extend_from_slice(&cwd);
+        prompt.push(0);
+        let mut decoder = ShellProtocolDecoder::new(ShellKind::Zsh);
+        let output = decoder.feed(&prompt);
+        assert!(!output.buffer_uncertain);
+        assert!(output.diagnostics.is_empty());
+        assert_eq!(
+            output.events,
+            vec![ShellEvent::Prompt {
+                boundary_id: BoundaryId::new(1),
+                cwd: expected.clone(),
+                history_control: None,
+            }]
+        );
+
+        let mut command = b"HKP2\tSTART\techo ok\0HKP2\tEND\t0\t".to_vec();
+        command.extend_from_slice(&cwd);
+        command.push(0);
+        let output = decoder.feed(&command);
+        assert!(!output.buffer_uncertain);
+        assert!(output.diagnostics.is_empty());
+        assert_eq!(
+            output.events,
+            vec![
+                ShellEvent::CommandStart {
+                    command: "echo ok".into(),
+                },
+                ShellEvent::CommandEnd {
+                    exit_code: 0,
+                    cwd: expected,
+                    command: "echo ok".into(),
+                },
+            ]
         );
     }
 

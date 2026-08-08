@@ -6,7 +6,9 @@ mod workspace;
 
 pub use git::{GitContext, GitRefs, GitRefsCache, GitStatus, GitStatusCache};
 pub use makefile::{MakeTarget, MakefileCache, MakefileManifest, ManifestKind, discover_makefile};
-pub use node_workspace::{NodeWorkspace, NodeWorkspaceCache, WorkspaceMember};
+pub use node_workspace::{
+    NodeWorkspace, NodeWorkspaceCache, WorkspaceMember, discover_node_workspace,
+};
 pub use package_json::{
     DenoManifest, PackageManifest, ProjectCache, discover_deno_json, discover_package_json,
 };

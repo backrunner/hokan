@@ -133,8 +133,8 @@ pub(super) fn detect_setup_mode(contents: &str) -> Option<&'static str> {
         return None;
     }
     let block = &contents[start..end];
-    if block.contains("alias hk=") {
-        Some("on-demand (`hk` alias)")
+    if block.contains("alias hk=") || block.contains("hk() {") {
+        Some("on-demand (`hk` command)")
     } else if block.contains("exec \"$__hokan_bin\"") {
         Some("auto-start (exec)")
     } else {
@@ -164,7 +164,7 @@ pub(super) fn scan_plugin_conflicts(path: &Path, contents: &str) -> Vec<Check> {
             Check::new(
                 CheckLevel::Warn,
                 format!(
-                    "{plugin} detected at {}:{line}; guard it with `[[ -z $HOKAN_ACTIVE ]] && <plugin init line>` so it stays active in normal shells but inactive inside Hokan, or switch to on-demand mode (`hokan setup --shell zsh --on-demand`)",
+                    "{plugin} detected at {}:{line}; guard it with `[[ -z $HOKAN_ACTIVE ]] && <plugin init line>` so it stays active in normal shells but inactive inside Hokan, or switch to on-demand mode (`hokan install --shell zsh --on-demand`)",
                     path.display()
                 ),
             )

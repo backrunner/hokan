@@ -16,7 +16,7 @@ use crate::completion::{
 use crate::config::Config;
 use crate::history::{HistoryCursor, HistoryIndex, HistoryPolicy, HistoryStore};
 use crate::platform::CommandPathCache;
-use crate::shell::ShellKind;
+use crate::shell::{ControlMessage, ShellEvent, ShellKind};
 use crate::terminal::{BufferRevision, QueryId, RiskLevel, TerminalSize};
 
 fn runtime_state(directory: &Path) -> RuntimeState {
@@ -31,7 +31,9 @@ fn runtime_state(directory: &Path) -> RuntimeState {
         "0123456789abcdef01234567".into(),
         None,
         Arc::new(CommandPathCache::default()),
+        Arc::new(crate::shell::AliasCache::default()),
         Arc::new(crate::specs::SpecRegistry::default()),
+        Arc::new(crate::providers::CommandHelpCache::default()),
     )
 }
 
@@ -42,7 +44,7 @@ fn bare_executable_holds_suggestions_until_space() {
     let directory = tempfile::tempdir().expect("directory");
     let bin = directory.path().join("bin");
     std::fs::create_dir(&bin).expect("bin directory");
-    for name in ["kimi", "git", "ls", "tar"] {
+    for name in ["kimi", "code", "codex", "deno", "git", "ls", "tar"] {
         let executable = bin.join(name);
         std::fs::write(&executable, b"#!/bin/sh\n").expect("write executable");
         let mut permissions = std::fs::metadata(&executable)
@@ -54,8 +56,9 @@ fn bare_executable_holds_suggestions_until_space() {
     let path = std::ffi::OsString::from(&bin);
     let commands = CommandPathCache::from_path(Some(&path));
     // The embedded spec set covers `ls` (requires_arguments = false) and
-    // `tar` (requires_arguments = true); `kimi` and `git` have no spec.
+    // `tar` (requires_arguments = true); `kimi`, `code`, and `git` have no spec.
     let specs = crate::specs::SpecRegistry::load(None);
+    let aliases = crate::shell::AliasCache::default();
     let awaiting = |text: &str| {
         let snapshot = BufferSnapshot::new(
             Arc::<str>::from(text),
@@ -71,11 +74,17 @@ fn bare_executable_holds_suggestions_until_space() {
             snapshot,
         )
         .expect("context");
-        executable_awaiting_arguments(&context, &commands, &specs)
+        executable_awaiting_arguments(&context, &commands, &aliases, &specs)
     };
 
     // Bare executable word, cursor on it: hold suggestions.
     assert!(awaiting("kimi"));
+    // Exact runnable names are final even when a longer executable shares the
+    // prefix (`code` and `codex`). Prefix completion remains available at
+    // `cod`, before either exact name has been entered.
+    assert!(awaiting("code"));
+    assert!(awaiting("codex"));
+    assert!(!awaiting("deno"));
     // A trailing space commits to arguments: suggestions resume.
     assert!(!awaiting("kimi "));
     // Unknown prefix keeps path completion alive.
@@ -83,10 +92,15 @@ fn bare_executable_holds_suggestions_until_space() {
     // With wrapper peeling, `sudo kimi` IS the bare effective command `kimi`:
     // the same hold-back applies as for a plain `kimi`.
     assert!(awaiting("sudo kimi"));
+    assert!(awaiting("sudo -u root kimi"));
+    // A redirect target is an argument/path slot, even though
+    // `argument_progress` intentionally hides it from argv semantics.
+    assert!(!awaiting("kimi > lo"));
     // A subcommand-style CLI cannot run standalone: no holding back.
     assert!(!awaiting("git"));
-    // Spec-covered commands keep their recipe rows at the bare position.
-    assert!(!awaiting("ls"));
+    // Static recipes also wait for the argument-opening space when the command
+    // itself is runnable; specs marked requires_arguments remain open.
+    assert!(awaiting("ls"));
     assert!(!awaiting("tar"));
 
     // Same executable with the cursor mid-word: still the runnable token.
@@ -104,7 +118,200 @@ fn bare_executable_holds_suggestions_until_space() {
     )
     .expect("context");
     mid_word.parsed = crate::parser::parse_line("kimi", 2).expect("parse");
-    assert!(executable_awaiting_arguments(&mid_word, &commands, &specs));
+    assert!(executable_awaiting_arguments(
+        &mid_word, &commands, &aliases, &specs
+    ));
+}
+
+#[test]
+fn exact_executable_prefetches_dynamic_help_before_the_space() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir().expect("directory");
+    let bin = directory.path().join("bin");
+    std::fs::create_dir(&bin).expect("bin directory");
+    let executable = bin.join("codex-fixture");
+    std::fs::write(
+        &executable,
+        b"#!/bin/sh\nprintf '%s\\n' 'Commands:' '  resume    Resume a session'\n",
+    )
+    .expect("write executable");
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
+        .expect("executable mode");
+    let commands = CommandPathCache::from_path(Some(&std::ffi::OsString::from(&bin)));
+    let specs = crate::specs::SpecRegistry::default();
+    let help = Arc::new(crate::providers::CommandHelpCache::default());
+    let context = CompletionContext::new(
+        QueryId::new(1),
+        ShellKind::Zsh,
+        directory.path().to_owned(),
+        BufferSnapshot::new(
+            Arc::<str>::from("codex-fixture"),
+            "codex-fixture".len(),
+            BufferRevision::ZERO,
+            SyncQuality::Exact,
+        )
+        .expect("snapshot"),
+    )
+    .expect("context");
+
+    super::state::prefetch_command_help(&context, &commands, &specs, &help);
+    assert_eq!(help.fetch_count(), 1);
+    // A repeated buffer event must share the same pending/cache entry.
+    super::state::prefetch_command_help(&context, &commands, &specs, &help);
+    assert_eq!(help.fetch_count(), 1);
+}
+
+#[test]
+fn bare_alias_or_function_holds_until_space_even_with_a_longer_name() {
+    let directory = tempfile::tempdir().expect("directory");
+    let commands = CommandPathCache::default();
+    let specs = crate::specs::SpecRegistry::default();
+    let mut definitions = crate::shell::ShellAliases::default();
+    crate::shell::parse_rc_text(
+        ShellKind::Zsh,
+        "alias ship='git push'\nalias co='git checkout'\ncommit() { git commit \"$@\"; }\n",
+        &mut definitions,
+    );
+    let aliases = crate::shell::AliasCache::new_fixed(definitions);
+    let awaiting = |text: &str| {
+        let context = CompletionContext::new(
+            QueryId::new(1),
+            ShellKind::Zsh,
+            directory.path().to_owned(),
+            BufferSnapshot::new(
+                Arc::<str>::from(text),
+                text.len(),
+                BufferRevision::ZERO,
+                SyncQuality::Exact,
+            )
+            .expect("snapshot"),
+        )
+        .expect("context");
+        executable_awaiting_arguments(&context, &commands, &aliases, &specs)
+    };
+
+    assert!(awaiting("ship"));
+    assert!(awaiting("time ship"));
+    assert!(!awaiting("ship "));
+    assert!(awaiting("co"), "an exact alias is final despite `commit`");
+    assert!(
+        !awaiting("sudo ship"),
+        "external wrappers do not expand aliases"
+    );
+    assert!(!awaiting("command ship"), "`command` bypasses aliases");
+}
+
+#[test]
+fn bare_shell_symbols_hold_only_in_their_valid_resolution_domain() {
+    let directory = tempfile::tempdir().expect("directory");
+    let commands = CommandPathCache::default();
+    let aliases = crate::shell::AliasCache::default();
+    let specs = crate::specs::SpecRegistry::default();
+    let awaiting = |text: &str| {
+        let context = CompletionContext::new(
+            QueryId::new(1),
+            ShellKind::Zsh,
+            directory.path().to_owned(),
+            BufferSnapshot::new(
+                Arc::<str>::from(text),
+                text.len(),
+                BufferRevision::ZERO,
+                SyncQuality::Exact,
+            )
+            .expect("snapshot"),
+        )
+        .expect("context");
+        executable_awaiting_arguments(&context, &commands, &aliases, &specs)
+    };
+
+    assert!(awaiting("pwd"));
+    assert!(awaiting("command pwd"));
+    assert!(awaiting("builtin pwd"));
+    assert!(!awaiting("sudo pwd"));
+    assert!(!awaiting("if"), "reserved words need more shell syntax");
+
+    assert!(awaiting("compdef"), "standard zsh functions are callable");
+    assert!(!awaiting("command compdef"), "`command` bypasses functions");
+    assert!(!awaiting("builtin compdef"), "functions are not builtins");
+}
+
+#[test]
+fn child_shell_path_event_refreshes_the_shared_provider_cache() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir().expect("directory");
+    let bin = directory.path().join("child-bin");
+    std::fs::create_dir(&bin).expect("bin directory");
+    let executable = bin.join("second-command");
+    std::fs::write(&executable, b"#!/bin/sh\n").expect("write executable");
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
+        .expect("executable mode");
+
+    let mut state = runtime_state(directory.path());
+    state.editing = true;
+    state.buffer.set_exact("second".into(), 6).expect("buffer");
+    let mut engine = crate::completion::CompletionEngine::new(20, 12);
+    engine.register(crate::providers::PathCommandProvider::new(Arc::clone(
+        &state.commands,
+    )));
+    let worker = ProviderWorker::start(Arc::new(engine), None).expect("provider worker");
+    let (output, join) = test_output();
+    let store = HistoryStore::open(&directory.path().join("state")).expect("history store");
+    let history = Arc::new(RwLock::new(HistoryIndex::default()));
+    let policy = HistoryPolicy::new(1024, &[]).expect("history policy");
+
+    handle_control_message(
+        ControlMessage::Event(ShellEvent::PathChanged {
+            path: bin.as_os_str().to_owned(),
+        }),
+        &mut state,
+        &output,
+        &worker,
+        &store,
+        &history,
+        &policy,
+    )
+    .expect("PATH event");
+
+    assert!(state.commands.contains("second-command"));
+    let result = worker
+        .results()
+        .recv_timeout(Duration::from_secs(2))
+        .expect("refreshed completion result");
+    assert!(result.output.candidates.iter().any(|candidate| {
+        candidate.display.primary == "second-command"
+            && candidate.source == CandidateSource::PathCommand
+    }));
+
+    output.restore_and_exit().expect("shutdown");
+    join.join().expect("actor joins").expect("actor exits");
+}
+
+#[test]
+fn background_help_refresh_does_not_steal_owned_overlay_states() {
+    let directory = tempfile::tempdir().expect("directory");
+    let mut state = runtime_state(directory.path());
+    state.editing = true;
+    state
+        .buffer
+        .set_exact("natural language request".into(), 24)
+        .expect("buffer");
+    state.ai_owns_candidates = true;
+    state.help.bump_revision();
+
+    let worker = ProviderWorker::start(
+        Arc::new(crate::completion::CompletionEngine::new(20, 12)),
+        None,
+    )
+    .expect("provider worker");
+    let before = state.query_id;
+    state
+        .refresh_help_results(&worker)
+        .expect("refresh help revision");
+
+    assert_eq!(state.query_id, before, "AI-owned rows must not be replaced");
+    assert_eq!(state.help_revision, state.help.revision());
 }
 
 #[test]
@@ -623,6 +830,40 @@ fn navigation_intent_does_not_create_a_selection_by_itself() {
     );
     handle_provider_result(result, &mut state, &output).expect("provider result");
     assert_eq!(state.selected, None);
+    output.restore_and_exit().expect("shutdown");
+    join.join().expect("actor joins").expect("actor exits");
+}
+
+#[test]
+fn deferred_navigation_lands_on_the_first_history_batch() {
+    let directory = tempfile::tempdir().expect("directory");
+    let mut state = runtime_state(directory.path());
+    let (output, join) = crate::terminal::spawn_with_writer(
+        Vec::new(),
+        session_token(),
+        TerminalSize::new(24, 80).expect("terminal size"),
+        3,
+    )
+    .expect("output actor");
+
+    state.buffer.set_exact(String::new(), 0).expect("buffer");
+    state.history_only = true;
+    refresh_context(&mut state, QueryId::new(1));
+    defer_selection(&mut state, 1);
+    let result = provider_result(
+        &state,
+        vec![
+            history_candidate(QueryId::new(1), "echo newest"),
+            history_candidate(QueryId::new(1), "echo older"),
+        ],
+    );
+    handle_provider_result(result, &mut state, &output).expect("provider result");
+
+    assert_eq!(
+        state.selected,
+        Some(state.candidates[0].id),
+        "the Down key that opened history must select the first row"
+    );
     output.restore_and_exit().expect("shutdown");
     join.join().expect("actor joins").expect("actor exits");
 }

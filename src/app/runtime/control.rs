@@ -30,6 +30,15 @@ pub(super) fn handle_control_message(
     policy: &HistoryPolicy,
 ) -> crate::Result<()> {
     match message {
+        ControlMessage::Event(ShellEvent::PathChanged { path }) => {
+            if state.commands.refresh_from_path(Some(path.as_os_str()))
+                && state.editing
+                && state.buffer.sync != SyncQuality::Uncertain
+                && (!state.buffer.text.trim().is_empty() || state.history_only)
+            {
+                state.schedule_query(worker)?;
+            }
+        }
         ControlMessage::Event(ShellEvent::Prompt {
             boundary_id,
             cwd,
@@ -155,8 +164,17 @@ pub(super) fn handle_config_reload(
             );
             let (live, restart_required) = merge_live_config(config, *loaded);
             let live = Arc::new(live);
-            let (engine, _, _, _) = build_engine(paths, &live, Arc::clone(history));
+            let (engine, specs, _, help, aliases) = build_engine(
+                paths,
+                &live,
+                Arc::clone(history),
+                Some(Arc::clone(&state.commands)),
+            );
             worker.replace_engine(engine)?;
+            state.specs = specs;
+            state.aliases = aliases;
+            state.help_revision = help.revision();
+            state.help = help;
             state.cancel_ai();
             state.overlay_visible = false;
             state.pending_confirm = None;

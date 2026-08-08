@@ -71,6 +71,14 @@ pub fn classify_command(command: &str) -> RiskAssessment {
                 RiskReason::PrivilegeElevation,
             );
         }
+        if command.opaque || command.indeterminate {
+            raise_with_reason(
+                &mut level,
+                RiskLevel::Unknown,
+                &mut reasons,
+                RiskReason::OpaqueSyntax,
+            );
+        }
         classify_simple_command(command, &mut level, &mut reasons);
     }
 
@@ -115,15 +123,22 @@ pub fn classify_command(command: &str) -> RiskAssessment {
     assessment(level, reasons)
 }
 
-/// The effective command word of the first segment, after peeling variable
-/// assignments and wrapper commands (`sudo`/`env`/`command`/`builtin`/
-/// `nohup`/`xargs`), exactly as the risk classifier sees it. The word is
-/// returned as written (no `basename` normalization) so callers can still
-/// recognize explicit paths. `None` when the line cannot be parsed, uses
-/// opaque substitutions, or has no command word — callers filtering "clearly
-/// wrong" commands must treat `None` as "unknown", not as "invalid".
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct EffectiveCommandInfo {
+    pub(crate) word: String,
+    pub(crate) kind: crate::parser::EffectiveCommandKind,
+    pub(crate) indeterminate: bool,
+}
+
+/// The effective command of the first segment, after peeling assignments and
+/// wrappers exactly as completion and the risk classifier do. The raw word is
+/// preserved for explicit-path checks; `kind` records whether the surrounding
+/// syntax accepts aliases/builtins or requires a PATH executable.
 #[must_use]
-pub(crate) fn effective_command_word(command: &str) -> Option<String> {
+pub(crate) fn effective_command_info_for_shell(
+    command: &str,
+    shell: crate::shell::ShellKind,
+) -> Option<EffectiveCommandInfo> {
     let parsed = crate::parser::parse_line(command, command.len()).ok()?;
     if parsed
         .tokens
@@ -133,137 +148,117 @@ pub(crate) fn effective_command_word(command: &str) -> Option<String> {
         return None;
     }
     let segments = command_segments(&parsed.tokens);
-    command_view(segments.first()?.as_slice()).map(|view| view.raw_name.to_owned())
+    let words = segments.first()?.as_slice();
+    let analysis = crate::parser::effective_command_analysis_for_shell(words, false, shell);
+    let (index, indeterminate) = match analysis.state {
+        crate::parser::EffectiveCommandState::Found(index)
+        | crate::parser::EffectiveCommandState::WrapperCommand(index) => (index, false),
+        crate::parser::EffectiveCommandState::IndeterminateWrapper(index) => (index, true),
+        crate::parser::EffectiveCommandState::AwaitingCommand
+        | crate::parser::EffectiveCommandState::AwaitingWrapperValue => return None,
+    };
+    Some(EffectiveCommandInfo {
+        word: words[index].to_owned(),
+        kind: analysis.kind,
+        indeterminate,
+    })
+}
+
+#[must_use]
+pub(crate) fn effective_command_word_for_shell(
+    command: &str,
+    shell: crate::shell::ShellKind,
+) -> Option<String> {
+    effective_command_info_for_shell(command, shell).map(|info| info.word)
 }
 
 #[derive(Clone, Copy)]
 struct CommandView<'a> {
     name: &'a str,
-    /// The command word as written, before `basename` normalization — the
-    /// history provider needs it to recognize explicit paths (`./run.sh`).
-    raw_name: &'a str,
     args: &'a [&'a str],
     privileged: bool,
+    opaque: bool,
+    indeterminate: bool,
 }
 
 fn command_segments(tokens: &[crate::parser::Token]) -> Vec<Vec<&str>> {
-    let mut segments = vec![Vec::new()];
+    let mut ranges = Vec::new();
+    let mut start = 0;
     for token in tokens {
-        match token.kind {
-            TokenKind::Word => {
-                if let Some(segment) = segments.last_mut() {
-                    segment.push(token.cooked_prefix.as_str());
-                }
-            }
-            TokenKind::Pipe | TokenKind::AndIf | TokenKind::OrIf | TokenKind::Separator => {
-                segments.push(Vec::new());
-            }
-            _ => {}
+        if matches!(
+            token.kind,
+            TokenKind::Pipe | TokenKind::AndIf | TokenKind::OrIf | TokenKind::Separator
+        ) {
+            ranges.push(start..token.range.start);
+            start = token.range.end;
         }
     }
-    segments
+    let end = tokens.last().map_or(start, |token| token.range.end);
+    ranges.push(start..end);
+    ranges
+        .iter()
+        .map(|range| {
+            crate::parser::semantic_word_tokens(tokens, range)
+                .into_iter()
+                .map(|token| token.cooked_prefix.as_str())
+                .collect()
+        })
+        .collect()
 }
 
 fn command_view<'a>(words: &'a [&'a str]) -> Option<CommandView<'a>> {
-    let mut index = 0;
-    let mut privileged = false;
-    skip_assignments(words, &mut index);
-    while index < words.len() {
-        match basename(words[index]) {
-            "sudo" => {
-                privileged = true;
-                index += 1;
-                skip_wrapper_options(
-                    words,
-                    &mut index,
-                    &[
-                        "-u", "--user", "-g", "--group", "-h", "--host", "-p", "--prompt",
-                    ],
-                );
-                skip_assignments(words, &mut index);
-            }
-            "env" => {
-                index += 1;
-                skip_wrapper_options(words, &mut index, &["-u", "--unset", "-C", "--chdir"]);
-                skip_assignments(words, &mut index);
-            }
-            "command" | "builtin" | "nohup" => {
-                index += 1;
-                while index < words.len() && words[index].starts_with('-') {
-                    index += 1;
-                }
-            }
-            "xargs" => {
-                index += 1;
-                // Options with a separate value; attached forms (`-n1`,
-                // `-I{}`) are skipped as plain options.
-                skip_wrapper_options(
-                    words,
-                    &mut index,
-                    &[
-                        "-E",
-                        "-e",
-                        "-I",
-                        "-L",
-                        "-n",
-                        "-P",
-                        "-s",
-                        "-S",
-                        "--eof",
-                        "--replace",
-                        "--max-lines",
-                        "--max-args",
-                        "--max-procs",
-                        "--max-chars",
-                        "--delimiter",
-                    ],
-                );
-            }
-            _ => {
-                return Some(CommandView {
-                    name: basename(words[index]),
-                    raw_name: words[index],
-                    args: &words[index + 1..],
-                    privileged,
-                });
-            }
-        }
-    }
-    None
-}
-
-fn skip_assignments(words: &[&str], index: &mut usize) {
-    while *index < words.len() && is_assignment(words[*index]) {
-        *index += 1;
-    }
-}
-
-fn is_assignment(word: &str) -> bool {
-    let Some((name, _)) = word.split_once('=') else {
-        return false;
+    let analysis = crate::parser::effective_command_analysis(words, false);
+    let (mut index, mut indeterminate) = match analysis.state {
+        crate::parser::EffectiveCommandState::Found(index)
+        | crate::parser::EffectiveCommandState::WrapperCommand(index) => (index, false),
+        crate::parser::EffectiveCommandState::IndeterminateWrapper(index) => (index, true),
+        crate::parser::EffectiveCommandState::AwaitingCommand
+        | crate::parser::EffectiveCommandState::AwaitingWrapperValue => return None,
     };
-    let mut characters = name.chars();
-    characters
-        .next()
-        .is_some_and(|character| character == '_' || character.is_ascii_alphabetic())
-        && characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
+    if let Some(dispatched) = dispatched_command_index(words, index) {
+        index = dispatched;
+    } else if dispatches_command(basename(words[index]), words.get(index + 1).copied()) {
+        indeterminate = true;
+    }
+    Some(CommandView {
+        name: basename(words[index]),
+        args: &words[index + 1..],
+        privileged: analysis.privileged,
+        opaque: analysis.opaque,
+        indeterminate,
+    })
 }
 
-fn skip_wrapper_options(words: &[&str], index: &mut usize, options_with_value: &[&str]) {
-    while *index < words.len() {
-        let word = words[*index];
-        if word == "--" {
-            *index += 1;
-            break;
-        }
-        if !word.starts_with('-') || word == "-" {
-            break;
-        }
-        *index += 1;
-        if options_with_value.contains(&word) && *index < words.len() {
-            *index += 1;
-        }
+fn dispatches_command(command: &str, first_argument: Option<&str>) -> bool {
+    match command {
+        "pnpm" | "yarn" => matches!(first_argument, Some("exec" | "dlx")),
+        "npm" => first_argument == Some("exec"),
+        "bun" => first_argument == Some("x"),
+        "npx" => true,
+        _ => false,
     }
+}
+
+fn dispatched_command_index(words: &[&str], command_index: usize) -> Option<usize> {
+    let command = basename(words[command_index]);
+    let mut index = match command {
+        "pnpm" | "yarn"
+            if matches!(words.get(command_index + 1).copied(), Some("exec" | "dlx")) =>
+        {
+            command_index + 2
+        }
+        "npm" if words.get(command_index + 1).copied() == Some("exec") => command_index + 2,
+        "bun" if words.get(command_index + 1).copied() == Some("x") => command_index + 2,
+        "npx" => command_index + 1,
+        _ => return None,
+    };
+    while words.get(index).copied() == Some("--") {
+        index += 1;
+    }
+    words
+        .get(index)
+        .is_some_and(|word| !word.starts_with('-'))
+        .then_some(index)
 }
 
 fn basename(command: &str) -> &str {
@@ -586,6 +581,21 @@ mod tests {
             ("echo hi > file", RiskLevel::Medium),
             ("rm -rf ./build", RiskLevel::High),
             ("sudo /bin/rm -f ./artifact", RiskLevel::High),
+            ("doas -u root rm -rf ./artifact", RiskLevel::High),
+            ("timeout 2 rm -rf ./artifact", RiskLevel::High),
+            ("watch -n 1 rm -rf ./artifact", RiskLevel::High),
+            ("time -f %E rm ./artifact", RiskLevel::Medium),
+            ("nice -n 5 rm ./artifact", RiskLevel::Medium),
+            ("stdbuf -oL rm ./artifact", RiskLevel::Medium),
+            ("setsid -f rm ./artifact", RiskLevel::Medium),
+            ("noglob rm ./artifact", RiskLevel::Medium),
+            ("! rm ./artifact", RiskLevel::Medium),
+            ("builtin command rm -rf ./artifact", RiskLevel::High),
+            ("command command rm -rf ./artifact", RiskLevel::High),
+            ("pnpm exec rm -rf ./artifact", RiskLevel::High),
+            ("npm exec -- rm ./artifact", RiskLevel::Medium),
+            ("yarn exec rm ./artifact", RiskLevel::Medium),
+            ("npx rm ./artifact", RiskLevel::Medium),
             ("find . -delete", RiskLevel::High),
             (r"find . -exec rm -f {} \;", RiskLevel::High),
             ("chmod -R 755 tree", RiskLevel::High),
@@ -608,6 +618,10 @@ mod tests {
             ("cat >(rm -rf /)", RiskLevel::Unknown),
             ("eval 'rm -rf /'", RiskLevel::Unknown),
             ("builtin eval payload", RiskLevel::Unknown),
+            ("command -v rm", RiskLevel::Low),
+            ("sudo -e /etc/hosts", RiskLevel::Medium),
+            ("sudo --not-a-real-option value rm", RiskLevel::Unknown),
+            ("env -S 'rm -rf /'", RiskLevel::Unknown),
             ("source ./script.sh", RiskLevel::Unknown),
             (". ./script.sh", RiskLevel::Unknown),
             ("exec rm -rf /", RiskLevel::Unknown),
@@ -658,5 +672,9 @@ mod tests {
         assert!(recursive.reasons.contains(&RiskReason::PrivilegeElevation));
         assert!(recursive.reasons.contains(&RiskReason::PermissionChange));
         assert!(recursive.reasons.contains(&RiskReason::RecursiveOperation));
+
+        let doas = classify_command("doas rm file");
+        assert!(doas.reasons.contains(&RiskReason::PrivilegeElevation));
+        assert!(doas.reasons.contains(&RiskReason::DestructiveCommand));
     }
 }

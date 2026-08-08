@@ -7,12 +7,12 @@ use std::{
 
 use super::{super::buffer::EditableBuffer, worker::ProviderWorker};
 use crate::{
-    completion::{BufferSnapshot, Candidate, CompletionContext, SyncQuality},
+    completion::{BufferSnapshot, Candidate, CompletionContext, CompletionMode, SyncQuality},
     diagnostics::DebugLog,
     history::{HistoryCursor, HistoryEventV1},
     platform::CommandPathCache,
-    providers::argument_progress,
-    shell::ShellKind,
+    providers::CommandHelpCache,
+    shell::{AliasCache, ShellKind},
     specs::SpecRegistry,
     terminal::{
         BufferRevision, FrameRequest, FrameRevision, LatestFrameScheduler, QueryId, TerminalSize,
@@ -49,7 +49,10 @@ pub(super) struct RuntimeState {
     pub(super) previous_command: Option<String>,
     pub(super) workspace_probe: crate::project::WorkspaceProbe,
     pub(super) commands: Arc<CommandPathCache>,
+    pub(super) aliases: Arc<AliasCache>,
     pub(super) specs: Arc<SpecRegistry>,
+    pub(super) help: Arc<CommandHelpCache>,
+    pub(super) help_revision: u64,
     pub(super) pending_confirm: Option<PendingConfirm>,
     pub(super) ai_query: Option<ActiveAiRequest>,
     /// Bumped for every AI request so a late result from a superseded request
@@ -91,8 +94,11 @@ impl RuntimeState {
         history_session_id: String,
         debug_log: Option<DebugLog>,
         commands: Arc<CommandPathCache>,
+        aliases: Arc<AliasCache>,
         specs: Arc<SpecRegistry>,
+        help: Arc<CommandHelpCache>,
     ) -> Self {
+        let help_revision = help.revision();
         Self {
             shell,
             terminal_size,
@@ -121,7 +127,10 @@ impl RuntimeState {
             previous_command: None,
             workspace_probe: crate::project::WorkspaceProbe::default(),
             commands,
+            aliases,
             specs,
+            help,
+            help_revision,
             pending_confirm: None,
             ai_query: None,
             ai_generation: 0,
@@ -200,17 +209,26 @@ impl RuntimeState {
                 self.cwd.clone(),
                 self.snapshot()?,
             )?
+            .with_mode(if self.history_only {
+                CompletionMode::HistoryOnly
+            } else {
+                CompletionMode::Normal
+            })
             .with_previous_command(self.previous_command.clone())
             .with_workspace(self.workspace_probe.markers(&self.cwd)),
         );
-        // A bare executable word with the cursor still on it (`kimi`, no
-        // trailing space) is already runnable — hold suggestions until the
-        // user commits to arguments with a space instead of flashing rows
-        // that all just complete the same command name. Spec-covered
-        // commands are exempt: their recipe rows (`ls -la`) are exactly what
-        // the user wants next.
+        if !self.history_only {
+            prefetch_command_help(&context, &self.commands, &self.specs, &self.help);
+        }
+        // A bare runnable command word with the cursor still on it (`kimi`, no
+        // trailing space) is already complete, whether it resolves through
+        // PATH, a shell builtin/standard function, or a user alias/function.
+        // Hold suggestions until the user commits to arguments with a space
+        // instead of flashing rows that all just complete the same command
+        // name. Specs and dynamic help become eligible after that space;
+        // commands marked as requiring arguments remain open immediately.
         if !self.history_only
-            && executable_awaiting_arguments(&context, &self.commands, &self.specs)
+            && executable_awaiting_arguments(&context, &self.commands, &self.aliases, &self.specs)
         {
             self.context = None;
             self.candidates.clear();
@@ -222,6 +240,28 @@ impl RuntimeState {
         self.context = Some(Arc::clone(&context));
         self.provider_pending = true;
         worker.schedule(context)
+    }
+
+    pub(super) fn refresh_help_results(&mut self, worker: &ProviderWorker) -> crate::Result<()> {
+        let revision = self.help.revision();
+        if revision == self.help_revision {
+            return Ok(());
+        }
+        self.help_revision = revision;
+        // A help fetch can finish long after the buffer that requested it.
+        // Never let that background completion steal the overlay from an AI
+        // request/result or a dangerous-command confirmation; the next real
+        // buffer edit will query the warmed cache normally.
+        if self.pending_confirm.is_some() || self.ai_query.is_some() || self.ai_owns_candidates {
+            return Ok(());
+        }
+        if self.editing
+            && self.buffer.sync != SyncQuality::Uncertain
+            && (!self.buffer.text.trim().is_empty() || self.history_only)
+        {
+            self.schedule_query(worker)?;
+        }
+        Ok(())
     }
 
     pub(super) fn cancel_ai(&mut self) {
@@ -274,31 +314,73 @@ pub(super) fn visible_page_size(max_overlay_height: u16, terminal_size: Terminal
 }
 
 /// True while the cursor is still on the command token (no trailing
-/// whitespace) and the typed word is itself an executable on PATH that runs
-/// standalone — a bare `kimi`. The line is already runnable, so suggestions
-/// wait for the space that commits the user to typing arguments. Spec-covered
-/// commands are NOT held back (their recipe rows are useful at the bare
-/// position), and neither are commands that do nothing useful without
-/// arguments (`git` and other subcommand-style CLIs, specs with
-/// `requires_arguments`): their suggestions are exactly what the user needs
-/// next.
+/// whitespace) and the typed word resolves to a standalone PATH executable,
+/// shell builtin/standard function, alias, or user function — a bare `kimi`.
+/// The line is already runnable, so suggestions wait for the space that
+/// commits the user to typing arguments. An exact runnable name is final even
+/// when longer commands share its prefix or a static spec has recipes; those
+/// rows become relevant only after a trailing space. Commands that do nothing
+/// useful without arguments (`git` and other subcommand-style CLIs, specs with
+/// `requires_arguments`) remain open immediately.
 pub(super) fn executable_awaiting_arguments(
     context: &CompletionContext,
     commands: &CommandPathCache,
+    aliases: &AliasCache,
     specs: &SpecRegistry,
 ) -> bool {
-    argument_progress(context).is_none()
+    crate::providers::command_position_open(context)
         && context.command().is_some_and(|command| {
-            commands.contains(command)
-                && specs.get(command).is_none()
-                && !requires_arguments(command, specs)
+            let resolution = crate::providers::command_resolution_kind(context);
+            let shell_aliases = (resolution == crate::parser::EffectiveCommandKind::Shell)
+                .then(|| aliases.load(context.shell));
+            let runnable = match resolution {
+                crate::parser::EffectiveCommandKind::Shell => {
+                    commands.contains(command)
+                        || crate::providers::is_shell_callable(context.shell, command)
+                        || shell_aliases
+                            .as_ref()
+                            .is_some_and(|aliases| aliases.contains(command))
+                }
+                crate::parser::EffectiveCommandKind::External => commands.contains(command),
+                crate::parser::EffectiveCommandKind::ExternalOrBuiltin => {
+                    commands.contains(command)
+                        || crate::providers::is_shell_builtin(context.shell, command)
+                }
+                crate::parser::EffectiveCommandKind::Builtin => {
+                    crate::providers::is_shell_builtin(context.shell, command)
+                }
+            };
+            runnable && !requires_arguments(command, specs)
         })
 }
 
+pub(super) fn prefetch_command_help(
+    context: &CompletionContext,
+    commands: &CommandPathCache,
+    specs: &SpecRegistry,
+    help: &Arc<CommandHelpCache>,
+) {
+    let Some(command) = context.command() else {
+        return;
+    };
+    if !crate::providers::command_position_open(context)
+        || specs.get(command).is_some()
+        || crate::providers::is_package_manager(command)
+        || !crate::providers::effective_command_accepts_external(context)
+        || !commands.contains(command)
+    {
+        return;
+    }
+    help.request(command, commands.path(command));
+}
+
 /// Commands that cannot run standalone. The PATH cache cannot express this,
-/// so combine two deterministic signals: a built-in list of subcommand-style
-/// CLIs and the spec registry's `requires_arguments` flag.
+/// so combine the package-manager registry, a built-in list of other
+/// subcommand-style CLIs, and the spec registry's `requires_arguments` flag.
 fn requires_arguments(command: &str, specs: &SpecRegistry) -> bool {
+    if crate::providers::is_package_manager(command) {
+        return true;
+    }
     const SUBCOMMAND_COMMANDS: &[&str] = &[
         "ansible",
         "apt",
@@ -324,13 +406,11 @@ fn requires_arguments(command: &str, specs: &SpecRegistry) -> bool {
         "mise",
         "nerdctl",
         "nix",
-        "npm",
         "oc",
         "pacman",
         "pip",
         "pip3",
         "pipx",
-        "pnpm",
         "podman",
         "railway",
         "rustup",
@@ -343,8 +423,6 @@ fn requires_arguments(command: &str, specs: &SpecRegistry) -> bool {
         "vault",
         "vercel",
         "wrangler",
-        "yarn",
-        "bun",
         "git",
     ];
     if SUBCOMMAND_COMMANDS.contains(&command) {
@@ -370,7 +448,7 @@ fn requires_arguments(command: &str, specs: &SpecRegistry) -> bool {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SelectionIntent {
     pub(super) delta: isize,
-    pub(super) key: SelectionKey,
+    pub(super) key: Option<SelectionKey>,
 }
 
 /// Content identity of a candidate row: two queries for different buffer
@@ -424,8 +502,16 @@ pub(super) fn move_selection(state: &mut RuntimeState, delta: isize) {
     state.selected = Some(state.candidates[next].id);
     state.selection_intent = Some(SelectionIntent {
         delta,
-        key: SelectionKey::of(&state.candidates[next]),
+        key: Some(SelectionKey::of(&state.candidates[next])),
     });
+}
+
+/// Preserve an arrow press while a hidden overlay is waiting for its first
+/// provider batch. The result handler applies the normal no-selection landing
+/// rule once the history rows exist.
+pub(super) fn defer_selection(state: &mut RuntimeState, delta: isize) {
+    state.selected = None;
+    state.selection_intent = Some(SelectionIntent { delta, key: None });
 }
 
 /// Where a navigation lands when nothing is selected yet: Down on the first

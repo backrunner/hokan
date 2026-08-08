@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use crate::{
     completion::{
@@ -10,14 +10,6 @@ use crate::{
     providers::argument_progress,
     terminal::RiskLevel,
 };
-
-/// Subcommands whose argument is a ref (branch, remote, or tag) rather
-/// than a path — `git add <path>` deliberately stays with file completion.
-/// Shared with the filesystem provider, which suppresses its rows at these
-/// slots.
-pub(crate) const GIT_REF_SUBCOMMANDS: &[&str] = &[
-    "checkout", "switch", "merge", "rebase", "log", "diff", "branch", "push", "pull",
-];
 
 /// Ranking for ref rows: local branches outrank remote refs and tags; the
 /// current branch sinks below everything else — switching to it is a no-op.
@@ -37,6 +29,21 @@ pub struct GitProvider {
     cache: Arc<GitStatusCache>,
     refs: Arc<GitRefsCache>,
     commands: Arc<CommandPathCache>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RefSlotKind {
+    RemoteNames,
+    Locals,
+    LocalsAndRemotes,
+    LocalsAndTags,
+    AllRefs,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RefSlot {
+    kind: RefSlotKind,
+    edit_prefix: String,
 }
 
 impl GitProvider {
@@ -60,22 +67,32 @@ impl CandidateProvider for GitProvider {
     }
 
     fn applies(&self, context: &CompletionContext) -> bool {
-        context.command() == Some("git")
-            && self.commands.contains("git")
-            && (at_git_argument_position(context) || ref_subcommand(context).is_some())
+        if context.command() != Some("git")
+            || !crate::providers::effective_command_accepts_external(context)
+            || !self.commands.contains("git")
+        {
+            return false;
+        }
+        let words = crate::providers::segment_words(context);
+        git_context_supported(&words)
+            && (at_git_argument_position(context) || ref_slot(context).is_some())
     }
 
     fn complete(&self, context: &CompletionContext) -> ProviderOutput {
-        if context.command() != Some("git") {
+        if context.command() != Some("git")
+            || !crate::providers::effective_command_accepts_external(context)
+        {
             return ProviderOutput::default();
         }
-        if let Some(subcommand) = ref_subcommand(context) {
-            return self.ref_candidates(context, subcommand);
+        let words = crate::providers::segment_words(context);
+        let directory = git_working_directory(context, &words);
+        if let Some(slot) = ref_slot(context) {
+            return self.ref_candidates(context, slot, &directory);
         }
         if !at_git_argument_position(context) {
             return ProviderOutput::default();
         }
-        let rows: Vec<(&str, &str, RowKind)> = match self.cache.context_for(&context.cwd) {
+        let rows: Vec<(&str, &str, RowKind)> = match self.cache.context_for(&directory) {
             GitContext::NotARepository => vec![
                 (
                     "git init",
@@ -102,44 +119,66 @@ impl CandidateProvider for GitProvider {
     }
 }
 
+fn git_context_supported(words: &[&str]) -> bool {
+    let mut index = 1;
+    while let Some(word) = words.get(index).copied() {
+        let flag = word.split_once('=').map_or(word, |(flag, _)| flag);
+        if matches!(flag, "--git-dir" | "--work-tree" | "--namespace") || word == "--bare" {
+            return false;
+        }
+        if word == "--" {
+            return true;
+        }
+        if git_global_option_has_attached_value(word) || git_global_flag(word) {
+            index += 1;
+        } else if git_global_value_flag(word) {
+            index += 2;
+        } else {
+            return !word.starts_with('-');
+        }
+    }
+    true
+}
+
 impl GitProvider {
-    fn ref_candidates(&self, context: &CompletionContext, subcommand: &str) -> ProviderOutput {
-        let Some(refs) = self.refs.refs_for(&context.cwd) else {
+    fn ref_candidates(
+        &self,
+        context: &CompletionContext,
+        slot: RefSlot,
+        directory: &std::path::Path,
+    ) -> ProviderOutput {
+        let Some(refs) = self.refs.refs_for(directory) else {
             return ProviderOutput::default();
         };
         let mut candidates: Vec<Candidate> = Vec::new();
-        match subcommand {
-            "push" | "pull" => {
-                for branch in &refs.remotes {
-                    candidates.push(ref_candidate(context, branch, "远程分支", REMOTE_BOOST));
-                }
+        match slot.kind {
+            RefSlotKind::RemoteNames => {
                 for name in &refs.remote_names {
-                    candidates.push(ref_candidate(context, name, "远程仓库", REMOTE_BOOST));
+                    candidates.push(ref_candidate(
+                        context,
+                        name,
+                        "远程仓库",
+                        REMOTE_BOOST,
+                        &slot.edit_prefix,
+                    ));
                 }
             }
-            "log" | "diff" | "branch" => {
+            RefSlotKind::Locals => {
                 for local in &refs.locals {
                     let current = refs.current.as_deref() == Some(local);
+                    if current {
+                        continue;
+                    }
                     candidates.push(ref_candidate(
                         context,
                         local,
-                        if current {
-                            "当前分支"
-                        } else {
-                            "本地分支"
-                        },
+                        "本地分支",
                         LOCAL_BOOST,
+                        &slot.edit_prefix,
                     ));
                 }
-                for remote in &refs.remotes {
-                    candidates.push(ref_candidate(context, remote, "远程分支", REMOTE_BOOST));
-                }
-                for tag in &refs.tags {
-                    candidates.push(ref_candidate(context, tag, "标签", REMOTE_BOOST));
-                }
             }
-            // checkout / switch / merge / rebase: locals first, then remotes.
-            _ => {
+            RefSlotKind::LocalsAndRemotes => {
                 for local in &refs.locals {
                     let current = refs.current.as_deref() == Some(local);
                     candidates.push(ref_candidate(
@@ -155,19 +194,139 @@ impl GitProvider {
                         } else {
                             LOCAL_BOOST
                         },
+                        &slot.edit_prefix,
                     ));
                 }
                 for remote in &refs.remotes {
-                    candidates.push(ref_candidate(context, remote, "远程分支", REMOTE_BOOST));
+                    candidates.push(ref_candidate(
+                        context,
+                        remote,
+                        "远程分支",
+                        REMOTE_BOOST,
+                        &slot.edit_prefix,
+                    ));
+                }
+            }
+            RefSlotKind::LocalsAndTags => {
+                for local in &refs.locals {
+                    candidates.push(ref_candidate(
+                        context,
+                        local,
+                        "本地分支",
+                        LOCAL_BOOST,
+                        &slot.edit_prefix,
+                    ));
+                }
+                for tag in &refs.tags {
+                    candidates.push(ref_candidate(
+                        context,
+                        tag,
+                        "标签",
+                        REMOTE_BOOST,
+                        &slot.edit_prefix,
+                    ));
+                }
+            }
+            RefSlotKind::AllRefs => {
+                for local in &refs.locals {
+                    let current = refs.current.as_deref() == Some(local);
+                    candidates.push(ref_candidate(
+                        context,
+                        local,
+                        if current {
+                            "当前分支"
+                        } else {
+                            "本地分支"
+                        },
+                        if current {
+                            CURRENT_PENALTY
+                        } else {
+                            LOCAL_BOOST
+                        },
+                        &slot.edit_prefix,
+                    ));
+                }
+                for remote in &refs.remotes {
+                    candidates.push(ref_candidate(
+                        context,
+                        remote,
+                        "远程分支",
+                        REMOTE_BOOST,
+                        &slot.edit_prefix,
+                    ));
+                }
+                for tag in &refs.tags {
+                    candidates.push(ref_candidate(
+                        context,
+                        tag,
+                        "标签",
+                        REMOTE_BOOST,
+                        &slot.edit_prefix,
+                    ));
                 }
             }
         }
-        candidates.truncate(MAX_REF_ROWS);
+        preselect_ref_candidates(context, &mut candidates);
         ProviderOutput {
             candidates,
             diagnostics: Vec::new(),
         }
     }
+}
+
+/// Apply the provider cap after query filtering. Large repositories can have
+/// thousands of refs; truncating the unfiltered local-branch list would hide
+/// a matching remote or tag merely because it was enumerated later.
+fn preselect_ref_candidates(context: &CompletionContext, candidates: &mut Vec<Candidate>) {
+    let query = context.parsed.current_prefix.as_str();
+    if !query.is_empty() {
+        candidates.sort_by(|left, right| {
+            ref_candidate_match(query, right).cmp(&ref_candidate_match(query, left))
+        });
+    }
+    candidates.truncate(MAX_REF_ROWS);
+}
+
+fn ref_candidate_match(query: &str, candidate: &Candidate) -> i16 {
+    let replacement = candidate
+        .edit
+        .as_ref()
+        .map_or(candidate.display.primary.as_str(), |edit| {
+            edit.replacement.as_str()
+        });
+    crate::completion::match_quality(query, replacement).max(crate::completion::match_quality(
+        query,
+        &candidate.display.primary,
+    ))
+}
+
+pub(crate) fn git_working_directory(context: &CompletionContext, words: &[&str]) -> PathBuf {
+    let mut directory = crate::providers::invocation_working_directory(context);
+    let mut index = 1;
+    while let Some(word) = words.get(index).copied() {
+        let value = if word == "-C" {
+            let Some(value) = words.get(index + 1).copied() else {
+                break;
+            };
+            index += 2;
+            Some(value)
+        } else if word.len() > 2 && word.starts_with("-C") {
+            index += 1;
+            Some(&word[2..])
+        } else if git_global_option_has_attached_value(word) || git_global_flag(word) {
+            index += 1;
+            None
+        } else if git_global_value_flag(word) {
+            index += 2;
+            None
+        } else {
+            break;
+        };
+        if let Some(value) = value {
+            directory = crate::providers::resolve_directory(&directory, value);
+        }
+    }
+    directory
 }
 
 /// A ref row replaces only the typed word, never the whole line.
@@ -176,6 +335,7 @@ fn ref_candidate(
     name: &str,
     description: &str,
     boost: i16,
+    edit_prefix: &str,
 ) -> Candidate {
     let mut candidate = Candidate::new(
         context.query_id,
@@ -183,7 +343,7 @@ fn ref_candidate(
         description,
         Some(TextEdit {
             range: context.parsed.replacement.clone(),
-            replacement: name.to_owned(),
+            replacement: format!("{edit_prefix}{name}"),
             cursor_after: CursorPlacement::End,
         }),
         CandidateAction::Insert,
@@ -197,41 +357,196 @@ fn ref_candidate(
     candidate
 }
 
-/// The ref-taking subcommand when the cursor sits at-or-past its first
-/// argument (`git checkout <…>`), `None` everywhere else — `git add <path>`
-/// keeps file completion, a dashed active word belongs to flag completion,
-/// `--` before the active slot means pathspec (files, not refs), and the word
-/// after `checkout -b` / `switch -c` is a NEW branch name, not a ref.
-fn ref_subcommand(context: &CompletionContext) -> Option<&'static str> {
-    if context.parsed.current_prefix.starts_with('-') {
-        return None;
-    }
+fn ref_slot(context: &CompletionContext) -> Option<RefSlot> {
     let (words, position) = argument_progress(context)?;
+    if context.parsed.current_prefix.starts_with('-') {
+        let (_, subcommand) = git_subcommand(&words)?;
+        let (flag, _) = context.parsed.current_prefix.split_once('=')?;
+        let GitValueKind::Ref(kind) = git_value_flag_kind(subcommand, flag)? else {
+            return None;
+        };
+        return Some(RefSlot {
+            kind,
+            edit_prefix: format!("{flag}="),
+        });
+    }
     if new_branch_slot(&words, position) {
         return None;
     }
-    ref_slot_subcommand(&words, position)
+    ref_slot_kind(&words, position).map(|kind| RefSlot {
+        kind,
+        edit_prefix: String::new(),
+    })
 }
 
 /// The ref-taking subcommand at the active slot, if any. A `--` in the words
 /// before the active slot ends ref territory: what follows is a pathspec.
 /// Shared with the filesystem provider, which suppresses its rows at ref
 /// slots and resumes them after `--`.
-pub(crate) fn ref_slot_subcommand(words: &[&str], position: usize) -> Option<&'static str> {
-    if position == 0 {
+pub(crate) fn ref_slot_subcommand<'a>(words: &'a [&'a str], position: usize) -> Option<&'a str> {
+    ref_slot_kind(words, position)?;
+    git_subcommand(words).map(|(_, subcommand)| subcommand)
+}
+
+fn ref_slot_kind(words: &[&str], position: usize) -> Option<RefSlotKind> {
+    let (subcommand_index, subcommand) = git_subcommand(words)?;
+    if subcommand_index > position {
         return None;
     }
-    if words
-        .get(1..=position)
-        .is_some_and(|before| before.contains(&"--"))
-    {
+    let before = words
+        .get(subcommand_index + 1..=position)
+        .unwrap_or_default();
+    if before.contains(&"--") {
         return None;
     }
-    let subcommand = words.get(1).copied()?;
-    GIT_REF_SUBCOMMANDS
+    let arguments = scan_ref_arguments(subcommand, before)?;
+    if let Some(kind) = arguments.pending_ref {
+        return Some(kind);
+    }
+    let positional = arguments.positionals.len();
+    match subcommand {
+        "checkout" | "switch" if positional == 0 => Some(RefSlotKind::LocalsAndRemotes),
+        "merge" | "log" | "diff" | "show" | "cherry-pick" | "revert" => Some(RefSlotKind::AllRefs),
+        "rebase" if positional < 2 => Some(RefSlotKind::AllRefs),
+        "push" if positional == 0 => Some(RefSlotKind::RemoteNames),
+        "push" => Some(RefSlotKind::LocalsAndTags),
+        "pull" if positional == 0 => Some(RefSlotKind::RemoteNames),
+        "pull" => Some(RefSlotKind::AllRefs),
+        "branch" if before.iter().any(|word| matches!(*word, "-d" | "-D")) => {
+            Some(RefSlotKind::Locals)
+        }
+        "branch" if branch_rename_or_copy(before) => None,
+        "branch" if positional == 1 => Some(RefSlotKind::AllRefs),
+        "reset" if positional == 0 => Some(RefSlotKind::AllRefs),
+        _ => None,
+    }
+}
+
+struct RefArguments<'a> {
+    positionals: Vec<&'a str>,
+    pending_ref: Option<RefSlotKind>,
+}
+
+fn scan_ref_arguments<'a>(subcommand: &str, before: &'a [&'a str]) -> Option<RefArguments<'a>> {
+    let mut positional = Vec::new();
+    let mut index = 0;
+    while let Some(word) = before.get(index).copied() {
+        if word == "--" {
+            return None;
+        }
+        if let Some((flag, _)) = word.split_once('=')
+            && git_value_flag_kind(subcommand, flag).is_some()
+        {
+            index += 1;
+            continue;
+        }
+        if let Some(kind) = git_value_flag_kind(subcommand, word) {
+            if index + 1 >= before.len() {
+                return match kind {
+                    GitValueKind::Ref(kind) => Some(RefArguments {
+                        positionals: positional,
+                        pending_ref: Some(kind),
+                    }),
+                    GitValueKind::Other => None,
+                };
+            }
+            index += 2;
+        } else if word.starts_with('-') {
+            index += 1;
+        } else {
+            positional.push(word);
+            index += 1;
+        }
+    }
+    Some(RefArguments {
+        positionals: positional,
+        pending_ref: None,
+    })
+}
+
+#[derive(Clone, Copy)]
+enum GitValueKind {
+    Ref(RefSlotKind),
+    Other,
+}
+
+fn git_value_flag_kind(subcommand: &str, word: &str) -> Option<GitValueKind> {
+    match subcommand {
+        "checkout" | "switch" => matches!(
+            word,
+            "--conflict" | "--pathspec-from-file" | "-b" | "-B" | "-c" | "-C" | "--orphan"
+        )
+        .then_some(GitValueKind::Other),
+        "merge" => matches!(
+            word,
+            "-m" | "--message" | "-s" | "--strategy" | "-X" | "--strategy-option"
+        )
+        .then_some(GitValueKind::Other),
+        "rebase" if word == "--onto" => Some(GitValueKind::Ref(RefSlotKind::AllRefs)),
+        "rebase" => matches!(
+            word,
+            "--exec" | "-s" | "--strategy" | "-X" | "--strategy-option"
+        )
+        .then_some(GitValueKind::Other),
+        "log" | "diff" => matches!(
+            word,
+            "-n" | "--max-count"
+                | "--skip"
+                | "--since"
+                | "--until"
+                | "--author"
+                | "--grep"
+                | "--format"
+                | "--pretty"
+                | "--output"
+        )
+        .then_some(GitValueKind::Other),
+        "push" => matches!(
+            word,
+            "--repo" | "--receive-pack" | "--exec" | "-o" | "--push-option"
+        )
+        .then_some(GitValueKind::Other),
+        "pull" => matches!(
+            word,
+            "-s" | "--strategy"
+                | "-X"
+                | "--strategy-option"
+                | "--depth"
+                | "--shallow-since"
+                | "--upload-pack"
+                | "--server-option"
+        )
+        .then_some(GitValueKind::Other),
+        "branch"
+            if matches!(
+                word,
+                "--contains"
+                    | "--no-contains"
+                    | "--merged"
+                    | "--no-merged"
+                    | "--points-at"
+                    | "-u"
+                    | "--set-upstream-to"
+            ) =>
+        {
+            Some(GitValueKind::Ref(RefSlotKind::AllRefs))
+        }
+        "branch" => matches!(word, "--sort" | "--format").then_some(GitValueKind::Other),
+        "restore" if matches!(word, "-s" | "--source") => {
+            Some(GitValueKind::Ref(RefSlotKind::AllRefs))
+        }
+        "restore" => {
+            matches!(word, "--conflict" | "--pathspec-from-file").then_some(GitValueKind::Other)
+        }
+        "reset" => (word == "--pathspec-from-file").then_some(GitValueKind::Other),
+        _ => None,
+    }
+}
+
+fn branch_rename_or_copy(words: &[&str]) -> bool {
+    words
         .iter()
-        .copied()
-        .find(|name| *name == subcommand)
+        .any(|word| matches!(*word, "-m" | "-M" | "--move" | "-c" | "-C" | "--copy"))
 }
 
 /// The word before the active slot is `checkout -b` / `switch -c`: the slot
@@ -239,9 +554,122 @@ pub(crate) fn ref_slot_subcommand(words: &[&str], position: usize) -> Option<&'s
 /// belong there.
 pub(crate) fn new_branch_slot(words: &[&str], position: usize) -> bool {
     let flag = words.get(position).copied().unwrap_or_default();
+    let Some((subcommand_index, subcommand)) = git_subcommand(words) else {
+        return false;
+    };
+    if matches!(
+        (subcommand, flag),
+        ("checkout", "-b" | "-B" | "--orphan") | ("switch", "-c" | "-C" | "--orphan")
+    ) {
+        return true;
+    }
+    if subcommand != "branch" {
+        return false;
+    }
+    let before = words
+        .get(subcommand_index + 1..=position)
+        .unwrap_or_default();
+    let Some(arguments) = scan_ref_arguments(subcommand, before) else {
+        return true;
+    };
+    if arguments.pending_ref.is_some() {
+        return false;
+    }
+    branch_rename_or_copy(before)
+        || (arguments.positionals.is_empty()
+            && !before.iter().any(|word| matches!(*word, "-d" | "-D")))
+}
+
+pub(crate) fn ref_subcommand_accepts_paths(words: &[&str]) -> bool {
+    git_subcommand(words).is_some_and(|(_, subcommand)| {
+        matches!(
+            subcommand,
+            "checkout" | "restore" | "reset" | "log" | "diff"
+        )
+    })
+}
+
+pub(crate) fn path_slot_after_ref(words: &[&str], position: usize) -> bool {
+    let Some((subcommand_index, subcommand)) = git_subcommand(words) else {
+        return false;
+    };
+    let before = words
+        .get(subcommand_index + 1..=position)
+        .unwrap_or_default();
+    let Some(arguments) = scan_ref_arguments(subcommand, before) else {
+        return false;
+    };
+    if arguments.pending_ref.is_some() {
+        return false;
+    }
+    match subcommand {
+        "checkout" | "reset" => !arguments.positionals.is_empty(),
+        "restore" => true,
+        _ => false,
+    }
+}
+
+/// First non-global-option word of a git invocation. Global options may sit
+/// before the subcommand (`git -C repo --no-pager status`). Incomplete value
+/// options return `None`, keeping completion on their value slot.
+pub(crate) fn git_subcommand<'a>(words: &'a [&'a str]) -> Option<(usize, &'a str)> {
+    let mut index = 1;
+    while let Some(word) = words.get(index).copied() {
+        if word == "--" {
+            index += 1;
+            break;
+        }
+        if git_global_option_has_attached_value(word) || git_global_flag(word) {
+            index += 1;
+            continue;
+        }
+        if git_global_value_flag(word) {
+            if index + 1 >= words.len() {
+                return None;
+            }
+            index += 2;
+            continue;
+        }
+        if word.starts_with('-') {
+            return None;
+        }
+        break;
+    }
+    words.get(index).copied().map(|command| (index, command))
+}
+
+fn git_global_value_flag(word: &str) -> bool {
     matches!(
-        (words.get(1).copied(), flag),
-        (Some("checkout"), "-b") | (Some("switch"), "-c")
+        word,
+        "-C" | "-c"
+            | "--git-dir"
+            | "--work-tree"
+            | "--namespace"
+            | "--super-prefix"
+            | "--exec-path"
+            | "--config-env"
+    )
+}
+
+fn git_global_option_has_attached_value(word: &str) -> bool {
+    word.split_once('=')
+        .is_some_and(|(flag, _)| git_global_value_flag(flag))
+        || (word.len() > 2 && (word.starts_with("-C") || word.starts_with("-c")))
+}
+
+fn git_global_flag(word: &str) -> bool {
+    matches!(
+        word,
+        "--paginate"
+            | "-P"
+            | "--no-pager"
+            | "--bare"
+            | "--no-replace-objects"
+            | "--literal-pathspecs"
+            | "--glob-pathspecs"
+            | "--noglob-pathspecs"
+            | "--icase-pathspecs"
+            | "--no-optional-locks"
     )
 }
 
@@ -284,13 +712,21 @@ fn row_candidate(
     kind: RowKind,
 ) -> Candidate {
     let incomplete = matches!(kind, RowKind::NeedsValue);
+    let (range, replacement) = if crate::providers::argument_progress(context).is_none() {
+        (context.parsed.replacement.clone(), line.to_owned())
+    } else {
+        (
+            context.parsed.replacement.clone(),
+            line.strip_prefix("git ").unwrap_or(line).to_owned(),
+        )
+    };
     Candidate::new(
         context.query_id,
         line.trim_end(),
         description,
         Some(TextEdit {
-            range: command_edit_range(context),
-            replacement: line.to_owned(),
+            range,
+            replacement,
             cursor_after: CursorPlacement::End,
         }),
         if incomplete {
@@ -314,26 +750,39 @@ fn row_candidate(
     )
 }
 
-/// The whole typed line from the effective command word is replaced, like
-/// spec recipes — a wrapper/assignment prefix (`sudo git …`) is preserved.
-fn command_edit_range(context: &CompletionContext) -> std::ops::Range<usize> {
-    let start = context
-        .parsed
-        .command_range
-        .as_ref()
-        .map_or(context.buffer.cursor, |range| range.start);
-    start..context.buffer.cursor
-}
-
 /// Only the `git` word itself or its first argument: ref-taking deeper
 /// slots (`git checkout <…>`) are handled by `ref_subcommand` instead.
 /// Measured from the effective command, so `sudo git st` still fires.
 fn at_git_argument_position(context: &CompletionContext) -> bool {
     match argument_progress(context) {
         // Still on the effective command word itself.
-        None => true,
-        Some((_, position)) => position == 0,
+        None => crate::providers::command_position_open(context),
+        Some((words, position)) => git_subcommand_slot(&words, position),
     }
+}
+
+fn git_subcommand_slot(words: &[&str], position: usize) -> bool {
+    let before = words.get(1..=position).unwrap_or_default();
+    let mut index = 0;
+    while let Some(word) = before.get(index).copied() {
+        if word == "--" {
+            index += 1;
+            break;
+        }
+        if git_global_option_has_attached_value(word) || git_global_flag(word) {
+            index += 1;
+            continue;
+        }
+        if git_global_value_flag(word) {
+            if index + 1 >= before.len() {
+                return false;
+            }
+            index += 2;
+            continue;
+        }
+        return false;
+    }
+    index == before.len()
 }
 
 #[cfg(test)]
@@ -416,8 +865,8 @@ mod tests {
         assert_eq!(rows, ["git init", "git clone"]);
         let init = &provider.complete(&context).candidates[0];
         let edit = init.edit.as_ref().expect("edit");
-        assert_eq!(edit.range, 0..4, "bare `git ` replaces the whole line");
-        assert_eq!(edit.replacement, "git init");
+        assert_eq!(edit.range, 4..4, "bare `git ` fills the subcommand slot");
+        assert_eq!(edit.replacement, "init");
     }
 
     #[test]
@@ -474,6 +923,42 @@ mod tests {
     }
 
     #[test]
+    fn global_c_option_uses_the_selected_repository() {
+        if !git_available() {
+            return;
+        }
+        let root = tempfile::tempdir().expect("root");
+        let repository = root.path().join("repo");
+        fs::create_dir(&repository).expect("repository");
+        git(&repository, &["init", "-q", "-b", "main"]);
+        fs::write(repository.join("untracked.txt"), b"x").expect("file");
+        let provider = GitProvider::new(
+            Arc::new(GitStatusCache::default()),
+            Arc::new(GitRefsCache::default()),
+            git_on_path(root.path()),
+        );
+
+        let rows = primaries(&context(root.path(), "git -C repo "), &provider);
+        assert!(rows.contains(&"git status".to_owned()), "rows: {rows:?}");
+        assert!(!rows.contains(&"git init".to_owned()), "rows: {rows:?}");
+    }
+
+    #[test]
+    fn unmodeled_repository_selectors_suppress_state_rows() {
+        assert!(git_context_supported(&["git", "-C", "repo"]));
+        assert!(git_context_supported(&["git", "-c", "color.ui=false"]));
+        for words in [
+            &["git", "--bare"][..],
+            &["git", "--git-dir", "repo/.git"][..],
+            &["git", "--git-dir=repo/.git"][..],
+            &["git", "--work-tree", "repo"][..],
+            &["git", "--namespace=ci"][..],
+        ] {
+            assert!(!git_context_supported(words), "unsupported: {words:?}");
+        }
+    }
+
+    #[test]
     fn non_ref_deeper_positions_do_not_fire() {
         let directory = tempfile::tempdir().expect("directory");
         let provider = GitProvider::new(
@@ -482,9 +967,12 @@ mod tests {
             git_on_path(directory.path()),
         );
         // `git add <path>` keeps file completion: no git rows at all here.
-        let context = context(directory.path(), "git add ma");
-        assert!(provider.complete(&context).candidates.is_empty());
-        assert!(!provider.applies(&context));
+        let add_context = context(directory.path(), "git add ma");
+        assert!(provider.complete(&add_context).candidates.is_empty());
+        assert!(!provider.applies(&add_context));
+        let builtin_context = context(directory.path(), "builtin git ");
+        assert!(provider.complete(&builtin_context).candidates.is_empty());
+        assert!(!provider.applies(&builtin_context));
     }
 
     /// A repository on `main` with a `feature/mars` branch, an `origin`
@@ -578,7 +1066,7 @@ mod tests {
     }
 
     #[test]
-    fn push_and_pull_offer_remote_branches_and_remote_names() {
+    fn push_and_pull_distinguish_remote_and_refspec_slots() {
         let Some(root) = ref_repository() else { return };
         let provider = GitProvider::new(
             Arc::new(GitStatusCache::default()),
@@ -586,13 +1074,17 @@ mod tests {
             git_on_path(root.path()),
         );
         let rows = primaries(&context(root.path(), "git push "), &provider);
-        assert!(rows.contains(&"origin/main".to_owned()), "rows: {rows:?}");
-        assert!(rows.contains(&"origin".to_owned()), "rows: {rows:?}");
-        assert!(!rows.contains(&"main".to_owned()), "rows: {rows:?}");
+        assert_eq!(rows, vec!["origin".to_owned()]);
+
+        let rows = primaries(&context(root.path(), "git push origin "), &provider);
+        assert!(rows.contains(&"main".to_owned()), "rows: {rows:?}");
+        assert!(rows.contains(&"v1".to_owned()), "rows: {rows:?}");
+        assert!(!rows.contains(&"origin".to_owned()), "rows: {rows:?}");
+        assert!(!rows.contains(&"origin/main".to_owned()), "rows: {rows:?}");
     }
 
     #[test]
-    fn log_diff_and_branch_offer_all_refs() {
+    fn revision_and_branch_slots_offer_only_valid_ref_families() {
         let Some(root) = ref_repository() else { return };
         let provider = GitProvider::new(
             Arc::new(GitStatusCache::default()),
@@ -603,6 +1095,67 @@ mod tests {
         for expected in ["main", "feature/mars", "origin/main", "v1"] {
             assert!(rows.contains(&expected.to_owned()), "rows: {rows:?}");
         }
+
+        let branch = context(root.path(), "git branch ");
+        assert!(!provider.applies(&branch));
+        assert!(provider.complete(&branch).candidates.is_empty());
+
+        let rows = primaries(&context(root.path(), "git branch new "), &provider);
+        assert!(rows.contains(&"main".to_owned()), "rows: {rows:?}");
+        assert!(rows.contains(&"v1".to_owned()), "rows: {rows:?}");
+
+        for text in [
+            "git branch new main ",
+            "git branch -m old ",
+            "git branch -m old new ",
+            "git rebase main topic ",
+        ] {
+            let context = context(root.path(), text);
+            assert!(!provider.applies(&context), "{text:?} must be complete");
+            assert!(
+                provider.complete(&context).candidates.is_empty(),
+                "{text:?} must not offer more refs"
+            );
+        }
+
+        let rows = primaries(&context(root.path(), "git branch -d "), &provider);
+        assert!(rows.contains(&"feature/mars".to_owned()), "rows: {rows:?}");
+        assert!(!rows.contains(&"main".to_owned()), "rows: {rows:?}");
+    }
+
+    #[test]
+    fn ref_valued_flags_complete_refs_in_separate_and_attached_forms() {
+        let Some(root) = ref_repository() else { return };
+        let provider = GitProvider::new(
+            Arc::new(GitStatusCache::default()),
+            Arc::new(GitRefsCache::default()),
+            git_on_path(root.path()),
+        );
+        for text in [
+            "git branch --contains ",
+            "git branch --merged ma",
+            "git branch --points-at ",
+            "git rebase --onto ",
+            "git restore --source ",
+        ] {
+            let rows = primaries(&context(root.path(), text), &provider);
+            assert!(
+                rows.contains(&"main".to_owned()),
+                "rows for {text:?}: {rows:?}"
+            );
+        }
+
+        let context = context(root.path(), "git branch --contains=fea");
+        let feature = provider
+            .complete(&context)
+            .candidates
+            .into_iter()
+            .find(|candidate| candidate.display.primary == "feature/mars")
+            .expect("attached ref flag candidate");
+        assert_eq!(
+            feature.edit.as_ref().expect("edit").replacement,
+            "--contains=feature/mars"
+        );
     }
 
     #[test]
@@ -613,8 +1166,8 @@ mod tests {
             Arc::new(GitRefsCache::default()),
             git_on_path(directory.path()),
         );
-        // `sudo git ` still recommends from state, and the row edit starts
-        // at the effective command word so `sudo ` survives the fill.
+        // `sudo git ` still recommends from state, and the row fills only
+        // the empty subcommand slot so every wrapper/global prefix survives.
         let sudo_git = context(directory.path(), "sudo git ");
         assert!(provider.applies(&sudo_git));
         let output = provider.complete(&sudo_git);
@@ -626,8 +1179,8 @@ mod tests {
             Some("git init")
         );
         let edit = output.candidates[0].edit.as_ref().expect("edit");
-        assert_eq!(edit.range, 5..9);
-        assert_eq!(edit.replacement, "git init");
+        assert_eq!(edit.range, 9..9);
+        assert_eq!(edit.replacement, "init");
 
         // `sudo git st` still fires at the subcommand slot.
         assert!(provider.applies(&context(directory.path(), "sudo git st")));
@@ -645,6 +1198,29 @@ mod tests {
         assert!(provider.applies(&context));
         let rows = primaries(&context, &provider);
         assert!(rows.contains(&"feature/mars".to_owned()), "rows: {rows:?}");
+    }
+
+    #[test]
+    fn wrapper_chdir_selects_the_nested_git_repository() {
+        if !git_available() {
+            return;
+        }
+        let root = tempfile::tempdir().expect("root");
+        let app = root.path().join("app");
+        fs::create_dir(&app).expect("app");
+        git(&app, &["init", "-q", "-b", "main"]);
+        let provider = GitProvider::new(
+            Arc::new(GitStatusCache::default()),
+            Arc::new(GitRefsCache::default()),
+            git_on_path(root.path()),
+        );
+        let context = context(root.path(), "sudo -D app git ");
+        let rows = primaries(&context, &provider);
+        assert!(
+            rows.contains(&"git branch".to_owned()) || rows.contains(&"git status".to_owned()),
+            "rows: {rows:?}"
+        );
+        assert!(!rows.contains(&"git init".to_owned()), "rows: {rows:?}");
     }
 
     #[test]
@@ -666,6 +1242,7 @@ mod tests {
         }
         // Without `--` the same subcommand still offers refs.
         assert!(provider.applies(&context(root.path(), "git checkout ")));
+        assert!(!provider.applies(&context(root.path(), "git checkout main ")));
     }
 
     #[test]
@@ -724,5 +1301,33 @@ mod tests {
                 .map(|c| c.display.primary.as_str()),
             Some("git init")
         );
+    }
+
+    #[test]
+    fn ref_cap_is_applied_after_matching_the_typed_prefix() {
+        let directory = tempfile::tempdir().expect("directory");
+        let context = context(directory.path(), "git checkout release-special");
+        let mut candidates: Vec<_> = (0..MAX_REF_ROWS + 50)
+            .map(|index| {
+                ref_candidate(
+                    &context,
+                    &format!("branch-{index:04}"),
+                    "本地分支",
+                    LOCAL_BOOST,
+                    "",
+                )
+            })
+            .collect();
+        candidates.push(ref_candidate(
+            &context,
+            "release-special",
+            "标签",
+            REMOTE_BOOST,
+            "",
+        ));
+
+        preselect_ref_candidates(&context, &mut candidates);
+        assert_eq!(candidates.len(), MAX_REF_ROWS);
+        assert_eq!(candidates[0].display.primary, "release-special");
     }
 }

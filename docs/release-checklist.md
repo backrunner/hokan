@@ -61,7 +61,7 @@ overlay、跨 control sequence 写入、AI 隐式联网或 secret 泄漏都会�
 1. tag 必须为 `v<package-version>`，workflow 会拒绝版本不一致。
 2. 在干净机器校验 `SHA256SUMS`，解压对应 target 归档。
 3. 运行 `bin/hokan --version`、`doctor --json`、`spec validate`。
-4. 用临时 rc 文件验证 `setup` 幂等、备份和 `uninstall --integration-only`。
+4. 用临时 rc 文件验证 `install` 幂等、备份、`setup` 兼容别名和 `uninstall`。
 5. 检查归档包含 README、双许可证和 `share/man/man1/hokan.1`。
 6. 检查每个 target 对应的 `.spdx.json` 可解析且与同一构建产物关联。
 

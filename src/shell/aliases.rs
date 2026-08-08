@@ -3,7 +3,7 @@
 //! completion worker re-reads rc files only when they change.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -18,6 +18,8 @@ const MAX_ENTRIES: usize = 512;
 const FUNCTION_BODY_MAX_BYTES: usize = 4 * 1024;
 /// `source` includes are followed exactly one level deep.
 const MAX_INCLUDE_DEPTH: usize = 1;
+
+type CachedAliases = HashMap<ShellKind, (Vec<Fingerprint>, Arc<ShellAliases>)>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AliasKind {
@@ -41,6 +43,8 @@ pub struct AliasEntry {
 struct PendingFunction {
     name: String,
     body: String,
+    /// POSIX function-group brace depth. Fish uses `end` and keeps this at 0.
+    brace_depth: usize,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -64,6 +68,13 @@ impl ShellAliases {
     }
 
     #[must_use]
+    pub fn has_longer_prefix(&self, prefix: &str) -> bool {
+        self.entries
+            .keys()
+            .any(|name| name.len() > prefix.len() && name.starts_with(prefix))
+    }
+
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -71,7 +82,7 @@ impl ShellAliases {
 
 #[derive(Debug, Default)]
 pub struct AliasCache {
-    cached: Mutex<Option<(Vec<Fingerprint>, Arc<ShellAliases>)>>,
+    cached: Mutex<CachedAliases>,
     /// Test-only fixed set that bypasses rc discovery entirely.
     #[cfg(test)]
     fixed: Option<Arc<ShellAliases>>,
@@ -81,7 +92,7 @@ impl AliasCache {
     #[cfg(test)]
     pub(crate) fn new_fixed(aliases: ShellAliases) -> Self {
         Self {
-            cached: Mutex::new(None),
+            cached: Mutex::new(HashMap::new()),
             fixed: Some(Arc::new(aliases)),
         }
     }
@@ -96,14 +107,14 @@ impl AliasCache {
         let files = rc_files(shell);
         let fingerprints: Vec<Fingerprint> = files.iter().map(|p| fingerprint(p)).collect();
         if let Ok(cache) = self.cached.lock()
-            && let Some((cached_fp, aliases)) = cache.as_ref()
+            && let Some((cached_fp, aliases)) = cache.get(&shell)
             && *cached_fp == fingerprints
         {
             return Arc::clone(aliases);
         }
         let aliases = Arc::new(load_aliases(shell, &files));
         if let Ok(mut cache) = self.cached.lock() {
-            *cache = Some((fingerprints, Arc::clone(&aliases)));
+            cache.insert(shell, (fingerprints, Arc::clone(&aliases)));
         }
         aliases
     }
@@ -215,7 +226,7 @@ fn parse_includes(text: &str, base: &Path) -> Vec<PathBuf> {
                 .or_else(|| line.strip_prefix(". "))?;
             let raw = rest.split_whitespace().next()?;
             let raw = raw.trim_matches(|c| c == '\'' || c == '"');
-            if raw.contains('$') && !raw.starts_with("$HOME") {
+            if raw.contains('$') && !raw.starts_with("$HOME/") && !raw.starts_with("${HOME}/") {
                 return None;
             }
             let expanded = raw
@@ -223,6 +234,10 @@ fn parse_includes(text: &str, base: &Path) -> Vec<PathBuf> {
                 .map(|rest| std::env::home_dir().map(|home| home.join(rest)))
                 .or_else(|| {
                     raw.strip_prefix("$HOME/")
+                        .map(|rest| std::env::home_dir().map(|home| home.join(rest)))
+                })
+                .or_else(|| {
+                    raw.strip_prefix("${HOME}/")
                         .map(|rest| std::env::home_dir().map(|home| home.join(rest)))
                 })
                 .flatten()
@@ -233,7 +248,11 @@ fn parse_includes(text: &str, base: &Path) -> Vec<PathBuf> {
 }
 
 pub(crate) fn parse_rc_text(shell: ShellKind, text: &str, aliases: &mut ShellAliases) {
-    let text = &text[..text.len().min(RC_FILE_MAX_BYTES as usize)];
+    let mut end = text.len().min(RC_FILE_MAX_BYTES as usize);
+    while !text.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    let text = &text[..end];
     let mut pending: Option<PendingFunction> = None;
     for line in text.lines() {
         if aliases.entries.len() >= MAX_ENTRIES {
@@ -243,17 +262,16 @@ pub(crate) fn parse_rc_text(shell: ShellKind, text: &str, aliases: &mut ShellAli
         if let Some(open) = pending.as_mut() {
             // Accumulating a multi-line function body until the closing
             // brace (posix) or `end` (fish).
-            let closes = match shell {
-                ShellKind::Zsh | ShellKind::Bash => line.contains('}'),
-                ShellKind::Fish => line == "end" || line.starts_with("end "),
+            let close_at = match shell {
+                ShellKind::Zsh | ShellKind::Bash => {
+                    let (close_at, depth) = posix_function_close(line, open.brace_depth);
+                    open.brace_depth = depth;
+                    close_at
+                }
+                ShellKind::Fish => (line == "end" || line.starts_with("end ")).then_some(0),
             };
-            if closes {
-                let (prefix, _) = match shell {
-                    ShellKind::Zsh | ShellKind::Bash => {
-                        line.rsplit_once('}').map_or((line, ""), |head| head)
-                    }
-                    ShellKind::Fish => (line, ""),
-                };
+            if let Some(close_at) = close_at {
+                let prefix = &line[..close_at];
                 if open.body.len() + prefix.len() <= FUNCTION_BODY_MAX_BYTES {
                     if !open.body.is_empty() {
                         open.body.push('\n');
@@ -344,7 +362,8 @@ fn parse_posix_line(line: &str, aliases: &mut ShellAliases) -> Option<PendingFun
     }
     let open_brace = rest.find('{')?;
     let after = &rest[open_brace + 1..];
-    if let Some((body, _)) = after.rsplit_once('}') {
+    let (close_at, brace_depth) = posix_function_close(after, 1);
+    if let Some(close_at) = close_at {
         // Single-line body: `proj() { cd ~/projects/$1; }`.
         insert(
             aliases,
@@ -352,7 +371,7 @@ fn parse_posix_line(line: &str, aliases: &mut ShellAliases) -> Option<PendingFun
             AliasEntry {
                 kind: AliasKind::Function,
                 expansion: None,
-                body: Some(body.trim().to_owned()),
+                body: Some(after[..close_at].trim().to_owned()),
             },
         );
         return None;
@@ -360,7 +379,93 @@ fn parse_posix_line(line: &str, aliases: &mut ShellAliases) -> Option<PendingFun
     Some(PendingFunction {
         name: name_candidate.to_owned(),
         body: after.trim().to_owned(),
+        brace_depth,
     })
+}
+
+/// Locate the closing reserved-word brace for a POSIX-style function group.
+/// Braces inside quotes, parameter expansions, command substitutions, and
+/// ordinary words such as brace expansions do not affect the group depth.
+fn posix_function_close(line: &str, mut depth: usize) -> (Option<usize>, usize) {
+    let bytes = line.as_bytes();
+    let mut index = 0;
+    let mut quote = None;
+    while index < bytes.len() {
+        match (quote, bytes[index]) {
+            (Some(b'\''), b'\'') => quote = None,
+            (Some(b'\''), _) => {}
+            (Some(b'"'), b'"') => quote = None,
+            (Some(b'"'), b'\\') => {
+                index = (index + 2).min(bytes.len());
+                continue;
+            }
+            (Some(b'"'), _) => {}
+            (None, b'\'' | b'"') => quote = Some(bytes[index]),
+            (None, b'\\') => {
+                index = (index + 2).min(bytes.len());
+                continue;
+            }
+            (None, b'#') if brace_word_boundary(bytes.get(index.wrapping_sub(1)).copied()) => break,
+            (None, b'$') if bytes.get(index + 1) == Some(&b'{') => {
+                index = skip_balanced(bytes, index + 2, b'{', b'}');
+                continue;
+            }
+            (None, b'$') if bytes.get(index + 1) == Some(&b'(') => {
+                index = skip_balanced(bytes, index + 2, b'(', b')');
+                continue;
+            }
+            (None, brace @ (b'{' | b'}')) if is_reserved_brace(bytes, index) => {
+                if brace == b'{' {
+                    depth = depth.saturating_add(1);
+                } else {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return (Some(index), 0);
+                    }
+                }
+            }
+            (None, _) => {}
+            (Some(_), _) => {}
+        }
+        index += 1;
+    }
+    (None, depth)
+}
+
+fn skip_balanced(bytes: &[u8], mut index: usize, open: u8, close: u8) -> usize {
+    let mut depth = 1_usize;
+    let mut quote = None;
+    while index < bytes.len() && depth > 0 {
+        match (quote, bytes[index]) {
+            (Some(b'\''), b'\'') => quote = None,
+            (Some(b'\''), _) => {}
+            (Some(b'"'), b'"') => quote = None,
+            (Some(b'"'), b'\\') | (None, b'\\') => {
+                index = (index + 2).min(bytes.len());
+                continue;
+            }
+            (Some(b'"'), _) => {}
+            (None, b'\'' | b'"') => quote = Some(bytes[index]),
+            (None, byte) if byte == open => depth = depth.saturating_add(1),
+            (None, byte) if byte == close => depth = depth.saturating_sub(1),
+            (None, _) => {}
+            (Some(_), _) => {}
+        }
+        index += 1;
+    }
+    index
+}
+
+fn is_reserved_brace(bytes: &[u8], index: usize) -> bool {
+    brace_word_boundary(
+        index
+            .checked_sub(1)
+            .and_then(|before| bytes.get(before).copied()),
+    ) && brace_word_boundary(bytes.get(index + 1).copied())
+}
+
+fn brace_word_boundary(byte: Option<u8>) -> bool {
+    byte.is_none_or(|byte| byte.is_ascii_whitespace() || b";|&()".contains(&byte))
 }
 
 fn parse_fish_line(line: &str, aliases: &mut ShellAliases) -> Option<PendingFunction> {
@@ -425,6 +530,7 @@ fn parse_fish_line(line: &str, aliases: &mut ShellAliases) -> Option<PendingFunc
             return Some(PendingFunction {
                 name: name.to_owned(),
                 body: String::new(),
+                brace_depth: 0,
             });
         }
         return None;
@@ -525,6 +631,61 @@ export EDITOR=vim
     }
 
     #[test]
+    fn multiline_parameter_expansions_do_not_end_posix_functions() {
+        let aliases = parse(
+            ShellKind::Zsh,
+            r#"
+proj() {
+  if [ -n "$1" ]; then
+    cd "${HOME}/projects/${1}"
+  else
+    cd "${HOME}/projects"
+  fi
+}
+alias after='still parsed'
+"#,
+        );
+        let body = aliases
+            .get("proj")
+            .and_then(|entry| entry.body.as_deref())
+            .expect("complete proj body");
+        assert!(
+            body.contains("else"),
+            "body ended at a parameter brace: {body}"
+        );
+        assert!(aliases.contains("after"));
+
+        let slot = crate::shell::infer_function_slot(ShellKind::Zsh, body).expect("proj slot");
+        assert_eq!(slot.kind, crate::completion::SlotKind::Directory);
+        assert_eq!(
+            slot.base,
+            std::env::home_dir().map(|home| home.join("projects"))
+        );
+    }
+
+    #[test]
+    fn nested_command_groups_do_not_end_the_outer_function() {
+        let aliases = parse(
+            ShellKind::Bash,
+            r#"
+enter() {
+  {
+    echo preparing
+  }
+  cd "$HOME/work/$1"
+}
+"#,
+        );
+        let body = aliases
+            .get("enter")
+            .and_then(|entry| entry.body.as_deref())
+            .expect("complete function body");
+        assert!(body.contains("cd \"$HOME/work/$1\""));
+        let slot = crate::shell::infer_function_slot(ShellKind::Bash, body).expect("enter slot");
+        assert_eq!(slot.kind, crate::completion::SlotKind::Directory);
+    }
+
+    #[test]
     fn parses_fish_alias_function_and_abbr() {
         let aliases = parse(
             ShellKind::Fish,
@@ -582,6 +743,7 @@ alias good='ok'
 source ~/.aliases.zsh
 . ./extra.zsh
 source $HOME/shared.zsh
+source ${HOME}/braced.zsh
 source $RANDOM/dynamic.zsh
 ",
             Path::new("/configs"),
@@ -589,6 +751,7 @@ source $RANDOM/dynamic.zsh
         assert!(includes.contains(&home.join(".aliases.zsh")));
         assert!(includes.contains(&PathBuf::from("/configs/extra.zsh")));
         assert!(includes.contains(&home.join("shared.zsh")));
+        assert!(includes.contains(&home.join("braced.zsh")));
         assert!(
             !includes
                 .iter()
@@ -597,11 +760,20 @@ source $RANDOM/dynamic.zsh
     }
 
     #[test]
-    fn first_definition_wins_like_sourcing_order() {
+    fn first_definition_wins_with_the_current_file_loading_policy() {
         let aliases = parse(ShellKind::Zsh, "alias ll='first'\nalias ll='second'\n");
         assert_eq!(
             aliases.get("ll").expect("ll").expansion.as_deref(),
             Some("first")
         );
+    }
+
+    #[test]
+    fn rc_size_limit_never_slices_through_utf8() {
+        let mut text = "x".repeat(RC_FILE_MAX_BYTES as usize - 1);
+        text.push('界');
+        text.push_str("\nalias after='ignored past the limit'\n");
+        let aliases = parse(ShellKind::Zsh, &text);
+        assert!(!aliases.contains("after"));
     }
 }

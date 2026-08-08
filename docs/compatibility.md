@@ -1,6 +1,6 @@
 # Hokan 兼容矩阵
 
-更新日期：2026-08-02。
+更新日期：2026-08-08。
 
 本页区分实现能力、自动化验证和真实环境认证。只有标记为“实测通过”的组合才代表当前
 机器完成了端到端验证；“待认证”不能被发布说明改写为已支持。
@@ -29,6 +29,7 @@ v1 面向 macOS 和 Linux 上支持 UTF-8 与常见 ANSI/VT 控制序列的 POSI
 | Rendering | mode 2026 | 自动化通过 | 强制 capability 的外层 PTY 与双 emulator 测试 |
 | Rendering | unsupported fallback | 实测通过 | 外层 PTY 与真实 tmux 3.6b 测试 |
 | Input | Unicode/CJK/emoji | 自动化通过 | parser、surface 和真实 PTY 输入测试 |
+| Input | CSI/SS3 上下箭头 | 自动化通过 | history 列表入口、zsh 自定义 widget 隔离与真实 PTY 测试 |
 | Input | 1 MiB bracketed paste | 自动化通过 | 单事件上限及超限 raw streaming 测试 |
 | Recovery | panic/TERM/HUP/TSTP/CONT | 自动化通过 | 子进程恢复、termios 与 signal integration 测试 |
 
@@ -56,9 +57,12 @@ Terminal.app、iTerm2、Ghostty、Kitty、WezTerm 和 Alacritty 均在发布阻�
   检查会检测并提示。
 - bash：标准 emacs 编辑键使用本地镜像；未知键序列会把同步状态降为 uncertain 并隐藏列表。
 - fish：默认键位使用本地镜像；在真实 fish 认证完成前不承诺自定义 key binding 或 vi mode。
+- Hokan 的集成脚本不注册或覆盖 shell 的上下箭头绑定。仅在 Hokan 会话的可编辑 prompt
+  且列表关闭时，外层输入路由消费 CSI/SS3 上下键并打开 history 列表；前台程序、普通
+  shell 会话，以及 history 功能关闭且列表未打开时的按键仍接收原始字节。
 - 与 zsh 插件共存：oh-my-zsh 和主题在 Hokan 内层 shell 中运行并逐字节透传；补全类插件
   （zsh-autosuggestions、atuin、fzf 等）建议用 `[[ -z $HOKAN_ACTIVE ]] && ...` 守卫，
-  或使用 `hokan setup --shell zsh --on-demand` 按需进入；已知冲突由 `hokan doctor` 检测。
+  或使用 `hokan install --shell zsh --on-demand` 按需进入；已知冲突由 `hokan doctor` 检测。
 
 所有 shell 在前台程序、alternate screen、未知 VT 状态、失去锚点或 buffer 不确定时都会
 隐藏 overlay 并保持字节透传。

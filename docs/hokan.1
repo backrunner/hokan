@@ -1,4 +1,4 @@
-.TH HOKAN 1 "2026-08-02" "hokan 0.1.0" "User Commands"
+.TH HOKAN 1 "2026-08-08" "hokan 0.1.0" "User Commands"
 .SH NAME
 hokan \- shell-aware terminal completion overlay
 .SH SYNOPSIS
@@ -46,17 +46,31 @@ Print the version.
 .BI "init " SHELL
 Print versioned shell integration code.
 .TP
-.B setup
+.B install
 Install a managed integration block in the selected shell rc file. Existing
-files are backed up. Use
+files are backed up, and repeated installs are idempotent. Use
 .B --rc-file
-to select an explicit file. For zsh, a new real interactive terminal session
-automatically execs Hokan; the completion hook is loaded only in the managed
-child shell.
+to select an explicit file, or
+.B --on-demand
+to install an
+.B hk
+command instead of automatic startup. New interactive zsh, bash, and fish
+sessions automatically exec Hokan; the completion hook is loaded only in the
+managed child shell.
 .TP
-.B uninstall --integration-only
-Remove only the managed integration block and preserve configuration, history,
-and other rc content.
+.B setup
+Compatibility alias for
+.BR install .
+.TP
+.B uninstall [--integration-only]
+Remove managed shell integration while preserving configuration, credentials,
+custom specs, history, and logs. When the release installer owns the current
+binary, plain
+.B uninstall
+also removes that binary, its man page, and its updater backup. Package-manager
+binaries remain owned by their package manager. Use
+.B --integration-only
+to always preserve the executable.
 .TP
 .B doctor [--json]
 Inspect TTY, terminal, shell, configuration, directory permissions, AI, and
@@ -106,8 +120,13 @@ and never modifies the shell's own history.
 Inspect the effective built-in and user command specifications.
 .SH DEFAULT KEYS
 .TP
-.B Up, Down, PageUp, PageDown
-Move the current selection.
+.B Up, Down
+Move the current selection. When the overlay is closed at an editable prompt,
+open Hokan's history-only list without installing or replacing shell key
+bindings.
+.TP
+.B PageUp, PageDown
+Move the current selection by one page.
 .TP
 .B Enter
 With no selection, execute the command exactly as typed: the overlay is
@@ -176,6 +195,9 @@ Private event log, snapshots, locks, and import checkpoints.
 .I ~/.local/state/hokan/debug.log
 Optional bounded JSONL diagnostic log. Disabled by default; excludes query text,
 history, working-directory paths, HTTP bodies, and environment values.
+.TP
+.I ~/.local/bin/.hokan-install.toml
+Private release-installer receipt used to remove only installer-owned files.
 .SH EXIT STATUS
 Interactive mode returns the child shell exit status, capped at 255. CLI
 commands return zero on success and nonzero on configuration, I/O, validation,

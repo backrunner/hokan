@@ -330,7 +330,7 @@ activation = "continue"
 
 [[commands.recipes.slots]]
 name = "script"
-kind = "executable"
+kind = "file"
 provider = "filesystem"
 
 [[commands]]

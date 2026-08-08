@@ -150,6 +150,17 @@ pub enum Completeness {
 /// ```
 ///
 /// Signal ranges:
+/// - `match_priority`: 0..=4 (none/action, subsequence, substring, prefix,
+///   exact) — a hard ordering tier applied before `total()`, so usage signals
+///   can refine equally relevant rows but never make a weak fuzzy match beat
+///   a direct completion.
+/// - `continuation_priority`: 0 or 1 — a hard non-executable argument tier for
+///   a history row that genuinely continues the text already in the buffer.
+///   This keeps a full-line continuation above a same-prefix file or directory
+///   row without affecting executable-name completion in nested command slots.
+/// - `command_priority`: 0 or 1 — a hard command-position tier. A PATH command
+///   or user alias that completes the executable word stays ahead of full-line
+///   history with the same textual match quality.
 /// - `match_quality`: 0..=1000 (exact 1000, prefix 900-.., substring 700-..,
 ///   subsequence 450, no-match 0; empty query 500) — set centrally by ranking.
 /// - `source_trust`: 0..=300 — set centrally from the candidate source.
@@ -167,6 +178,9 @@ pub enum Completeness {
 ///   record's last known run exited non-zero (excluding SIGINT 130).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ScoreSignals {
+    pub match_priority: u8,
+    pub continuation_priority: u8,
+    pub command_priority: u8,
     pub match_quality: i16,
     pub source_trust: i16,
     pub spec_priority: i16,

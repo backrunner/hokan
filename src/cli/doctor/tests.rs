@@ -273,7 +273,16 @@ fn detect_setup_mode_classifies_managed_blocks() {
     );
     assert_eq!(
         detect_setup_mode(&on_demand),
-        Some("on-demand (`hk` alias)")
+        Some("on-demand (`hk` command)")
+    );
+    let on_demand_function = format!(
+        "{}\n# protocol 2 (on-demand)\nhk() {{ command hokan --shell zsh \"$@\"; }}\n{}\n",
+        crate::cli::integration::START,
+        crate::cli::integration::END
+    );
+    assert_eq!(
+        detect_setup_mode(&on_demand_function),
+        Some("on-demand (`hk` command)")
     );
     assert_eq!(detect_setup_mode("export EDITOR=vim\n"), None);
 }

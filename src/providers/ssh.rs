@@ -10,10 +10,12 @@ use std::{
     time::UNIX_EPOCH,
 };
 
+use globset::GlobBuilder;
+
 use crate::{
     completion::{
         Candidate, CandidateAction, CandidateKind, CandidateProvider, CandidateSource,
-        Completeness, CompletionContext, CursorPlacement, ProviderOutput, TextEdit,
+        Completeness, CompletionContext, CursorPlacement, ProviderOutput, SlotKind, TextEdit,
     },
     providers::argument_progress,
     terminal::RiskLevel,
@@ -24,6 +26,7 @@ const SSH_COMMANDS: &[&str] = &["ssh", "sftp", "mosh"];
 /// A `~/.ssh/config` larger than this is almost certainly not a hand-written
 /// host list; skip it rather than stall completion.
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+const MAX_INCLUDE_FILES: usize = 64;
 
 pub struct SshHostProvider {
     cache: SshConfigCache,
@@ -78,24 +81,42 @@ impl CandidateProvider for SshHostProvider {
             .split_once('@')
             .map(|(user, _)| format!("{user}@"))
             .unwrap_or_default();
+        let scp_remote = context.command() == Some("scp");
         ProviderOutput {
             candidates: hosts
                 .iter()
                 .map(|host| {
                     let completed = format!("{user}{host}");
+                    let replacement = if scp_remote {
+                        format!("{completed}:")
+                    } else {
+                        completed.clone()
+                    };
                     Candidate::new(
                         context.query_id,
                         completed.clone(),
                         "SSH 主机（~/.ssh/config）",
                         Some(TextEdit {
                             range: context.parsed.replacement.clone(),
-                            replacement: completed,
+                            replacement,
                             cursor_after: CursorPlacement::End,
                         }),
-                        CandidateAction::Insert,
+                        if scp_remote {
+                            CandidateAction::InsertAndContinue {
+                                next_slot: crate::completion::SlotKind::Path,
+                            }
+                        } else {
+                            CandidateAction::Insert
+                        },
                         CandidateSource::Project,
                         CandidateKind::Command,
-                        Completeness::Runnable,
+                        if scp_remote {
+                            Completeness::NeedsInput {
+                                slot: crate::completion::SlotKind::Path,
+                            }
+                        } else {
+                            Completeness::Runnable
+                        },
                         RiskLevel::Low,
                         format!("ssh:host:{host}"),
                     )
@@ -109,23 +130,43 @@ impl CandidateProvider for SshHostProvider {
 /// `Some(())` when the cursor sits at the host slot of an ssh-family
 /// command — the unit keeps call sites terse without a bespoke type.
 fn host_slot(context: &CompletionContext) -> Option<()> {
+    if !crate::providers::effective_command_accepts_external(context) {
+        return None;
+    }
     let command = context.command()?;
     let (words, position) = argument_progress(context)?;
     let prefix = context.parsed.current_prefix.as_str();
     if SSH_COMMANDS.contains(&command) && at_host_slot(command, &words, position, prefix) {
         return Some(());
     }
-    // scp keeps plain file completion at path slots; only an `user@…`
-    // active word past the first argument flips to hosts.
-    if command == "scp"
-        && position >= 1
-        && prefix.contains('@')
-        && !prefix.contains('/')
-        && !flag_takes_value(command, words.get(position).copied().unwrap_or_default())
-    {
+    // Every scp operand may be local or remote. Offer configured aliases next
+    // to local paths until a slash or colon makes the user's intent explicit.
+    if at_scp_candidate_slot(command, &words, position, prefix) {
         return Some(());
     }
     None
+}
+
+fn at_scp_candidate_slot(command: &str, words: &[&str], position: usize, prefix: &str) -> bool {
+    command == "scp"
+        && !prefix.starts_with('-')
+        && !prefix.contains(['/', ':'])
+        && !flag_takes_value(command, words.get(position).copied().unwrap_or_default())
+}
+
+/// An explicit `user@host` prefix belongs exclusively to remote-host
+/// completion. Plain aliases remain ambiguous and therefore keep local file
+/// rows visible beside SSH host rows.
+pub(crate) fn at_scp_host_slot(
+    command: &str,
+    words: &[&str],
+    position: usize,
+    prefix: &str,
+) -> bool {
+    command == "scp"
+        && prefix.contains('@')
+        && !prefix.contains(['/', ':'])
+        && !flag_takes_value(command, words.get(position).copied().unwrap_or_default())
 }
 
 /// Whether the cursor sits at the host slot of an ssh/sftp/mosh command:
@@ -149,7 +190,9 @@ fn has_positional_before(command: &str, words: &[&str], position: usize) -> bool
     let mut index = 1; // skip the command word
     while index <= position {
         let word = words.get(index).copied().unwrap_or_default();
-        if flag_takes_value(command, word) {
+        if flag_has_attached_value(command, word) {
+            index += 1;
+        } else if flag_takes_value(command, word) {
             index += 2; // the flag consumes the next word as its value
         } else if word.starts_with('-') {
             index += 1;
@@ -160,33 +203,57 @@ fn has_positional_before(command: &str, words: &[&str], position: usize) -> bool
     false
 }
 
+fn flag_has_attached_value(command: &str, word: &str) -> bool {
+    if let Some((flag, _)) = word.split_once('=') {
+        return flag_value_slot(command, flag).is_some();
+    }
+    attached_short_value_flags(command)
+        .iter()
+        .any(|flag| word.len() > flag.len() && word.starts_with(flag))
+}
+
 /// Flags after which a host row would be noise because the next word is the
 /// flag's value. Mirrors the `flag_value_slot` table in the filesystem
 /// provider for the ssh command family.
 fn flag_takes_value(command: &str, flag: &str) -> bool {
+    flag_value_slot(command, flag).is_some()
+}
+
+pub(crate) fn flag_value_slot(command: &str, flag: &str) -> Option<SlotKind> {
     if !flag.starts_with('-') {
-        return false;
+        return None;
     }
+    match (command, flag) {
+        ("ssh", "-E" | "-F" | "-I" | "-i" | "-S")
+        | ("sftp", "-b" | "-D" | "-F" | "-i" | "-S")
+        | ("scp", "-D" | "-F" | "-i" | "-S")
+        | ("mosh", "--client" | "--server") => Some(SlotKind::Path),
+        (
+            "ssh",
+            "-B" | "-b" | "-c" | "-D" | "-e" | "-J" | "-L" | "-l" | "-m" | "-O" | "-o" | "-P"
+            | "-p" | "-Q" | "-R" | "-W" | "-w",
+        )
+        | ("sftp", "-B" | "-c" | "-J" | "-l" | "-o" | "-P" | "-R" | "-s" | "-X")
+        | ("scp", "-c" | "-J" | "-l" | "-o" | "-P" | "-X")
+        | ("mosh", "-p" | "--port" | "--ssh" | "--predict" | "--bind-server") => {
+            Some(SlotKind::Value)
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn attached_short_value_flags(command: &str) -> &'static [&'static str] {
     match command {
-        "ssh" | "sftp" | "mosh" => matches!(
-            flag,
-            "-i" | "-F"
-                | "-o"
-                | "-l"
-                | "-p"
-                | "-P"
-                | "-L"
-                | "-R"
-                | "-D"
-                | "-J"
-                | "-W"
-                | "-b"
-                | "-c"
-                | "-m"
-                | "-S"
-        ),
-        "scp" => matches!(flag, "-i" | "-F" | "-o" | "-l" | "-P" | "-c" | "-S"),
-        _ => false,
+        "ssh" => &[
+            "-B", "-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-l", "-m", "-O",
+            "-o", "-P", "-p", "-Q", "-R", "-S", "-W", "-w",
+        ],
+        "sftp" => &[
+            "-B", "-b", "-c", "-D", "-F", "-i", "-J", "-l", "-o", "-P", "-R", "-s", "-S", "-X",
+        ],
+        "scp" => &["-c", "-D", "-F", "-i", "-J", "-l", "-o", "-P", "-S", "-X"],
+        "mosh" => &["-p"],
+        _ => &[],
     }
 }
 
@@ -208,13 +275,17 @@ impl SshConfigCache {
         let Ok(text) = fs::read_to_string(path) else {
             return Arc::new(hosts);
         };
-        for include in parse_config(&text).1 {
-            let Some(resolved) = resolve_include(path, &include) else {
-                continue;
-            };
-            for host in self.hosts_from(&resolved).iter() {
-                if !hosts.contains(host) {
-                    hosts.push(host.clone());
+        let mut included_files = 0;
+        'includes: for include in parse_config(&text).1 {
+            for resolved in resolve_includes(path, &include) {
+                if included_files >= MAX_INCLUDE_FILES {
+                    break 'includes;
+                }
+                included_files += 1;
+                for host in self.hosts_from(&resolved).iter() {
+                    if !hosts.contains(host) {
+                        hosts.push(host.clone());
+                    }
                 }
             }
         }
@@ -269,7 +340,7 @@ fn parse_config(text: &str) -> (Vec<String>, Vec<String>) {
     let mut hosts = Vec::new();
     let mut includes = Vec::new();
     for line in text.lines() {
-        let line = line.trim_start();
+        let line = strip_config_comment(line).trim_start();
         if line.starts_with('#') {
             continue;
         }
@@ -294,21 +365,76 @@ fn parse_config(text: &str) -> (Vec<String>, Vec<String>) {
     (hosts, includes)
 }
 
-/// Plain paths and `~/` expansion only — glob includes are skipped.
-/// Relative paths resolve against the including file's directory.
-fn resolve_include(config_path: &Path, include: &str) -> Option<PathBuf> {
-    if include.contains(['*', '?', '[']) {
-        return None;
+fn strip_config_comment(line: &str) -> &str {
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, character) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' {
+            escaped = true;
+            continue;
+        }
+        match (quote, character) {
+            (None, '\'' | '"') => quote = Some(character),
+            (Some(active), current) if active == current => quote = None,
+            (None, '#') => return &line[..index],
+            _ => {}
+        }
     }
-    if let Some(rest) = include.strip_prefix("~/") {
-        return std::env::home_dir().map(|home| home.join(rest));
-    }
-    let path = PathBuf::from(include);
-    if path.is_absolute() {
-        Some(path)
+    line
+}
+
+/// Resolve a plain Include or a filename glob under a fixed directory.
+/// Relative paths use the including file's directory. Wildcards in parent
+/// directories stay unsupported so one config line cannot trigger a broad
+/// recursive scan.
+fn resolve_includes(config_path: &Path, include: &str) -> Vec<PathBuf> {
+    let path = if let Some(rest) = include.strip_prefix("~/") {
+        let Some(home) = std::env::home_dir() else {
+            return Vec::new();
+        };
+        home.join(rest)
     } else {
-        config_path.parent().map(|directory| directory.join(path))
+        let path = PathBuf::from(include);
+        if path.is_absolute() {
+            path
+        } else {
+            let Some(directory) = config_path.parent() else {
+                return Vec::new();
+            };
+            directory.join(path)
+        }
+    };
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Vec::new();
+    };
+    if !file_name.contains(['*', '?', '[', '{']) {
+        return vec![path];
     }
+    let Some(parent) = path.parent() else {
+        return Vec::new();
+    };
+    if parent.to_string_lossy().contains(['*', '?', '[', '{']) {
+        return Vec::new();
+    }
+    let Ok(glob) = GlobBuilder::new(file_name).literal_separator(true).build() else {
+        return Vec::new();
+    };
+    let matcher = glob.compile_matcher();
+    let Ok(entries) = fs::read_dir(parent) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|entry| matcher.is_match(entry.file_name()))
+        .map(|entry| entry.path())
+        .collect();
+    paths.sort();
+    paths.truncate(MAX_INCLUDE_FILES);
+    paths
 }
 
 #[cfg(test)]
@@ -342,7 +468,7 @@ mod tests {
             "# a comment\n\
              Host *\n\
              \x20   ServerAliveInterval 30\n\
-             Host dev-box staging !secret qa-?\n\
+             Host dev-box staging !secret qa-? # inline comment\n\
              \x20   HostName 192.168.1.10\n\
              Include ~/.ssh/hosts.local\n",
         );
@@ -379,6 +505,28 @@ mod tests {
     }
 
     #[test]
+    fn include_filename_globs_are_expanded_in_stable_order() {
+        let directory = tempfile::tempdir().expect("directory");
+        let includes = directory.path().join("config.d");
+        fs::create_dir(&includes).expect("include directory");
+        let nested = directory.path().join("nested");
+        fs::write(&nested, "Host from-nested\n").expect("nested config");
+        fs::write(includes.join("20-staging.conf"), "Host staging\n").expect("staging config");
+        fs::write(
+            includes.join("10-dev.conf"),
+            format!("Host dev\nInclude {}\n", nested.display()),
+        )
+        .expect("dev config");
+        fs::write(includes.join("ignored.txt"), "Host ignored\n").expect("ignored config");
+        let config = directory.path().join("config");
+        fs::write(&config, "Include config.d/*.conf\n").expect("config");
+
+        let hosts = SshConfigCache::default().hosts_from_config(&config);
+        assert_eq!(hosts.as_slice(), ["dev", "staging"]);
+        assert!(!hosts.iter().any(|host| host == "from-nested"));
+    }
+
+    #[test]
     fn cache_reloads_when_the_config_changes() {
         let directory = tempfile::tempdir().expect("directory");
         let config = directory.path().join("config");
@@ -411,25 +559,42 @@ mod tests {
         assert!(at("ssh", "ssh de"));
         assert!(at("ssh", "ssh -v de"));
         assert!(at("ssh", "ssh -p 22 de"));
+        assert!(at("ssh", "ssh -p22 de"));
+        assert!(at("ssh", "ssh -i~/.ssh/id_ed25519 de"));
         assert!(!at("ssh", "ssh -i "));
         assert!(!at("ssh", "ssh -p "));
+        assert!(!at("ssh", "ssh -Q "));
+        assert!(!at("ssh", "ssh -O check"));
+        assert!(!at("sftp", "sftp -D "));
+        assert!(!at("sftp", "sftp -c "));
+        assert!(!at("sftp", "sftp -s "));
         assert!(!at("ssh", "ssh -"));
         assert!(!at("ssh", "ssh host1 de"));
         assert!(at("sftp", "sftp "));
         assert!(at("mosh", "mosh "));
+        assert!(at("mosh", "mosh --ssh 'ssh -p 2222' de"));
+        assert!(at("mosh", "mosh --port=60000 de"));
+        assert!(!at("mosh", "mosh --ssh "));
         assert!(!at("scp", "scp "));
     }
 
     #[test]
-    fn scp_flips_to_hosts_only_on_an_at_word_past_the_first_argument() {
+    fn scp_offers_plain_and_user_qualified_hosts_at_every_operand() {
         let directory = tempfile::tempdir().expect("directory");
         let fires =
             |text: &str, query: u64| host_slot(&context(directory.path(), text, query)).is_some();
+        assert!(fires("scp ", 1));
+        assert!(fires("scp de", 2));
+        assert!(fires("scp file ", 3));
+        assert!(fires("scp file de", 4));
         assert!(fires("scp file user@", 1));
         assert!(fires("scp file user@ho", 2));
-        assert!(!fires("scp user@ho", 3), "first argument stays a path slot");
-        assert!(!fires("scp file ", 4));
+        assert!(fires("scp user@ho", 3), "explicit remote first argument");
         assert!(!fires("scp user@host:/pa", 5), "a slash ends the host part");
+        assert!(!fires("scp user@host:pa", 6), "a colon ends the host part");
+        assert!(!fires("scp ./de", 7), "an explicit local path stays local");
+        assert!(!fires("scp -P ", 8), "option value slots are not hosts");
+        assert!(!fires("scp -J ", 9), "jump-host value is not an operand");
     }
 
     #[test]
@@ -468,7 +633,24 @@ mod tests {
             .expect("scp row");
         assert_eq!(
             dev.edit.as_ref().expect("edit").replacement,
-            "admin@dev-box"
+            "admin@dev-box:"
         );
+        assert_eq!(
+            dev.completeness,
+            Completeness::NeedsInput {
+                slot: crate::completion::SlotKind::Path,
+            }
+        );
+
+        // Plain aliases are also offered; choosing one adds the remote-path
+        // separator while local file completion remains available in parallel.
+        let scp = context(directory.path(), "scp de", 4);
+        let output = provider.complete(&scp);
+        let dev = output
+            .candidates
+            .iter()
+            .find(|candidate| candidate.display.primary == "dev-box")
+            .expect("plain scp host row");
+        assert_eq!(dev.edit.as_ref().expect("edit").replacement, "dev-box:");
     }
 }

@@ -1,4 +1,4 @@
-use std::{fs, time::Duration};
+use std::{fs, sync::Arc, time::Duration};
 
 use crate::{
     completion::{
@@ -6,10 +6,20 @@ use crate::{
         Completeness, CompletionContext, CursorPlacement, ProviderDiagnostic, ProviderOutput,
         TextEdit,
     },
+    platform::CommandPathCache,
     terminal::RiskLevel,
 };
 
-pub struct NetworkInterfaceProvider;
+pub struct NetworkInterfaceProvider {
+    commands: Arc<CommandPathCache>,
+}
+
+impl NetworkInterfaceProvider {
+    #[must_use]
+    pub fn new(commands: Arc<CommandPathCache>) -> Self {
+        Self { commands }
+    }
+}
 
 impl CandidateProvider for NetworkInterfaceProvider {
     fn id(&self) -> &'static str {
@@ -17,7 +27,11 @@ impl CandidateProvider for NetworkInterfaceProvider {
     }
 
     fn applies(&self, context: &CompletionContext) -> bool {
-        matches!(context.command(), Some("ifconfig" | "ip")) && argument_position(context)
+        context
+            .command()
+            .is_some_and(|command| self.commands.contains(command))
+            && crate::providers::effective_command_accepts_external(context)
+            && interface_slot(context)
     }
 
     fn complete(&self, context: &CompletionContext) -> ProviderOutput {
@@ -93,20 +107,125 @@ fn interface_names() -> Result<Vec<(String, String)>, String> {
         .collect())
 }
 
-fn argument_position(context: &CompletionContext) -> bool {
-    let word_count = context
-        .parsed
-        .tokens
-        .iter()
-        .filter(|token| {
-            token.kind == crate::parser::TokenKind::Word
-                && token.range.start >= context.parsed.active_segment.start
-                && token.range.start <= context.buffer.cursor
-        })
-        .count();
-    word_count >= 2
-        || context.buffer.text[..context.buffer.cursor]
-            .chars()
-            .next_back()
-            .is_some_and(char::is_whitespace)
+fn interface_slot(context: &CompletionContext) -> bool {
+    if context.parsed.current_prefix.starts_with('-')
+        || !crate::providers::effective_command_accepts_external(context)
+    {
+        return false;
+    }
+    let Some((words, position)) = crate::providers::argument_progress(context) else {
+        return false;
+    };
+    match context.command() {
+        Some("ifconfig") => {
+            !ifconfig_flag_takes_value(words.get(position).copied().unwrap_or_default())
+                && !has_ifconfig_interface_before(&words, position)
+        }
+        Some("ip") => {
+            words.get(position).copied() == Some("dev")
+                || ip_object_index(&words).is_some_and(|object| {
+                    words.get(object).copied() == Some("link")
+                        && words.get(object + 1).copied() == Some("show")
+                        && position == object + 1
+                })
+        }
+        _ => false,
+    }
+}
+
+fn has_ifconfig_interface_before(words: &[&str], position: usize) -> bool {
+    let mut index = 1;
+    while index <= position {
+        let word = words.get(index).copied().unwrap_or_default();
+        if ifconfig_flag_takes_value(word) {
+            index += 2;
+        } else if word.starts_with('-') {
+            index += 1;
+        } else {
+            return true;
+        }
+    }
+    false
+}
+
+fn ifconfig_flag_takes_value(flag: &str) -> bool {
+    matches!(flag, "-f" | "-g" | "-G")
+}
+
+fn ip_object_index(words: &[&str]) -> Option<usize> {
+    let mut index = 1;
+    while let Some(word) = words.get(index).copied() {
+        if matches!(
+            word,
+            "-f" | "-family" | "-n" | "-netns" | "-b" | "-batch" | "-rcvbuf"
+        ) {
+            index += 2;
+            continue;
+        }
+        if word.starts_with('-') {
+            index += 1;
+            continue;
+        }
+        return Some(index);
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::{
+        completion::{BufferSnapshot, SyncQuality},
+        shell::ShellKind,
+        terminal::{BufferRevision, QueryId},
+    };
+
+    fn context(text: &str) -> CompletionContext {
+        CompletionContext::new(
+            QueryId::new(1),
+            ShellKind::Zsh,
+            PathBuf::from("/tmp"),
+            BufferSnapshot::new(text, text.len(), BufferRevision::new(1), SyncQuality::Exact)
+                .expect("buffer"),
+        )
+        .expect("context")
+    }
+
+    #[test]
+    fn interfaces_only_appear_at_interface_slots() {
+        for text in [
+            "ifconfig ",
+            "ifconfig en",
+            "ifconfig -v en",
+            "ifconfig -m en",
+            "ip link show ",
+            "ip -br link show ",
+            "ip -family inet link show ",
+            "ip -n testns link show ",
+            "ip addr show dev ",
+            "ip route add default dev ",
+        ] {
+            assert!(
+                interface_slot(&context(text)),
+                "expected interface slot for {text:?}"
+            );
+        }
+        for text in [
+            "ifconfig",
+            "ifconfig en0 ",
+            "ifconfig -f ",
+            "ifconfig -g gr",
+            "ip ",
+            "ip addr ",
+            "ip route show ",
+            "builtin ifconfig ",
+        ] {
+            assert!(
+                !interface_slot(&context(text)),
+                "unexpected interface slot for {text:?}"
+            );
+        }
+    }
 }

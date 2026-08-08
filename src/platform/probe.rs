@@ -15,16 +15,18 @@ pub(crate) struct BoundedOutput {
     pub stderr: Vec<u8>,
 }
 
-pub(crate) fn run_bounded<I, S>(
-    program: &str,
+pub(crate) fn run_bounded<P, I, S>(
+    program: P,
     args: I,
     timeout: Duration,
     max_output_bytes: usize,
 ) -> Result<BoundedOutput, String>
 where
+    P: AsRef<OsStr>,
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    let program = program.as_ref();
     let mut child = Command::new(program)
         .args(args)
         .stdin(Stdio::null())
@@ -54,7 +56,8 @@ where
             let _ = stdout_join.join();
             let _ = stderr_join.join();
             return Err(format!(
-                "{program} timed out after {} ms",
+                "{} timed out after {} ms",
+                program.to_string_lossy(),
                 timeout.as_millis()
             ));
         }

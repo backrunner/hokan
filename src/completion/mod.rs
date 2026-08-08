@@ -8,7 +8,7 @@ pub use candidate::{
     Completeness, CursorPlacement, DisplayText, ScoreSignals, SlotKind, TextEdit,
     activate_candidate,
 };
-pub use context::{BufferSnapshot, CompletionContext, SyncQuality};
+pub use context::{BufferSnapshot, CompletionContext, CompletionMode, SyncQuality};
 pub use engine::{
     CandidateProvider, CompletionEngine, ProviderDiagnostic, ProviderMetric, ProviderOutput,
 };

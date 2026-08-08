@@ -21,6 +21,7 @@ if [[ -n ${HOKAN_ACTIVE:-} && -n ${HOKAN_CONTROL_FIFO:-} && -z ${__HOKAN_ZSH_LOA
   typeset -gi __hokan_redisplay_id=0
   typeset -gi __hokan_command_active=0
   typeset -g __hokan_last_command=''
+  typeset -g __hokan_last_path=''
   typeset -g __hokan_prompt_base="$PROMPT"
   typeset -g __hokan_wrapped_prompt=''
   exec {__hokan_control_fd}>"$HOKAN_CONTROL_FIFO"
@@ -49,6 +50,13 @@ if [[ -n ${HOKAN_ACTIVE:-} && -n ${HOKAN_CONTROL_FIFO:-} && -z ${__HOKAN_ZSH_LOA
     PROMPT="$__hokan_wrapped_prompt"
   }
 
+  function __hokan_sync_path() {
+    if [[ "$PATH" != "$__hokan_last_path" ]]; then
+      printf 'HKP2\tPATH\t%s\0' "$PATH" >&$__hokan_control_fd
+      __hokan_last_path="$PATH"
+    fi
+  }
+
   function __hokan_precmd() {
     local command_status=$?
     if (( __hokan_command_active )); then
@@ -56,6 +64,7 @@ if [[ -n ${HOKAN_ACTIVE:-} && -n ${HOKAN_CONTROL_FIFO:-} && -z ${__HOKAN_ZSH_LOA
         >&$__hokan_control_fd
       __hokan_command_active=0
     fi
+    __hokan_sync_path
     (( __hokan_prompt_id++ ))
     printf 'HKP2\tPROMPT\t%d\t%s\0' "$__hokan_prompt_id" "$PWD" \
       >&$__hokan_control_fd
@@ -130,7 +139,15 @@ if [[ -n ${HOKAN_ACTIVE:-} && -n ${HOKAN_CONTROL_FIFO:-} && -z ${__HOKAN_BASH_LO
   __hokan_prompt_id=0
   __hokan_last_status=0
   __hokan_last_history=$(HISTTIMEFORMAT= builtin history 1)
+  __hokan_last_path=''
   exec 9>"$HOKAN_CONTROL_FIFO"
+
+  __hokan_sync_path() {
+    if [[ "$PATH" != "$__hokan_last_path" ]]; then
+      printf 'HKP2\tPATH\t%s\0' "$PATH" >&9
+      __hokan_last_path="$PATH"
+    fi
+  }
 
   __hokan_prompt_command() {
     local current_history
@@ -145,6 +162,7 @@ if [[ -n ${HOKAN_ACTIVE:-} && -n ${HOKAN_CONTROL_FIFO:-} && -z ${__HOKAN_BASH_LO
       printf 'HKP2\tEND\t%d\t%s\0' "$__hokan_last_status" "$PWD" >&9
       __hokan_last_history=$current_history
     fi
+    __hokan_sync_path
     __hokan_prompt_id=$((__hokan_prompt_id + 1))
     printf 'HKP2\tPROMPT\t%d\t%s\t%s\0' "$__hokan_prompt_id" \
       "${HISTCONTROL:-}" "$PWD" >&9
@@ -192,6 +210,15 @@ if test -n "$HOKAN_ACTIVE"; and test -n "$HOKAN_CONTROL_FIFO"; \
   set -gx HOKAN_HOOK_OWNER_PID $fish_pid
   set -g __HOKAN_FISH_LOADED 1
   set -g __hokan_prompt_id 0
+  set -g __hokan_last_path ''
+
+  function __hokan_sync_path
+    set -l current_path (string join : -- $PATH)
+    if test "$current_path" != "$__hokan_last_path"
+      printf 'HKP2\tPATH\t%s\0' "$current_path" >$HOKAN_CONTROL_FIFO
+      set -g __hokan_last_path "$current_path"
+    end
+  end
 
   function __hokan_emit_prompt
     printf 'HKP2\tPROMPT\t%d\t%s\0' $__hokan_prompt_id "$PWD" >$HOKAN_CONTROL_FIFO
@@ -223,6 +250,7 @@ if test -n "$HOKAN_ACTIVE"; and test -n "$HOKAN_CONTROL_FIFO"; \
   functions -c fish_prompt __hokan_original_fish_prompt
   function fish_prompt
     set -g __hokan_prompt_id (math $__hokan_prompt_id + 1)
+    __hokan_sync_path
     __hokan_emit_prompt
     __hokan_original_fish_prompt
     printf '\033]6973;hokan;1;%s;prompt;%d;%s\033\\' \
@@ -245,6 +273,7 @@ mod tests {
         for shell in [ShellKind::Zsh, ShellKind::Bash, ShellKind::Fish] {
             let script = init_script(shell);
             assert!(script.contains("protocol 2"));
+            assert!(script.contains("HKP2\\tPATH\\t%s\\0"));
             assert!(script.contains("HOKAN_ACTIVE"));
             assert!(script.contains("ipc take"));
             assert!(script.contains("HKP2"));
@@ -259,6 +288,19 @@ mod tests {
         assert!(init_script(ShellKind::Fish).contains("commandline --replace"));
         for shell in [ShellKind::Zsh, ShellKind::Bash, ShellKind::Fish] {
             assert!(init_script(shell).contains("HOKAN_HOOK_OWNER_PID"));
+        }
+    }
+
+    #[test]
+    fn integration_scripts_do_not_install_arrow_bindings() {
+        for shell in [ShellKind::Zsh, ShellKind::Bash, ShellKind::Fish] {
+            let script = init_script(shell);
+            for sequence in [r"\e[A", r"\e[B", r"\eOA", r"\eOB", r"\e\[A", r"\e\[B"] {
+                assert!(
+                    !script.contains(sequence),
+                    "{shell} integration must not bind {sequence}"
+                );
+            }
         }
     }
 }

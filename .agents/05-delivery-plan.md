@@ -198,7 +198,7 @@
 ### 8.1 产品化
 
 - `hokan doctor` 文本和 JSON 输出。
-- 幂等 `init/setup/uninstall --integration-only`，带备份与协议版本检查。
+- 幂等 `init/install/uninstall`（`setup` 兼容别名），带备份与协议版本检查。
 - 配置 last-known-good、热加载、错误定位和 migration。
 - shell/terminal capability fallback 与用户可读诊断。
 - man page、安装说明、兼容矩阵、故障恢复说明。

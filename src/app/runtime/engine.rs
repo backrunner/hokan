@@ -20,12 +20,20 @@ use crate::{
         FilesystemProvider, HistoryProvider, NetworkInterfaceProvider, PathCommandProvider,
         ProcessProvider, ProjectProvider,
     },
-    shell::ShellKind,
+    shell::{AliasCache, ShellKind},
     specs::SpecRegistry,
 };
 use nix::fcntl::OFlag;
 
 const SHELL_HISTORY_STARTUP_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+type EngineParts = (
+    Arc<CompletionEngine>,
+    Arc<SpecRegistry>,
+    Arc<CommandPathCache>,
+    Arc<CommandHelpCache>,
+    Arc<AliasCache>,
+);
 
 pub(super) fn load_history(
     paths: &ConfigPaths,
@@ -124,36 +132,19 @@ pub(super) fn build_engine(
     paths: &ConfigPaths,
     config: &Arc<Config>,
     history: Arc<RwLock<HistoryIndex>>,
-) -> (
-    Arc<CompletionEngine>,
-    Arc<SpecRegistry>,
-    Arc<CommandPathCache>,
-    Arc<CommandHelpCache>,
-) {
+    commands: Option<Arc<CommandPathCache>>,
+) -> EngineParts {
     let specs = Arc::new(SpecRegistry::load(Some(&paths.specs_directory)));
-    let commands = Arc::new(CommandPathCache::from_environment());
+    let commands = commands.unwrap_or_else(|| Arc::new(CommandPathCache::from_environment()));
     let projects = Arc::new(ProjectCache::default());
     let help = Arc::new(CommandHelpCache::default());
     let git_status = Arc::new(crate::project::GitStatusCache::default());
-    let aliases = Arc::new(crate::shell::AliasCache::default());
+    let aliases = Arc::new(AliasCache::default());
     let mut engine = CompletionEngine::new(config.completion.max_candidates, config.ui.max_rows)
         .with_local_timeout(Duration::from_millis(config.completion.local_timeout_ms));
-    if config.history.enabled {
-        engine.register(HistoryProvider::new(
-            Arc::clone(&history),
-            Arc::clone(&commands),
-            Arc::clone(&specs),
-            Arc::clone(&aliases),
-        ));
-    }
     engine.register(CommandSpecProvider::new(
         Arc::clone(&specs),
         Arc::clone(&commands),
-    ));
-    engine.register(CommandHelpProvider::new(
-        Arc::clone(&specs),
-        Arc::clone(&commands),
-        Arc::clone(&help),
     ));
     engine.register(ProjectProvider::new(
         projects,
@@ -166,20 +157,43 @@ pub(super) fn build_engine(
         Arc::clone(&commands),
     ));
     engine.register(crate::providers::SshHostProvider::new());
+    engine.register(PathCommandProvider::new(Arc::clone(&commands)));
+    if config.history.enabled {
+        engine.register(HistoryProvider::new(
+            Arc::clone(&history),
+            Arc::clone(&commands),
+            Arc::clone(&aliases),
+            Arc::clone(&specs),
+            Arc::clone(&help),
+        ));
+    }
+    // Full-line history continuation must run before providers that scan a
+    // function directory, process table, or network interfaces. A slow local
+    // source must never consume the query budget before `proj skillscat` can
+    // continue `proj `.
+    engine.register(crate::providers::AliasProvider::new(Arc::clone(&aliases)));
+    engine.register(ProcessProvider);
+    engine.register(NetworkInterfaceProvider::new(Arc::clone(&commands)));
+    engine.register(CommandHelpProvider::new(
+        Arc::clone(&specs),
+        Arc::clone(&commands),
+        Arc::clone(&help),
+    ));
+    // Directory scans have the largest local latency budget. Keep semantic,
+    // PATH, and history providers ahead of them so a large cwd cannot starve
+    // the rows that already know what the active slot means.
     engine.register(FilesystemProvider::new(
         config.ui.show_hidden,
         Arc::clone(&specs),
         Arc::clone(&help),
+        Arc::clone(&aliases),
     ));
-    engine.register(PathCommandProvider::new(Arc::clone(&commands)));
-    engine.register(crate::providers::AliasProvider::new(aliases));
-    engine.register(ProcessProvider);
-    engine.register(NetworkInterfaceProvider);
     engine.register(AiActionProvider::new(
         Arc::new(config.ai.clone()),
         crate::config::configured_credential_available(&config.ai, &paths.credentials_file),
         Arc::clone(&commands),
         Arc::clone(&specs),
+        Arc::clone(&aliases),
     ));
-    (Arc::new(engine), specs, commands, help)
+    (Arc::new(engine), specs, commands, help, aliases)
 }

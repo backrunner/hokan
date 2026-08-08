@@ -54,7 +54,7 @@ eval "$(hokan init zsh)"
 hokan init fish | source
 ```
 
-`hokan init` 输出的脚本必须幂等、可读、带版本号；`hokan doctor` 检查脚本协议版本。自动修改 rc 文件只由显式的 `hokan setup` 执行，并在修改前展示目标路径和创建备份。
+`hokan init` 输出的脚本必须幂等、可读、带版本号；`hokan doctor` 检查脚本协议版本。自动修改 rc 文件只由显式的 `hokan install` 执行，并在修改前展示目标路径和创建备份；`hokan setup` 仅作为兼容别名。
 
 ### 3.2 数据面和控制面
 

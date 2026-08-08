@@ -26,6 +26,7 @@ jobs:
         with:
           components: clippy,rustfmt
       - uses: Swatinem/rust-cache@v2
+      - run: sh -n scripts/install.sh
       - run: cargo fmt --all -- --check
       - run: cargo check --locked --all-targets
       - run: cargo test --locked

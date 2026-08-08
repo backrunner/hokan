@@ -1,9 +1,12 @@
 use std::{
     collections::{HashMap, HashSet},
+    panic::{AssertUnwindSafe, catch_unwind},
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex, MutexGuard, PoisonError,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
+    thread,
     time::Duration,
 };
 
@@ -25,7 +28,7 @@ use crate::{
 // measures 120-150 ms here and up to ~550 ms under full-suite test load, so
 // a ~150 ms cap negative-caches most cold fetches. 1200 ms stays bounded
 // while covering loaded machines; the fetch runs at most once per command
-// per session, from the applies pass, outside the engine's local budget.
+// per session on a background thread, outside the interactive query path.
 const MAN_TIMEOUT: Duration = Duration::from_millis(1200);
 // `--help` fallback for modern CLIs without a (useful) man page: the binary
 // itself is a fixed program resolved on PATH, receives no shell, a single
@@ -36,17 +39,31 @@ const HELP_TIMEOUT: Duration = Duration::from_millis(800);
 const MAN_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_ENTRIES: usize = 200;
 const MAX_DESCRIPTION_CHARS: usize = 72;
+const MAX_CONCURRENT_FETCHES: usize = 4;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CommandHelp {
     pub flags: Vec<HelpEntry>,
     pub subcommands: Vec<HelpEntry>,
+    /// Accepted aliases parsed from command rows. They validate history and
+    /// exact input but are not emitted as additional recommendation rows.
+    pub subcommand_aliases: Vec<String>,
+    /// The root invocation also accepts a free positional argument (for
+    /// example Codex/Claude prompts), so an unknown first word is not by
+    /// itself proof of an invalid subcommand.
+    pub accepts_positionals: bool,
+    /// True only when `<command> --help` exposed a parseable, untruncated
+    /// Commands section. Man pages and partial parses remain non-exhaustive
+    /// because commands such as Git can be extended by aliases or external
+    /// helpers.
+    pub subcommands_exhaustive: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HelpEntry {
     pub name: String,
     pub description: String,
+    pub takes_value: bool,
 }
 
 impl CommandHelp {
@@ -62,10 +79,14 @@ impl CommandHelp {
 /// session. Shared between the help provider (which fetches) and the
 /// filesystem provider (which only peeks) so the suppression check never
 /// spawns a subprocess.
+type CommandHelpEntries = HashMap<String, (Option<PathBuf>, Arc<CommandHelp>)>;
+
 #[derive(Default)]
 pub struct CommandHelpCache {
-    entries: Mutex<HashMap<String, Arc<CommandHelp>>>,
+    entries: Mutex<CommandHelpEntries>,
+    pending: Mutex<HashMap<String, Option<PathBuf>>>,
     fetches: AtomicUsize,
+    revision: AtomicU64,
 }
 
 impl CommandHelpCache {
@@ -73,43 +94,163 @@ impl CommandHelpCache {
     /// suppression checks in other providers.
     #[must_use]
     pub fn peek(&self, command: &str) -> Option<Arc<CommandHelp>> {
-        lock(&self.entries).get(command).cloned()
+        lock(&self.entries)
+            .get(command)
+            .map(|(_, help)| Arc::clone(help))
     }
 
-    /// Cache-first lookup; on a cold miss fetches synchronously once
-    /// (bounded `man`, with a bounded `--help` fallback when the page yields
-    /// nothing) and caches the outcome, including failures. The entries lock
-    /// is held across the fetch so concurrent cold misses for the same
-    /// command spawn a single fetch instead of one per caller.
+    #[must_use]
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
+    }
+
+    #[must_use]
+    pub fn is_pending(&self, command: &str) -> bool {
+        lock(&self.pending).contains_key(command)
+    }
+
+    /// Schedule one background fetch for a cold command. Completion queries
+    /// never wait for `man` or `<command> --help`; the populated cache is used
+    /// on the next keystroke. Pending and negative results are both deduped.
+    pub fn request(self: &Arc<Self>, command: &str, executable: Option<PathBuf>) {
+        let fetch_path = executable.clone();
+        self.request_with_path(command, executable, move |command| {
+            fetch_command_help_from(command, fetch_path.as_deref())
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn request_with(
+        self: &Arc<Self>,
+        command: &str,
+        fetch: impl FnOnce(&str) -> CommandHelp + Send + 'static,
+    ) {
+        self.request_with_path(command, None, fetch);
+    }
+
+    pub(crate) fn request_with_path(
+        self: &Arc<Self>,
+        command: &str,
+        executable: Option<PathBuf>,
+        fetch: impl FnOnce(&str) -> CommandHelp + Send + 'static,
+    ) {
+        {
+            let mut entries = lock(&self.entries);
+            if entries
+                .get(command)
+                .is_some_and(|(cached_path, _)| cache_path_matches(cached_path, &executable))
+            {
+                return;
+            }
+            entries.remove(command);
+        }
+        {
+            let mut pending = lock(&self.pending);
+            if pending.get(command) == Some(&executable) {
+                return;
+            }
+            if !pending.contains_key(command) && pending.len() >= MAX_CONCURRENT_FETCHES {
+                return;
+            }
+            pending.insert(command.to_owned(), executable.clone());
+        }
+        // Close the small race with a synchronous cache fill between the
+        // first lookup and the pending insertion.
+        if lock(&self.entries)
+            .get(command)
+            .is_some_and(|(cached_path, _)| cache_path_matches(cached_path, &executable))
+        {
+            let mut pending = lock(&self.pending);
+            if pending.get(command) == Some(&executable) {
+                pending.remove(command);
+            }
+            return;
+        }
+
+        self.fetches.fetch_add(1, Ordering::Relaxed);
+        let cache = Arc::clone(self);
+        let command = command.to_owned();
+        let pending_command = command.clone();
+        let pending_path = executable.clone();
+        let spawned = thread::Builder::new()
+            .name("hokan-command-help".into())
+            .spawn(move || {
+                let fetched =
+                    catch_unwind(AssertUnwindSafe(|| fetch(&command))).unwrap_or_default();
+                let mut pending = lock(&cache.pending);
+                let current = pending.get(&command) == Some(&executable);
+                let inserted = current && {
+                    let mut entries = lock(&cache.entries);
+                    if entries.get(&command).is_some_and(|(cached_path, _)| {
+                        cache_path_matches(cached_path, &executable)
+                    }) {
+                        false
+                    } else {
+                        entries.insert(command.clone(), (executable.clone(), Arc::new(fetched)));
+                        true
+                    }
+                };
+                if current {
+                    pending.remove(&command);
+                }
+                drop(pending);
+                if inserted {
+                    cache.revision.fetch_add(1, Ordering::Release);
+                }
+            });
+        if spawned.is_err() {
+            let mut pending = lock(&self.pending);
+            if pending.get(pending_command.as_str()) == Some(&pending_path) {
+                pending.remove(pending_command.as_str());
+            }
+        }
+    }
+
+    /// Synchronous cache-first lookup used by focused tests and callers that
+    /// explicitly opt into waiting. Interactive completion uses `request`.
     pub fn get(&self, command: &str) -> Arc<CommandHelp> {
         self.get_with(command, fetch_command_help)
     }
 
     fn get_with(&self, command: &str, fetch: impl Fn(&str) -> CommandHelp) -> Arc<CommandHelp> {
         let mut entries = lock(&self.entries);
-        if let Some(help) = entries.get(command) {
-            return help.clone();
+        if let Some((_, help)) = entries.get(command) {
+            return Arc::clone(help);
         }
         self.fetches.fetch_add(1, Ordering::Relaxed);
         let fetched = Arc::new(fetch(command));
-        entries.entry(command.to_owned()).or_insert(fetched).clone()
+        let fetched = entries
+            .entry(command.to_owned())
+            .or_insert_with(|| (None, fetched))
+            .1
+            .clone();
+        self.revision.fetch_add(1, Ordering::Release);
+        fetched
     }
 
     #[cfg(test)]
     pub(crate) fn seed(&self, command: &str, help: CommandHelp) {
-        lock(&self.entries).insert(command.to_owned(), Arc::new(help));
+        lock(&self.entries).insert(command.to_owned(), (None, Arc::new(help)));
+        self.revision.fetch_add(1, Ordering::Release);
     }
 
     #[cfg(test)]
     pub(crate) fn fetch_count(&self) -> usize {
         self.fetches.load(Ordering::Relaxed)
     }
+
+    #[cfg(test)]
+    pub(crate) fn bump_revision(&self) {
+        self.revision.fetch_add(1, Ordering::Release);
+    }
 }
 
-fn lock(
-    entries: &Mutex<HashMap<String, Arc<CommandHelp>>>,
-) -> MutexGuard<'_, HashMap<String, Arc<CommandHelp>>> {
-    entries.lock().unwrap_or_else(PoisonError::into_inner)
+fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
+    value.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn cache_path_matches(cached: &Option<PathBuf>, requested: &Option<PathBuf>) -> bool {
+    cached.is_none() || cached == requested
 }
 
 pub struct CommandHelpProvider {
@@ -143,22 +284,23 @@ impl CandidateProvider for CommandHelpProvider {
             return false;
         };
         // Specs are curated and win; never run `man` for a command the user
-        // cannot execute, and never for the command token itself.
-        if self.specs.get(command).is_some() || !self.commands.contains(command) {
+        // cannot execute, and never for the command token itself. Package
+        // managers have a dedicated state machine with project-aware scripts;
+        // probing their generic help would delay and duplicate those rows.
+        if self.specs.get(command).is_some()
+            || crate::providers::package_manager(context).is_some()
+            || !crate::providers::effective_command_accepts_external(context)
+            || !self.commands.contains(command)
+        {
             return false;
         }
-        let Some((_words, position)) = argument_progress(context) else {
+        let Some((_, _)) = argument_progress(context) else {
             return false;
         };
-        if !context.parsed.current_prefix.starts_with('-') && position != 0 {
-            return false;
+        if let Some(help) = self.cache.peek(command) {
+            return help_position(context, &help).is_some();
         }
-        // Warm the cache here, not in `complete`: the engine only starts the
-        // `local_timeout_ms` budget after the applies pass, so the single
-        // bounded `man` run on a cold miss cannot starve the providers that
-        // follow (a cold fetch inside `complete` eats the whole ~100 ms
-        // budget and the filesystem batch is skipped for that query).
-        self.cache.get(command);
+        self.cache.request(command, self.commands.path(command));
         true
     }
 
@@ -166,29 +308,37 @@ impl CandidateProvider for CommandHelpProvider {
         let Some(command) = context.command() else {
             return ProviderOutput::default();
         };
-        let Some((_words, position)) = argument_progress(context) else {
+        let Some(help) = self.cache.peek(command) else {
             return ProviderOutput::default();
         };
-        let flags_position = context.parsed.current_prefix.starts_with('-');
-        if !flags_position && position != 0 {
+        let Some(position) = help_position(context, &help) else {
             return ProviderOutput::default();
-        }
-        let help = self.cache.get(command);
+        };
+        let flags_position = position == HelpPosition::Flags;
         let entries = if flags_position {
             &help.flags
         } else {
             &help.subcommands
         };
+        let query = context.parsed.current_prefix.as_str();
+        let exact = entries.iter().any(|entry| entry.name == query)
+            || (!flags_position && help.subcommand_aliases.iter().any(|alias| alias == query));
         let candidates = entries
             .iter()
+            .filter(|entry| {
+                !exact || (entry.name.len() > query.len() && entry.name.starts_with(query))
+            })
             .map(|entry| {
-                // The edit inserts only the bare word, but the row displays
-                // the full command line (`kimi export`) so the list reads as
-                // arguments of THIS command — bare words (`export`) look like
-                // unrelated commands next to history rows.
+                let display = crate::parser::apply_edit(
+                    &context.buffer.text,
+                    context.parsed.replacement.clone(),
+                    &entry.name,
+                )
+                .map(|result| result.trim_end().to_owned())
+                .unwrap_or_else(|_| format!("{command} {}", entry.name));
                 Candidate::new(
                     context.query_id,
-                    format!("{command} {}", entry.name),
+                    display,
                     entry.description.as_str(),
                     Some(TextEdit {
                         range: context.parsed.replacement.clone(),
@@ -225,6 +375,207 @@ impl CandidateProvider for CommandHelpProvider {
     }
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum HelpPosition {
+    Flags,
+    Subcommands,
+}
+
+fn help_position(context: &CompletionContext, help: &CommandHelp) -> Option<HelpPosition> {
+    let (words, position) = argument_progress(context)?;
+    let before = words.get(1..=position).unwrap_or_default();
+    let mut index = 0;
+    while let Some(word) = before.get(index).copied() {
+        if word == "--" {
+            return None;
+        }
+        if word.starts_with('-') && word != "-" {
+            let (entry, attached_value) = help_flag_usage(help, word)?;
+            index += 1;
+            if entry.takes_value && !attached_value {
+                if index >= before.len() {
+                    return None;
+                }
+                index += 1;
+            }
+            continue;
+        }
+        // A completed positional word commits the invocation to a
+        // subcommand (recognized or not), so top-level help must stay quiet.
+        return None;
+    }
+
+    if context.parsed.current_prefix.starts_with('-')
+        && let Some((entry, attached_value)) = help_flag_usage(help, &context.parsed.current_prefix)
+        && entry.takes_value
+        && attached_value
+    {
+        return None;
+    }
+    if context.parsed.current_prefix.starts_with('-')
+        && !context.parsed.current_prefix.contains('=')
+    {
+        Some(HelpPosition::Flags)
+    } else if !context.parsed.current_prefix.starts_with('-') {
+        Some(HelpPosition::Subcommands)
+    } else {
+        None
+    }
+}
+
+pub(crate) fn dynamic_subcommand_position(context: &CompletionContext, help: &CommandHelp) -> bool {
+    help.has_subcommands() && help_position(context, help) == Some(HelpPosition::Subcommands)
+}
+
+fn help_flag_usage<'a>(help: &'a CommandHelp, word: &str) -> Option<(&'a HelpEntry, bool)> {
+    if let Some(entry) = help.flags.iter().find(|entry| entry.name == word) {
+        return Some((entry, false));
+    }
+    if let Some((name, _)) = word.split_once('=') {
+        return help
+            .flags
+            .iter()
+            .find(|entry| entry.name == name)
+            .map(|entry| (entry, true));
+    }
+    help.flags
+        .iter()
+        .filter(|entry| entry.takes_value && entry.name.len() == 2)
+        .find(|entry| word.len() > entry.name.len() && word.starts_with(&entry.name))
+        .map(|entry| (entry, true))
+}
+
+/// Validate the top-level argument portion of a recorded invocation against
+/// cached command help. A parseable `--help` Commands section is closed only
+/// when the root has no free positional and the CLI is not extensible. Hybrid
+/// prompt CLIs and man-derived lists reject spelling-near misses but preserve
+/// unknown positional text and proven external command extensions.
+pub(crate) fn history_arguments_are_plausible(
+    help: &CommandHelp,
+    arguments: &[&str],
+    known_non_failure: bool,
+    allows_external_subcommands: bool,
+) -> bool {
+    if help.subcommands.is_empty() {
+        return true;
+    }
+
+    let mut index = 0;
+    while let Some(word) = arguments.get(index).copied() {
+        if has_dynamic_shell_syntax(word) || word == "--" {
+            return true;
+        }
+        if word.starts_with('-') && word != "-" {
+            let Some((entry, attached_value)) = help_flag_usage(help, word) else {
+                // An unknown flag may itself consume the following word. Do
+                // not guess that the next token is a subcommand, but reject
+                // an obvious misspelling of a documented top-level flag.
+                let name = word.split_once('=').map_or(word, |(name, _)| name);
+                return known_non_failure
+                    || !help
+                        .flags
+                        .iter()
+                        .any(|entry| one_edit_or_adjacent_transposition(name, &entry.name));
+            };
+            index += 1;
+            if entry.takes_value && !attached_value {
+                if index >= arguments.len() {
+                    return known_non_failure;
+                }
+                index += 1;
+            }
+            continue;
+        }
+
+        if help.subcommands.iter().any(|entry| entry.name == word)
+            || help.subcommand_aliases.iter().any(|alias| alias == word)
+        {
+            return true;
+        }
+        if help.subcommands_exhaustive && !help.accepts_positionals && !allows_external_subcommands
+        {
+            return known_non_failure;
+        }
+        if known_non_failure && !help.accepts_positionals {
+            return true;
+        }
+        return !help_subcommand_typo(help, word);
+    }
+    true
+}
+
+fn help_subcommand_typo(help: &CommandHelp, word: &str) -> bool {
+    help.subcommands
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .chain(help.subcommand_aliases.iter().map(String::as_str))
+        .any(|name| {
+            one_edit_or_adjacent_transposition(word, name)
+                || common_subcommand_variant(name).is_some_and(|variant| {
+                    word.eq_ignore_ascii_case(variant)
+                        || one_edit_or_adjacent_transposition(word, variant)
+                })
+        })
+}
+
+fn common_subcommand_variant(command: &str) -> Option<&'static str> {
+    match command {
+        "update" => Some("upgrade"),
+        "upgrade" => Some("update"),
+        _ => None,
+    }
+}
+
+fn has_dynamic_shell_syntax(word: &str) -> bool {
+    word.chars()
+        .any(|character| matches!(character, '$' | '`' | '*' | '?' | '[' | '{'))
+}
+
+pub(crate) fn one_edit_or_adjacent_transposition(left: &str, right: &str) -> bool {
+    if left == right {
+        return false;
+    }
+    let left: Vec<char> = left.chars().flat_map(char::to_lowercase).collect();
+    let right: Vec<char> = right.chars().flat_map(char::to_lowercase).collect();
+    if left.len().abs_diff(right.len()) > 1 {
+        return false;
+    }
+    if left.len() == right.len() {
+        let differences: Vec<usize> = left
+            .iter()
+            .zip(&right)
+            .enumerate()
+            .filter_map(|(index, (left, right))| (left != right).then_some(index))
+            .collect();
+        return differences.len() == 1
+            || (differences.len() == 2
+                && differences[1] == differences[0] + 1
+                && left[differences[0]] == right[differences[1]]
+                && left[differences[1]] == right[differences[0]]);
+    }
+
+    let (shorter, longer) = if left.len() < right.len() {
+        (&left, &right)
+    } else {
+        (&right, &left)
+    };
+    let mut short_index = 0;
+    let mut long_index = 0;
+    let mut skipped = false;
+    while short_index < shorter.len() && long_index < longer.len() {
+        if shorter[short_index] == longer[long_index] {
+            short_index += 1;
+            long_index += 1;
+        } else if skipped {
+            return false;
+        } else {
+            skipped = true;
+            long_index += 1;
+        }
+    }
+    true
+}
+
 fn fetch_man_page(command: &str) -> CommandHelp {
     let Ok(output) = crate::platform::run_bounded(
         "man",
@@ -241,13 +592,24 @@ fn fetch_man_page(command: &str) -> CommandHelp {
     parse_man_page(command, &text)
 }
 
-/// Full cold-miss fetch: try the man page, and only when it yields no flags
-/// and no subcommands (kubectl has no man page at all; docker's page has no
-/// COMMANDS section) fall back to a single bounded `<cmd> --help` run. An
-/// empty fallback result is returned as-is so the negative-cache path still
-/// guarantees at most one fetch per command per session.
+/// Full cold-miss fetch: try the man page, and when it yields no subcommands
+/// (kubectl has no man page at all; some pages document only flags) merge a
+/// single bounded `<cmd> --help` run. The man-page flags remain useful while
+/// the modern help output supplies its Commands surface.
 fn fetch_command_help(command: &str) -> CommandHelp {
     fetch_with_fallback(command, fetch_man_page, fetch_help_output)
+}
+
+fn fetch_command_help_from(command: &str, executable: Option<&Path>) -> CommandHelp {
+    let parsed = fetch_man_page(command);
+    if !parsed.subcommands.is_empty() {
+        return parsed;
+    }
+    let fallback = executable.map_or_else(
+        || fetch_help_output(command),
+        |path| fetch_help_program(path.as_os_str()),
+    );
+    merge_help(parsed, fallback)
 }
 
 fn fetch_with_fallback(
@@ -256,10 +618,33 @@ fn fetch_with_fallback(
     help: impl Fn(&str) -> CommandHelp,
 ) -> CommandHelp {
     let parsed = man(command);
-    if !parsed.flags.is_empty() || !parsed.subcommands.is_empty() {
+    if !parsed.subcommands.is_empty() {
         return parsed;
     }
-    help(command)
+    merge_help(parsed, help(command))
+}
+
+fn merge_help(mut primary: CommandHelp, fallback: CommandHelp) -> CommandHelp {
+    let mut seen_flags: HashSet<String> = primary
+        .flags
+        .iter()
+        .map(|entry| entry.name.clone())
+        .collect();
+    for flag in fallback.flags {
+        if primary.flags.len() >= MAX_ENTRIES {
+            break;
+        }
+        if seen_flags.insert(flag.name.clone()) {
+            primary.flags.push(flag);
+        }
+    }
+    if primary.subcommands.is_empty() {
+        primary.subcommands = fallback.subcommands;
+        primary.subcommand_aliases = fallback.subcommand_aliases;
+        primary.subcommands_exhaustive = fallback.subcommands_exhaustive;
+    }
+    primary.accepts_positionals |= fallback.accepts_positionals;
+    primary
 }
 
 /// Modern-CLI fallback: `<cmd> --help`, bounded exactly like the man probe —
@@ -268,8 +653,12 @@ fn fetch_with_fallback(
 /// literal `--help`, reads null stdin, and dies on timeout. A failing,
 /// hanging, or empty run degrades to an empty `CommandHelp`.
 fn fetch_help_output(command: &str) -> CommandHelp {
+    fetch_help_program(std::ffi::OsStr::new(command))
+}
+
+fn fetch_help_program(program: &std::ffi::OsStr) -> CommandHelp {
     let Ok(output) =
-        crate::platform::run_bounded(command, ["--help"], HELP_TIMEOUT, MAN_MAX_OUTPUT_BYTES)
+        crate::platform::run_bounded(program, ["--help"], HELP_TIMEOUT, MAN_MAX_OUTPUT_BYTES)
     else {
         return CommandHelp::default();
     };
@@ -289,9 +678,17 @@ fn parse_help_output(text: &str) -> CommandHelp {
     let mut seen_flags = HashSet::new();
     let mut seen_subcommands = HashSet::new();
     let mut in_commands = false;
+    let mut saw_commands = false;
+    let mut truncated = false;
     for (index, line) in lines.iter().enumerate() {
         if is_commands_header(line) {
             in_commands = true;
+            saw_commands = true;
+            continue;
+        }
+        if is_arguments_header(line) {
+            in_commands = false;
+            help.accepts_positionals = true;
             continue;
         }
         if is_help_section_header(line) {
@@ -299,6 +696,7 @@ fn parse_help_output(text: &str) -> CommandHelp {
             continue;
         }
         if let Some((names, rest)) = parse_flag_line(line) {
+            let takes_value = flag_takes_separate_value(&rest);
             let description = inline_description(&rest)
                 .or_else(|| block_description(&lines, index, indent_of(line)))
                 .map_or_else(String::new, |text| shorten(&text));
@@ -307,6 +705,7 @@ fn parse_help_output(text: &str) -> CommandHelp {
                     help.flags.push(HelpEntry {
                         name,
                         description: description.clone(),
+                        takes_value,
                     });
                 }
             }
@@ -315,16 +714,39 @@ fn parse_help_output(text: &str) -> CommandHelp {
         if !in_commands {
             continue;
         }
-        if let Some((name, description)) = help_subcommand_row(line)
-            && seen_subcommands.insert(name.clone())
-            && help.subcommands.len() < MAX_ENTRIES
-        {
-            help.subcommands.push(HelpEntry {
-                name,
-                description: shorten(&description),
-            });
+        if let Some((mut names, description)) = help_subcommand_row(line) {
+            let description = match block_description(&lines, index, indent_of(line)) {
+                Some(continuation) => format!("{description} {continuation}"),
+                None => description,
+            };
+            names.extend(description_aliases(&description));
+            let mut names = names.into_iter();
+            let Some(name) = names.next() else {
+                continue;
+            };
+            if seen_subcommands.insert(name.clone()) {
+                if help.subcommands.len() < MAX_ENTRIES {
+                    help.subcommands.push(HelpEntry {
+                        name,
+                        description: shorten(&description),
+                        takes_value: false,
+                    });
+                } else {
+                    truncated = true;
+                }
+            }
+            for alias in names {
+                if seen_subcommands.insert(alias.clone()) {
+                    if help.subcommand_aliases.len() < MAX_ENTRIES {
+                        help.subcommand_aliases.push(alias);
+                    } else {
+                        truncated = true;
+                    }
+                }
+            }
         }
     }
+    help.subcommands_exhaustive = saw_commands && !help.subcommands.is_empty() && !truncated;
     help
 }
 
@@ -345,6 +767,16 @@ fn is_commands_header(line: &str) -> bool {
     head == "Commands" || head.ends_with(" Commands")
 }
 
+fn is_arguments_header(line: &str) -> bool {
+    if line.starts_with(char::is_whitespace) {
+        return false;
+    }
+    matches!(
+        line.trim().trim_end_matches(':'),
+        "Arguments" | "Positionals" | "Positional Arguments"
+    )
+}
+
 /// Any other flush-left `Something:` line ends a commands section (`Flags:`,
 /// `Options:`, `Global Flags:`, …). The commands header itself is matched
 /// first by the caller.
@@ -354,31 +786,23 @@ fn is_help_section_header(line: &str) -> bool {
 
 /// Two-column `name   description` rows inside a `--help` commands section.
 /// Unlike the man-page variant, hyphenated names (`api-versions`) and
-/// clap-style alias lists (`build, b`) are accepted — the alias after the
-/// comma is dropped.
-fn help_subcommand_row(line: &str) -> Option<(String, String)> {
+/// clap/commander-style alias lists (`build, b`, `update|upgrade`) are
+/// accepted and retained for validation without creating duplicate rows.
+fn help_subcommand_row(line: &str) -> Option<(Vec<String>, String)> {
     if line.starts_with('-') || !line.starts_with(char::is_whitespace) {
         return None;
     }
     let trimmed = line.trim_start();
     let name_end = trimmed.find(char::is_whitespace)?;
     let name_token = &trimmed[..name_end];
-    let name = name_token.trim_end_matches(',');
-    if !is_entry_name(name) {
-        return None;
-    }
+    let mut names = split_subcommand_names(name_token.trim_end_matches(','))?;
     let mut rest = &trimmed[name_end..];
     // Alias rows (`build, b    Compile…`): skip the single-word alias so the
     // column gap is measured after it.
     if name_token.ends_with(',') {
         let alias = rest.trim_start();
         let alias_end = alias.find(char::is_whitespace)?;
-        if !alias[..alias_end]
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric())
-        {
-            return None;
-        }
+        names.extend(split_subcommand_names(&alias[..alias_end])?);
         rest = &alias[alias_end..];
     }
     let gap = rest
@@ -392,7 +816,42 @@ fn help_subcommand_row(line: &str) -> Option<(String, String)> {
     if description.is_empty() {
         return None;
     }
-    Some((name.to_owned(), description.to_owned()))
+    names.extend(description_aliases(description));
+    let mut seen = HashSet::new();
+    names.retain(|name| seen.insert(name.clone()));
+    Some((names, description.to_owned()))
+}
+
+fn split_subcommand_names(token: &str) -> Option<Vec<String>> {
+    let names: Vec<_> = token
+        .split(['|', ','])
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect();
+    (!names.is_empty() && names.iter().all(|name| is_entry_name(name))).then_some(names)
+}
+
+fn description_aliases(description: &str) -> Vec<String> {
+    let Some(start) = description
+        .find("[aliases:")
+        .or_else(|| description.find("[alias:"))
+    else {
+        return Vec::new();
+    };
+    let Some(end) = description[start..].find(']') else {
+        return Vec::new();
+    };
+    let block = &description[start + 1..start + end];
+    let Some((_, aliases)) = block.split_once(':') else {
+        return Vec::new();
+    };
+    aliases
+        .split([',', ' ', '|'])
+        .map(str::trim)
+        .filter(|alias| is_entry_name(alias))
+        .map(str::to_owned)
+        .collect()
 }
 
 /// Conservative heuristics over `man -P cat` output. Anything unrecognized is
@@ -409,10 +868,11 @@ fn parse_man_page(command: &str, text: &str) -> CommandHelp {
             // COMMANDS / SUBCOMMANDS / "COMMAND LIST" style sections only;
             // e.g. git(1) has "GIT COMMANDS" and "HIGH-LEVEL COMMANDS
             // (PORCELAIN)".
-            in_commands = line.trim().contains("COMMAND");
+            in_commands = is_command_section_header(line);
             continue;
         }
         if let Some((names, rest)) = parse_flag_line(line) {
+            let takes_value = flag_takes_separate_value(&rest);
             let description = inline_description(&rest)
                 .or_else(|| block_description(&lines, index, indent_of(line)))
                 .map_or_else(String::new, |text| shorten(&text));
@@ -421,6 +881,7 @@ fn parse_man_page(command: &str, text: &str) -> CommandHelp {
                     help.flags.push(HelpEntry {
                         name,
                         description: description.clone(),
+                        takes_value,
                     });
                 }
             }
@@ -433,7 +894,11 @@ fn parse_man_page(command: &str, text: &str) -> CommandHelp {
             let description = block_description(&lines, index, indent_of(line))
                 .map_or_else(String::new, |text| shorten(&text));
             if seen_subcommands.insert(name.clone()) && help.subcommands.len() < MAX_ENTRIES {
-                help.subcommands.push(HelpEntry { name, description });
+                help.subcommands.push(HelpEntry {
+                    name,
+                    description,
+                    takes_value: false,
+                });
             }
         } else if let Some((name, description)) = two_column_subcommand(line)
             && seen_subcommands.insert(name.clone())
@@ -442,10 +907,19 @@ fn parse_man_page(command: &str, text: &str) -> CommandHelp {
             help.subcommands.push(HelpEntry {
                 name,
                 description: shorten(&description),
+                takes_value: false,
             });
         }
     }
     help
+}
+
+fn is_command_section_header(line: &str) -> bool {
+    let head = line.trim().split('(').next().unwrap_or_default().trim_end();
+    matches!(head, "COMMANDS" | "SUBCOMMANDS" | "COMMAND LIST")
+        || head.ends_with(" COMMANDS")
+        || head.ends_with(" SUBCOMMANDS")
+        || head.ends_with(" COMMAND LIST")
 }
 
 /// `man -P cat` output keeps troff overstrike markup: bold is `X\bX` and
@@ -558,6 +1032,31 @@ fn inline_description(rest: &str) -> Option<String> {
         return Some(after.to_owned());
     }
     Some(trimmed.to_owned())
+}
+
+/// Whether the syntax following a parsed flag names a required, separately
+/// supplied value. Attached-only forms such as `--color=WHEN` do not consume
+/// the next argv word; `<FILE>`, `FILE`, and `string  Description` do.
+fn flag_takes_separate_value(rest: &str) -> bool {
+    let trimmed = rest.trim_start();
+    if trimmed.is_empty() || trimmed.starts_with('=') || trimmed.starts_with("[=") {
+        return false;
+    }
+    if trimmed.starts_with('<') {
+        return true;
+    }
+    if trimmed.starts_with('[') {
+        return false;
+    }
+    let Some(first_end) = trimmed.find(char::is_whitespace) else {
+        return is_placeholder(trimmed.trim_end_matches([',', ';', ':']));
+    };
+    let first = trimmed[..first_end].trim_end_matches([',', ';', ':']);
+    let gap = trimmed[first_end..]
+        .chars()
+        .take_while(|character| *character == ' ' || *character == '\t')
+        .count();
+    gap >= 2 && is_placeholder(first)
 }
 
 fn is_placeholder(word: &str) -> bool {
@@ -713,6 +1212,8 @@ mod tests {
                 ("--null", "Read null-terminated names."),
             ]
         );
+        assert!(!help.flags[0].takes_value);
+        assert!(help.flags[2].takes_value);
         assert!(help.subcommands.is_empty());
     }
 
@@ -792,6 +1293,26 @@ mod tests {
     }
 
     #[test]
+    fn command_named_non_subcommand_sections_do_not_leak_rows() {
+        let page = [
+            bold("COMMAND LINE OPTIONS"),
+            "  output   This is prose laid out in two columns.".to_owned(),
+            bold("COMMAND EXECUTION"),
+            "  worker   This is also not a subcommand.".to_owned(),
+            bold("SUBCOMMANDS"),
+            "  deploy   Ship the service.".to_owned(),
+        ]
+        .join("\n");
+        let help = parse_man_page("demo", &page);
+        let names: Vec<_> = help
+            .subcommands
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, ["deploy"]);
+    }
+
+    #[test]
     fn garbage_input_yields_no_entries() {
         assert_eq!(parse_man_page("x", ""), CommandHelp::default());
         assert_eq!(
@@ -851,9 +1372,26 @@ Options:
   -V, --version   Print version
 ";
 
+    const AI_CLI_HELP: &str = "\
+Usage: ai [OPTIONS] <COMMAND>
+
+Commands:
+  exec            Run non-interactively [aliases: e]
+  apply           Apply the latest patch to the local
+                  working tree [aliases: a]
+  update|upgrade  Install the latest version
+
+Arguments:
+  [PROMPT]        Optional prompt to start a session
+
+Options:
+  -h, --help      Print help
+";
+
     #[test]
     fn parses_kubectl_style_help() {
         let help = parse_help_output(KUBECTL_HELP);
+        assert!(help.subcommands_exhaustive);
         let names: Vec<&str> = help
             .subcommands
             .iter()
@@ -882,6 +1420,7 @@ Options:
     #[test]
     fn parses_docker_style_help_with_management_commands() {
         let help = parse_help_output(DOCKER_HELP);
+        assert!(help.subcommands_exhaustive);
         let names: Vec<&str> = help
             .subcommands
             .iter()
@@ -891,11 +1430,14 @@ Options:
         let flags: Vec<&str> = help.flags.iter().map(|entry| entry.name.as_str()).collect();
         assert_eq!(flags, ["--config", "-D", "--debug"]);
         assert_eq!(help.flags[0].description, "Location of client config files");
+        assert!(help.flags[0].takes_value);
+        assert!(!help.flags[1].takes_value);
     }
 
     #[test]
     fn parses_cargo_style_help_with_aliases() {
         let help = parse_help_output(CARGO_HELP);
+        assert!(help.subcommands_exhaustive);
         let names: Vec<&str> = help
             .subcommands
             .iter()
@@ -908,6 +1450,68 @@ Options:
         );
         let flags: Vec<&str> = help.flags.iter().map(|entry| entry.name.as_str()).collect();
         assert_eq!(flags, ["-V", "--version"]);
+        assert_eq!(help.subcommand_aliases, ["b", "c"]);
+    }
+
+    #[test]
+    fn parses_pipe_and_description_subcommand_aliases() {
+        let help = parse_help_output(AI_CLI_HELP);
+        let names: Vec<_> = help
+            .subcommands
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, ["exec", "apply", "update"]);
+        assert_eq!(help.subcommand_aliases, ["e", "a", "upgrade"]);
+        assert!(help.subcommands_exhaustive);
+        assert!(help.accepts_positionals);
+        for alias in ["e", "a", "upgrade"] {
+            assert!(history_arguments_are_plausible(
+                &help,
+                &[alias],
+                false,
+                false
+            ));
+        }
+        assert!(!history_arguments_are_plausible(
+            &help,
+            &["upgrad"],
+            false,
+            false
+        ));
+        assert!(history_arguments_are_plausible(
+            &help,
+            &["fix", "this", "bug"],
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn proven_hidden_subcommands_survive_a_closed_help_surface() {
+        let help = CommandHelp {
+            flags: Vec::new(),
+            subcommands: vec![HelpEntry {
+                name: "deploy".into(),
+                description: String::new(),
+                takes_value: false,
+            }],
+            subcommand_aliases: Vec::new(),
+            accepts_positionals: false,
+            subcommands_exhaustive: true,
+        };
+        assert!(!history_arguments_are_plausible(
+            &help,
+            &["hidden"],
+            false,
+            false
+        ));
+        assert!(history_arguments_are_plausible(
+            &help,
+            &["hidden"],
+            true,
+            false
+        ));
     }
 
     #[test]
@@ -922,10 +1526,11 @@ Options:
         let orphan_rows = "  start   Start the service.\nCommands:\n\nFlags:\n";
         let help = parse_help_output(orphan_rows);
         assert!(help.subcommands.is_empty());
+        assert!(!help.subcommands_exhaustive);
     }
 
     #[test]
-    fn help_fallback_only_runs_when_the_man_page_is_empty() {
+    fn help_fallback_fills_a_man_page_without_subcommands() {
         use std::cell::Cell;
 
         let help_calls = Cell::new(0);
@@ -936,24 +1541,33 @@ Options:
                 subcommands: vec![HelpEntry {
                     name: "apply".into(),
                     description: String::new(),
+                    takes_value: false,
                 }],
+                subcommand_aliases: Vec::new(),
+                accepts_positionals: false,
+                subcommands_exhaustive: false,
             }
         };
         let man_with_flags = |_: &str| CommandHelp {
             flags: vec![HelpEntry {
                 name: "-x".into(),
                 description: String::new(),
+                takes_value: false,
             }],
             subcommands: Vec::new(),
+            subcommand_aliases: Vec::new(),
+            accepts_positionals: false,
+            subcommands_exhaustive: false,
         };
-        // A non-empty man parse wins; `--help` is never spawned.
+        // Preserve parsed man flags while filling its missing command list.
         let result = fetch_with_fallback("demo", man_with_flags, counting_help);
         assert_eq!(result.flags.len(), 1);
-        assert_eq!(help_calls.get(), 0);
+        assert_eq!(result.subcommands.len(), 1);
+        assert_eq!(help_calls.get(), 1);
         // An empty man parse falls back to `--help` exactly once.
         let result = fetch_with_fallback("demo", |_| CommandHelp::default(), counting_help);
         assert_eq!(result.subcommands.len(), 1);
-        assert_eq!(help_calls.get(), 1);
+        assert_eq!(help_calls.get(), 2);
         // Both empty: the negative result is returned for caching.
         let result = fetch_with_fallback(
             "demo",
@@ -1027,11 +1641,10 @@ Options:
         }
         let path = OsString::from(directory.path());
         let commands = Arc::new(CommandPathCache::from_path(Some(&path)));
-        let provider = CommandHelpProvider::new(
-            Arc::new(SpecRegistry::load(None)),
-            commands,
-            Arc::new(CommandHelpCache::default()),
-        );
+        let cache = Arc::new(CommandHelpCache::default());
+        cache.seed("git", CommandHelp::default());
+        let provider =
+            CommandHelpProvider::new(Arc::new(SpecRegistry::load(None)), commands, cache);
         // `ls` has spec coverage: skipped even at flag/subcommand positions.
         assert!(!provider.applies(&context("ls ", 1)));
         assert!(!provider.applies(&context("ls -", 2)));
@@ -1045,6 +1658,8 @@ Options:
         assert!(provider.applies(&context("git -", 7)));
         // Past the first argument without a dash: no.
         assert!(!provider.applies(&context("git add ", 8)));
+        // `--` ends flag parsing; a dash-prefixed path after it is not a flag.
+        assert!(!provider.applies(&context("git -- -path", 9)));
     }
 
     #[test]
@@ -1086,6 +1701,104 @@ Options:
     }
 
     #[test]
+    fn background_requests_return_immediately_and_dedupe() {
+        let cache = Arc::new(CommandHelpCache::default());
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let started = std::time::Instant::now();
+        cache.request_with("slow-tool", move |_| {
+            started_tx.send(()).expect("started");
+            release_rx.recv().expect("released");
+            CommandHelp {
+                flags: Vec::new(),
+                subcommands: vec![HelpEntry {
+                    name: "deploy".into(),
+                    description: "Ship it".into(),
+                    takes_value: false,
+                }],
+                subcommand_aliases: Vec::new(),
+                accepts_positionals: false,
+                subcommands_exhaustive: false,
+            }
+        });
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "request must not wait for the fetch"
+        );
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("background fetch started");
+        assert!(cache.is_pending("slow-tool"));
+        cache.request_with("slow-tool", |_| panic!("duplicate fetch"));
+        assert_eq!(cache.fetch_count(), 1);
+        assert!(cache.peek("slow-tool").is_none());
+
+        release_tx.send(()).expect("release fetch");
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while cache.peek("slow-tool").is_none() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let help = cache.peek("slow-tool").expect("cached help");
+        assert!(!cache.is_pending("slow-tool"));
+        assert_eq!(help.subcommands[0].name, "deploy");
+    }
+
+    #[test]
+    fn resolved_executable_change_invalidates_cached_help() {
+        let cache = Arc::new(CommandHelpCache::default());
+        let first_path = PathBuf::from("/toolchains/one/demo");
+        cache.request_with_path("demo", Some(first_path.clone()), |_| CommandHelp {
+            flags: Vec::new(),
+            subcommands: vec![HelpEntry {
+                name: "first".into(),
+                description: String::new(),
+                takes_value: false,
+            }],
+            subcommand_aliases: Vec::new(),
+            accepts_positionals: false,
+            subcommands_exhaustive: false,
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while cache.peek("demo").is_none() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            cache.peek("demo").expect("first help").subcommands[0].name,
+            "first"
+        );
+
+        // Same resolution is a cache hit; a different executable path gets a
+        // fresh parse for the identically named command.
+        cache.request_with_path("demo", Some(first_path), |_| panic!("duplicate fetch"));
+        cache.request_with_path("demo", Some(PathBuf::from("/toolchains/two/demo")), |_| {
+            CommandHelp {
+                flags: Vec::new(),
+                subcommands: vec![HelpEntry {
+                    name: "second".into(),
+                    description: String::new(),
+                    takes_value: false,
+                }],
+                subcommand_aliases: Vec::new(),
+                accepts_positionals: false,
+                subcommands_exhaustive: false,
+            }
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while cache
+            .peek("demo")
+            .is_none_or(|help| help.subcommands[0].name != "second")
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            cache.peek("demo").expect("second help").subcommands[0].name,
+            "second"
+        );
+        assert_eq!(cache.fetch_count(), 2);
+    }
+
+    #[test]
     fn engine_emits_seeded_subcommands_and_flags() {
         let directory = tempfile::tempdir().expect("command directory");
         let path = directory.path().join("git");
@@ -1097,14 +1810,26 @@ Options:
         cache.seed(
             "git",
             CommandHelp {
-                flags: vec![HelpEntry {
-                    name: "--paginate".into(),
-                    description: "Pipe output into less.".into(),
-                }],
+                flags: vec![
+                    HelpEntry {
+                        name: "--paginate".into(),
+                        description: "Pipe output into less.".into(),
+                        takes_value: false,
+                    },
+                    HelpEntry {
+                        name: "--config".into(),
+                        description: "Read configuration from a file.".into(),
+                        takes_value: true,
+                    },
+                ],
                 subcommands: vec![HelpEntry {
                     name: "checkout".into(),
                     description: "Switch branches.".into(),
+                    takes_value: false,
                 }],
+                subcommand_aliases: Vec::new(),
+                accepts_positionals: false,
+                subcommands_exhaustive: false,
             },
         );
         let provider = CommandHelpProvider::new(
@@ -1141,8 +1866,49 @@ Options:
         assert!(matches!(flag.action, CandidateAction::Insert));
         assert_eq!(flag.edit.as_ref().expect("edit").range, 4..7);
 
+        let wrapped = engine.complete(&context("sudo git --p", 20));
+        assert!(
+            wrapped
+                .candidates
+                .iter()
+                .any(|candidate| candidate.display.primary == "sudo git --paginate")
+        );
+
+        let after_global_value = engine.complete(&context("git --config cfg ch", 21));
+        let checkout = after_global_value
+            .candidates
+            .iter()
+            .find(|candidate| candidate.display.primary == "git --config cfg checkout")
+            .expect("subcommand after a separated global flag value");
+        assert_eq!(
+            checkout.edit.as_ref().expect("edit").replacement,
+            "checkout"
+        );
+        assert!(
+            engine
+                .complete(&context("git --config cf", 22))
+                .candidates
+                .is_empty(),
+            "a required flag value must not be treated as a subcommand"
+        );
+        assert!(
+            engine
+                .complete(&context("git checkout", 23))
+                .candidates
+                .is_empty(),
+            "an exact completed subcommand must not leave fuzzy siblings"
+        );
+
+        assert!(
+            engine
+                .complete(&context("git checkout -", 3))
+                .candidates
+                .is_empty(),
+            "top-level flags must not leak into a recognized subcommand"
+        );
+
         // Past the first argument without a dash the provider stays silent.
-        let output = engine.complete(&context("git checkout ", 3));
+        let output = engine.complete(&context("git checkout ", 4));
         assert!(output.candidates.is_empty());
     }
 

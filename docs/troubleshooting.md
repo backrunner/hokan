@@ -16,7 +16,7 @@ control FIFO。
 
 ## zsh 自动启动与临时旁路
 
-执行 `hokan setup --shell zsh` 后，当前已经运行的 shell 不会被替换；重新打开一个真实
+执行 `hokan install --shell zsh` 后，当前已经运行的 shell 不会被替换；重新打开一个真实
 终端窗口后，交互式 zsh 会自动 `exec` 安装时记录的 Hokan 二进制。外层 zsh 不加载
 hook，hook 只在 Hokan 管理的内层 zsh 中加载，因此不会形成递归 session。
 
@@ -27,7 +27,7 @@ HOKAN_AUTO_START=0 zsh -l
 ```
 
 带 `-c` 的 zsh、stdin/stdout 不是 TTY、`TERM=dumb` 或显式设置
-`HOKAN_AUTO_START=0` 时不会自动启动。移动或重装二进制后重新运行 setup，以更新受管块
+`HOKAN_AUTO_START=0` 时不会自动启动。移动或重装二进制后重新运行 install，以更新受管块
 中固定的可执行文件路径。
 
 ## 终端没有回显或输入模式异常
@@ -213,12 +213,12 @@ hokan history prune --keep 10000
 安装和卸载只操作两个受管理 marker 之间的内容，并在修改前创建备份：
 
 ```bash
-hokan setup --shell zsh
+hokan install --shell zsh
 hokan uninstall --shell zsh --integration-only
 ```
 
 重复或残缺 marker 会导致拒绝修改。此时先对照备份人工修复 rc 文件，不要删除用户配置。
-重复运行 setup 会升级旧协议的受管块，并在内容已是最新时保持文件不变。
+重复运行 install 会升级旧协议的受管块，并在内容已是最新时保持文件不变。
 
 ## 与 zsh-autosuggestions / atuin / fzf 等插件冲突
 
@@ -235,7 +235,7 @@ Hokan 自身在前台全屏程序和 alternate screen 下会隐藏 overlay 并�
    [[ -z $HOKAN_ACTIVE ]] && source /path/to/zsh-autosuggestions.zsh
    ```
 
-3. 或改用按需模式 `hokan setup --shell zsh --on-demand`：默认 shell 完全保持原样，
+3. 或改用按需模式 `hokan install --shell zsh --on-demand`：默认 shell 完全保持原样，
    只有输入 `hk` 进入的 Hokan session 使用 overlay。
 
 ## 收集最小诊断

@@ -8,6 +8,7 @@ use crate::{
     },
     config::AiConfig,
     platform::CommandPathCache,
+    shell::AliasCache,
     specs::SpecRegistry,
     terminal::RiskLevel,
 };
@@ -17,6 +18,7 @@ pub struct AiActionProvider {
     credential_available: bool,
     commands: Arc<CommandPathCache>,
     specs: Arc<SpecRegistry>,
+    aliases: Arc<AliasCache>,
 }
 
 impl AiActionProvider {
@@ -26,12 +28,14 @@ impl AiActionProvider {
         credential_available: bool,
         commands: Arc<CommandPathCache>,
         specs: Arc<SpecRegistry>,
+        aliases: Arc<AliasCache>,
     ) -> Self {
         Self {
             config,
             credential_available,
             commands,
             specs,
+            aliases,
         }
     }
 }
@@ -42,6 +46,9 @@ impl CandidateProvider for AiActionProvider {
     }
 
     fn applies(&self, context: &CompletionContext) -> bool {
+        if self.is_available_shell_command(context) {
+            return false;
+        }
         detect_natural_language(
             &context.buffer.text,
             &self.config.trigger_prefix,
@@ -81,6 +88,31 @@ impl CandidateProvider for AiActionProvider {
         ProviderOutput {
             candidates: vec![candidate],
             diagnostics: Vec::new(),
+        }
+    }
+}
+
+impl AiActionProvider {
+    fn is_available_shell_command(&self, context: &CompletionContext) -> bool {
+        let Some(info) =
+            crate::safety::effective_command_info_for_shell(&context.buffer.text, context.shell)
+        else {
+            return false;
+        };
+        if info.indeterminate {
+            return false;
+        }
+        let word = info.word.as_str();
+        let path = word.contains('/') || self.commands.contains(word);
+        let builtin = crate::providers::is_shell_builtin(context.shell, word);
+        let symbol = crate::providers::is_shell_builtin_or_keyword(context.shell, word);
+        match info.kind {
+            crate::parser::EffectiveCommandKind::Shell => {
+                path || symbol || self.aliases.load(context.shell).contains(word)
+            }
+            crate::parser::EffectiveCommandKind::External => path,
+            crate::parser::EffectiveCommandKind::ExternalOrBuiltin => path || builtin,
+            crate::parser::EffectiveCommandKind::Builtin => builtin,
         }
     }
 }
@@ -177,6 +209,7 @@ mod tests {
             false,
             Arc::new(CommandPathCache::default()),
             Arc::new(SpecRegistry::load(None)),
+            Arc::new(AliasCache::default()),
         );
         assert!(provider.applies(&context));
         let output = provider.complete(&context);
@@ -184,5 +217,47 @@ mod tests {
             output.candidates[0].action,
             CandidateAction::ConfigureAi
         ));
+    }
+
+    #[test]
+    fn valid_builtins_and_aliases_are_not_offered_as_natural_language() {
+        let mut aliases = crate::shell::ShellAliases::default();
+        crate::shell::parse_rc_text(
+            ShellKind::Zsh,
+            "alias showall='printf done'\n",
+            &mut aliases,
+        );
+        let provider = AiActionProvider::new(
+            Arc::new(AiConfig::default()),
+            false,
+            Arc::new(CommandPathCache::default()),
+            Arc::new(SpecRegistry::load(None)),
+            Arc::new(AliasCache::new_fixed(aliases)),
+        );
+        let context = |text: &str| {
+            CompletionContext::new(
+                QueryId::new(1),
+                ShellKind::Zsh,
+                PathBuf::from("/tmp"),
+                BufferSnapshot::new(text, text.len(), BufferRevision::new(1), SyncQuality::Exact)
+                    .expect("buffer"),
+            )
+            .expect("context")
+        };
+
+        // These lines deliberately contain enough English intent words to
+        // cross the natural-language threshold without command awareness.
+        for command in [
+            "set show all files now",
+            "time echo show all files now",
+            "builtin echo show all files now",
+            "showall show all files now",
+        ] {
+            assert!(
+                !provider.applies(&context(command)),
+                "valid shell command was treated as prose: {command:?}"
+            );
+        }
+        assert!(provider.applies(&context("please show all files now")));
     }
 }

@@ -187,6 +187,10 @@ fn parse_escape(bytes: &[u8]) -> ParseResult {
         (b"\x1b[B", InputKind::Down),
         (b"\x1b[C", InputKind::Right),
         (b"\x1b[D", InputKind::Left),
+        (b"\x1bOA", InputKind::Up),
+        (b"\x1bOB", InputKind::Down),
+        (b"\x1bOC", InputKind::Right),
+        (b"\x1bOD", InputKind::Left),
         (b"\x1b[H", InputKind::Home),
         (b"\x1b[F", InputKind::End),
         (b"\x1b[1~", InputKind::Home),
@@ -247,6 +251,7 @@ mod tests {
     fn arrows_utf8_and_paste_work_at_every_split() {
         for fixture in [
             b"\x1b[A".as_slice(),
+            b"\x1bOA".as_slice(),
             "中".as_bytes(),
             b"\x1b[200~hello\x1b[201~".as_slice(),
         ] {
@@ -257,6 +262,21 @@ mod tests {
                 actual.extend(decoder.feed(&fixture[split..]));
                 assert_eq!(actual, expected, "split {split} for {fixture:?}");
             }
+        }
+    }
+
+    #[test]
+    fn decodes_csi_and_application_cursor_arrows() {
+        for (raw, expected) in [
+            (b"\x1b[A".as_slice(), InputKind::Up),
+            (b"\x1b[B".as_slice(), InputKind::Down),
+            (b"\x1bOA".as_slice(), InputKind::Up),
+            (b"\x1bOB".as_slice(), InputKind::Down),
+        ] {
+            let events = InputDecoder::default().feed(raw);
+            assert_eq!(events.len(), 1, "sequence {raw:?}");
+            assert_eq!(events[0].kind, expected, "sequence {raw:?}");
+            assert_eq!(events[0].raw, raw, "sequence {raw:?}");
         }
     }
 
