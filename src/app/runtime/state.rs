@@ -328,22 +328,25 @@ pub(super) fn executable_awaiting_arguments(
     aliases: &AliasCache,
     specs: &SpecRegistry,
 ) -> bool {
-    crate::providers::command_position_open(context)
+    (crate::providers::command_position_open(context)
+        || crate::providers::explicit_executable_path_position(context))
         && context.command().is_some_and(|command| {
             let resolution = crate::providers::command_resolution_kind(context);
             let shell_aliases = (resolution == crate::parser::EffectiveCommandKind::Shell)
                 .then(|| aliases.load(context.shell));
             let runnable = match resolution {
                 crate::parser::EffectiveCommandKind::Shell => {
-                    commands.contains(command)
+                    crate::providers::resolved_executable_path(context, commands).is_some()
                         || crate::providers::is_shell_callable(context.shell, command)
                         || shell_aliases
                             .as_ref()
                             .is_some_and(|aliases| aliases.contains(command))
                 }
-                crate::parser::EffectiveCommandKind::External => commands.contains(command),
+                crate::parser::EffectiveCommandKind::External => {
+                    crate::providers::resolved_executable_path(context, commands).is_some()
+                }
                 crate::parser::EffectiveCommandKind::ExternalOrBuiltin => {
-                    commands.contains(command)
+                    crate::providers::resolved_executable_path(context, commands).is_some()
                         || crate::providers::is_shell_builtin(context.shell, command)
                 }
                 crate::parser::EffectiveCommandKind::Builtin => {
@@ -363,69 +366,33 @@ pub(super) fn prefetch_command_help(
     let Some(command) = context.command() else {
         return;
     };
-    if !crate::providers::command_position_open(context)
+    if !(crate::providers::command_position_open(context)
+        || crate::providers::explicit_executable_path_position(context))
         || specs.get(command).is_some()
-        || crate::providers::is_package_manager(command)
         || !crate::providers::effective_command_accepts_external(context)
-        || !commands.contains(command)
     {
         return;
     }
-    help.request(command, commands.path(command));
+    let Some(executable) = crate::providers::resolved_executable_path(context, commands) else {
+        return;
+    };
+    help.request(command, Some(executable));
 }
 
 /// Commands that cannot run standalone. The PATH cache cannot express this,
 /// so combine the package-manager registry, a built-in list of other
 /// subcommand-style CLIs, and the spec registry's `requires_arguments` flag.
 fn requires_arguments(command: &str, specs: &SpecRegistry) -> bool {
+    if crate::providers::known_standalone_command(command) {
+        return false;
+    }
     if crate::providers::is_package_manager(command) {
         return true;
     }
-    const SUBCOMMAND_COMMANDS: &[&str] = &[
-        "ansible",
-        "apt",
-        "aws",
-        "az",
-        "brew",
-        "cargo",
-        "consul",
-        "dnf",
-        "docker",
-        "docker-compose",
-        "eksctl",
-        "firebase",
-        "flyctl",
-        "gem",
-        "gh",
-        "gcloud",
-        "go",
-        "helm",
-        "heroku",
-        "istioctl",
-        "kubectl",
-        "mise",
-        "nerdctl",
-        "nix",
-        "oc",
-        "pacman",
-        "pip",
-        "pip3",
-        "pipx",
-        "podman",
-        "railway",
-        "rustup",
-        "snap",
-        "supabase",
-        "systemctl",
-        "terraform",
-        "tmux",
-        "vagrant",
-        "vault",
-        "vercel",
-        "wrangler",
-        "git",
-    ];
-    if SUBCOMMAND_COMMANDS.contains(&command) {
+    if crate::providers::known_subcommand_command(command) {
+        return true;
+    }
+    if crate::providers::known_required_argument_command(command) {
         return true;
     }
     if let Some(spec) = specs.get(command) {

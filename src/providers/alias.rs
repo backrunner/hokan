@@ -84,19 +84,9 @@ impl AliasProvider {
         }
         let query = context.parsed.current_prefix.as_str();
         let folded_query = query.to_lowercase();
-        let has_direct_prefix = !folded_query.is_empty()
-            && aliases
-                .names()
-                .any(|name| name.to_lowercase().starts_with(&folded_query));
         let candidates = aliases
             .names()
-            .filter(|name| {
-                if has_direct_prefix {
-                    name.to_lowercase().starts_with(&folded_query)
-                } else {
-                    crate::completion::match_quality(query, name) > 0
-                }
-            })
+            .filter(|name| query.is_empty() || name.to_lowercase().starts_with(&folded_query))
             .map(|name| {
                 let entry = aliases.get(name).expect("name from the same map");
                 let querying = crate::providers::shell_symbol_argument_position(context);
@@ -463,7 +453,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_alias_prefixes_suppress_scattered_fuzzy_rows() {
+    fn aliases_require_a_real_name_prefix() {
         let mut aliases = ShellAliases::default();
         crate::shell::parse_rc_text(
             ShellKind::Zsh,
@@ -486,6 +476,11 @@ mod tests {
             .map(|candidate| candidate.display.primary)
             .collect();
         assert_eq!(rows, ["code", "codex"]);
+
+        assert!(
+            provider.complete(&context("cgd")).candidates.is_empty(),
+            "a scattered subsequence must not surface an alias"
+        );
     }
 
     #[test]

@@ -18,7 +18,7 @@ use crate::{
     providers::{
         AiActionProvider, CommandHelpCache, CommandHelpProvider, CommandSpecProvider,
         FilesystemProvider, HistoryProvider, NetworkInterfaceProvider, PathCommandProvider,
-        ProcessProvider, ProjectProvider,
+        ProcessProvider, ProjectProvider, PythonModuleProvider,
     },
     shell::{AliasCache, ShellKind},
     specs::SpecRegistry,
@@ -146,18 +146,23 @@ pub(super) fn build_engine(
         Arc::clone(&specs),
         Arc::clone(&commands),
     ));
-    engine.register(ProjectProvider::new(
-        projects,
-        Arc::clone(&commands),
-        Arc::clone(&history),
-    ));
+    engine.register(
+        ProjectProvider::new(projects, Arc::clone(&commands), Arc::clone(&history))
+            .with_help(Arc::clone(&help)),
+    );
     engine.register(crate::providers::GitProvider::new(
         git_status,
         Arc::new(crate::project::GitRefsCache::default()),
         Arc::clone(&commands),
     ));
-    engine.register(crate::providers::SshHostProvider::new());
+    engine.register(crate::providers::SshHostProvider::new(Arc::clone(
+        &commands,
+    )));
     engine.register(PathCommandProvider::new(Arc::clone(&commands)));
+    engine.register(PythonModuleProvider::new(
+        Arc::clone(&commands),
+        Arc::clone(&help),
+    ));
     if config.history.enabled {
         engine.register(HistoryProvider::new(
             Arc::clone(&history),

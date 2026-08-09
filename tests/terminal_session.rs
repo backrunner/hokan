@@ -1702,6 +1702,9 @@ fn argument_position_excludes_unrelated_history_commands() {
     // broad fuzzy history at this argument position.
     terminal.wait_for_screen("HKARG_MARKER.txt");
     terminal.settle(Duration::from_millis(300));
+    // The first row can trigger a background `whoami` help refresh. Wait for
+    // the post-refresh repaint as well instead of sampling its paint window.
+    terminal.wait_for_screen("HKARG_MARKER.txt");
 
     let text = terminal.screen_text();
     let overlay_rows: Vec<_> = text.lines().filter(|line| line.contains('│')).collect();

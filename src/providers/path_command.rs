@@ -26,9 +26,14 @@ impl CandidateProvider for PathCommandProvider {
 
     fn applies(&self, context: &CompletionContext) -> bool {
         crate::providers::executable_position_open(context)
+            && (crate::providers::command_position_open(context)
+                || self.executable_slot_owner_available(context))
     }
 
     fn complete(&self, context: &CompletionContext) -> ProviderOutput {
+        if !self.applies(context) {
+            return ProviderOutput::default();
+        }
         let mut names = self.commands.names();
         let command_slot = crate::providers::command_position_open(context);
         let symbol_query = crate::providers::shell_symbol_argument_position(context);
@@ -68,9 +73,6 @@ impl CandidateProvider for PathCommandProvider {
         names.dedup();
         let query = context.parsed.current_prefix.as_str();
         let folded_query = query.to_lowercase();
-        let exact_reserved_word = command_slot
-            && crate::providers::is_shell_builtin_or_keyword(context.shell, query)
-            && !crate::providers::is_shell_callable(context.shell, query);
         let allowed = |name: &str| {
             let on_path = path_allowed && self.commands.contains(name);
             let shell_symbol = shell_name_allowed
@@ -87,22 +89,8 @@ impl CandidateProvider for PathCommandProvider {
             crate::providers::path_executable_name_allowed(context, name)
                 && (on_path || shell_symbol || virtual_manager)
         };
-        let has_direct_prefix = !folded_query.is_empty()
-            && names
-                .iter()
-                .any(|name| allowed(name) && name.to_lowercase().starts_with(&folded_query));
         names.retain(|name| {
-            allowed(name)
-                && if has_direct_prefix {
-                    name.to_lowercase().starts_with(&folded_query)
-                } else if (crate::providers::is_package_manager(name)
-                    && !self.commands.contains(name))
-                    || exact_reserved_word
-                {
-                    false
-                } else {
-                    crate::completion::match_quality(query, name) > 0
-                }
+            allowed(name) && (query.is_empty() || name.to_lowercase().starts_with(&folded_query))
         });
         names.sort_by(|left, right| {
             crate::completion::match_quality(query, right)
@@ -183,6 +171,16 @@ impl CandidateProvider for PathCommandProvider {
     }
 }
 
+impl PathCommandProvider {
+    fn executable_slot_owner_available(&self, context: &CompletionContext) -> bool {
+        let Some(command) = context.command() else {
+            return false;
+        };
+        crate::providers::is_shell_callable(context.shell, command)
+            || crate::providers::resolved_executable_path(context, &self.commands).is_some()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{ffi::OsString, fs, os::unix::fs::PermissionsExt, path::PathBuf};
@@ -220,6 +218,17 @@ mod tests {
             "code",
             "codex",
             "corepack",
+            "uv",
+            "poetry",
+            "pipenv",
+            "bundle",
+            "find",
+            "xargs",
+            "setsid",
+            "npm",
+            "npx",
+            "yarn",
+            "bun",
             "cargo-doc",
             "claude",
             "claude tool",
@@ -288,6 +297,14 @@ mod tests {
             "find . -exec time -o report.txt l",
             "xargs -0r l",
             "setsid -fw l",
+            "uv run l",
+            "uv run -- l",
+            "uv --directory app run l",
+            "uv run --python 3.12 l",
+            "poetry run l",
+            "poetry -C app run l",
+            "pipenv run l",
+            "bundle exec l",
         ] {
             assert!(provider.applies(&context(buffer)), "{buffer:?} must fire");
         }
@@ -319,6 +336,16 @@ mod tests {
             "find . -exec FOO=bar ",
             "sudo -nl l",
             r"find . -exec ls {} \; l",
+            "uv run --module l",
+            "uv run -m l",
+            "uv run --script l",
+            "uv run --python l",
+            "uv run ls ",
+            "poetry run ls ",
+            "pipenv run ls ",
+            "bundle exec ls ",
+            "pipenv run -v l",
+            "bundle exec -v l",
         ] {
             assert!(
                 !provider.applies(&context(buffer)),
@@ -382,7 +409,15 @@ mod tests {
             .iter()
             .map(|candidate| candidate.display.primary.as_str())
             .collect();
-        assert_eq!(names, ["corepack pnpm"]);
+        assert_eq!(
+            names,
+            [
+                "corepack npm",
+                "corepack npx",
+                "corepack pnpm",
+                "corepack yarn"
+            ]
+        );
 
         let output = provider.complete(&context("command -v r"));
         let rm = output
@@ -511,13 +546,13 @@ mod tests {
             .collect();
         assert_eq!(direct_names, ["code", "codex"]);
 
-        let fuzzy_names: Vec<_> = provider
+        let non_prefix_names: Vec<_> = provider
             .complete(&context("cgd"))
             .candidates
             .into_iter()
             .map(|candidate| candidate.display.primary)
             .collect();
-        assert_eq!(fuzzy_names, ["cargo-doc"]);
+        assert!(non_prefix_names.is_empty());
 
         let manager_only = PathCommandProvider::new(Arc::new(CommandPathCache::from_path(Some(
             &OsString::from(directory.path().join("missing")),
@@ -542,6 +577,10 @@ mod tests {
             manager_only.complete(&context("pm")).candidates.is_empty(),
             "virtual managers must not enter broad fuzzy fallback"
         );
+        assert!(
+            !manager_only.applies(&context("uv run c")),
+            "a missing outer executable must not open a nested PATH slot"
+        );
 
         let output = provider.complete(&context("find . -exec clau"));
         let claude = output
@@ -550,5 +589,20 @@ mod tests {
             .find(|candidate| candidate.display.primary == "find . -exec claude")
             .expect("find executable candidate");
         assert_eq!(claude.edit.as_ref().expect("edit").replacement, "claude");
+
+        let delegated = provider.complete(&context("uv run cod"));
+        assert!(
+            delegated
+                .candidates
+                .iter()
+                .any(|candidate| candidate.display.primary == "uv run codex")
+        );
+        assert!(
+            provider
+                .complete(&context("bundle exec clau"))
+                .candidates
+                .iter()
+                .any(|candidate| candidate.display.primary == "bundle exec claude")
+        );
     }
 }

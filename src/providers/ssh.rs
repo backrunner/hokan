@@ -17,6 +17,7 @@ use crate::{
         Candidate, CandidateAction, CandidateKind, CandidateProvider, CandidateSource,
         Completeness, CompletionContext, CursorPlacement, ProviderOutput, SlotKind, TextEdit,
     },
+    platform::CommandPathCache,
     providers::argument_progress,
     terminal::RiskLevel,
 };
@@ -29,14 +30,16 @@ const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_INCLUDE_FILES: usize = 64;
 
 pub struct SshHostProvider {
+    commands: Option<Arc<CommandPathCache>>,
     cache: SshConfigCache,
     config: Option<PathBuf>,
 }
 
 impl SshHostProvider {
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(commands: Arc<CommandPathCache>) -> Self {
         Self {
+            commands: Some(commands),
             cache: SshConfigCache::default(),
             config: std::env::home_dir().map(|home| home.join(".ssh").join("config")),
         }
@@ -45,15 +48,13 @@ impl SshHostProvider {
     #[cfg(test)]
     fn for_config(config: PathBuf) -> Self {
         Self {
+            // Unit tests exercise parsing and slot behavior independently of
+            // the process PATH. Production construction always supplies the
+            // shared executable cache.
+            commands: None,
             cache: SshConfigCache::default(),
             config: Some(config),
         }
-    }
-}
-
-impl Default for SshHostProvider {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -63,38 +64,63 @@ impl CandidateProvider for SshHostProvider {
     }
 
     fn applies(&self, context: &CompletionContext) -> bool {
-        host_slot(context).is_some()
+        host_slot(context, self.commands.as_deref()).is_some()
     }
 
     fn complete(&self, context: &CompletionContext) -> ProviderOutput {
-        if host_slot(context).is_none() {
+        let Some(slot) = host_slot(context, self.commands.as_deref()) else {
             return ProviderOutput::default();
-        }
+        };
         let Some(config) = self.config.as_deref() else {
             return ProviderOutput::default();
         };
         let hosts = self.cache.hosts_from_config(config);
-        let prefix = context.parsed.current_prefix.as_str();
+        let prefix = match slot {
+            HostSlot::BareCommand => "",
+            HostSlot::Argument => context.parsed.current_prefix.as_str(),
+        };
         // A typed `user@` prefix is preserved so the row completes the host
         // part only (`scp user@ho` → `user@host`).
-        let user = prefix
+        let (user, host_prefix) = prefix
             .split_once('@')
-            .map(|(user, _)| format!("{user}@"))
-            .unwrap_or_default();
-        let scp_remote = context.command() == Some("scp");
+            .map_or((String::new(), prefix), |(user, host)| {
+                (format!("{user}@"), host)
+            });
+        let command = context.command().unwrap_or_default();
+        let command_name = super::executable_basename(command);
+        let scp_remote = command_name == "scp";
+        let folded_prefix = host_prefix.to_lowercase();
         ProviderOutput {
             candidates: hosts
                 .iter()
+                .filter(|host| {
+                    folded_prefix.is_empty() || host.to_lowercase().starts_with(&folded_prefix)
+                })
                 .map(|host| {
                     let completed = format!("{user}{host}");
-                    let replacement = if scp_remote {
+                    let host_replacement = if scp_remote {
                         format!("{completed}:")
                     } else {
                         completed.clone()
                     };
+                    let replacement = if slot == HostSlot::BareCommand {
+                        format!("{command} {host_replacement}")
+                    } else {
+                        host_replacement
+                    };
+                    let resulting = crate::parser::apply_edit(
+                        &context.buffer.text,
+                        context.parsed.replacement.clone(),
+                        &replacement,
+                    )
+                    .unwrap_or_else(|_| replacement.clone());
                     Candidate::new(
                         context.query_id,
-                        completed.clone(),
+                        if slot == HostSlot::BareCommand {
+                            resulting
+                        } else {
+                            completed.clone()
+                        },
                         "SSH 主机（~/.ssh/config）",
                         Some(TextEdit {
                             range: context.parsed.replacement.clone(),
@@ -127,22 +153,43 @@ impl CandidateProvider for SshHostProvider {
     }
 }
 
-/// `Some(())` when the cursor sits at the host slot of an ssh-family
-/// command — the unit keeps call sites terse without a bespoke type.
-fn host_slot(context: &CompletionContext) -> Option<()> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostSlot {
+    BareCommand,
+    Argument,
+}
+
+/// Identify a configured-host slot only for an executable that the current
+/// user can actually run. Required-host commands can offer a complete
+/// invocation at their exact bare name; ordinary argument slots keep replacing
+/// only the active word.
+fn host_slot(context: &CompletionContext, commands: Option<&CommandPathCache>) -> Option<HostSlot> {
     if !crate::providers::effective_command_accepts_external(context) {
         return None;
     }
-    let command = context.command()?;
+    if commands.is_some_and(|commands| {
+        crate::providers::resolved_executable_path(context, commands).is_none()
+    }) {
+        return None;
+    }
+    let raw_command = context.command()?;
+    let command = super::executable_basename(raw_command);
+    if SSH_COMMANDS.contains(&command)
+        && (crate::providers::command_position_open(context)
+            || crate::providers::explicit_executable_path_position(context))
+        && context.parsed.current_prefix == raw_command
+    {
+        return Some(HostSlot::BareCommand);
+    }
     let (words, position) = argument_progress(context)?;
     let prefix = context.parsed.current_prefix.as_str();
     if SSH_COMMANDS.contains(&command) && at_host_slot(command, &words, position, prefix) {
-        return Some(());
+        return Some(HostSlot::Argument);
     }
     // Every scp operand may be local or remote. Offer configured aliases next
     // to local paths until a slash or colon makes the user's intent explicit.
     if at_scp_candidate_slot(command, &words, position, prefix) {
-        return Some(());
+        return Some(HostSlot::Argument);
     }
     None
 }
@@ -581,8 +628,9 @@ mod tests {
     #[test]
     fn scp_offers_plain_and_user_qualified_hosts_at_every_operand() {
         let directory = tempfile::tempdir().expect("directory");
-        let fires =
-            |text: &str, query: u64| host_slot(&context(directory.path(), text, query)).is_some();
+        let fires = |text: &str, query: u64| {
+            host_slot(&context(directory.path(), text, query), None).is_some()
+        };
         assert!(fires("scp ", 1));
         assert!(fires("scp de", 2));
         assert!(fires("scp file ", 3));
@@ -652,5 +700,60 @@ mod tests {
             .find(|candidate| candidate.display.primary == "dev-box")
             .expect("plain scp host row");
         assert_eq!(dev.edit.as_ref().expect("edit").replacement, "dev-box:");
+    }
+
+    #[test]
+    fn exact_required_host_command_completes_to_a_runnable_invocation() {
+        let directory = tempfile::tempdir().expect("directory");
+        let config = directory.path().join("config");
+        fs::write(&config, "Host dev-box staging\n").expect("config");
+        let provider = SshHostProvider::for_config(config);
+
+        for text in ["ssh", "sudo ssh", "./bin/ssh"] {
+            let context = context(directory.path(), text, 1);
+            assert!(provider.applies(&context), "bare slot for {text:?}");
+            let output = provider.complete(&context);
+            let dev = output
+                .candidates
+                .iter()
+                .find(|candidate| candidate.display.primary.ends_with("ssh dev-box"))
+                .expect("complete invocation");
+            let edit = dev.edit.as_ref().expect("edit");
+            assert_eq!(
+                crate::parser::apply_edit(
+                    &context.buffer.text,
+                    edit.range.clone(),
+                    &edit.replacement
+                )
+                .expect("apply edit"),
+                format!("{} dev-box", text)
+            );
+        }
+    }
+
+    #[test]
+    fn production_provider_requires_a_real_executable() {
+        use std::{ffi::OsString, os::unix::fs::PermissionsExt};
+
+        let directory = tempfile::tempdir().expect("directory");
+        let bin = directory.path().join("bin");
+        fs::create_dir(&bin).expect("bin");
+        let config = directory.path().join("config");
+        fs::write(&config, "Host dev-box\n").expect("config");
+        let plain = bin.join("ssh");
+        fs::write(&plain, b"#!/bin/sh\n").expect("plain file");
+        fs::set_permissions(&plain, fs::Permissions::from_mode(0o600)).expect("plain mode");
+
+        let commands = Arc::new(CommandPathCache::from_path(Some(&OsString::from(&bin))));
+        let provider = SshHostProvider {
+            commands: Some(Arc::clone(&commands)),
+            cache: SshConfigCache::default(),
+            config: Some(config),
+        };
+        assert!(!provider.applies(&context(directory.path(), "ssh ", 1)));
+
+        fs::set_permissions(&plain, fs::Permissions::from_mode(0o700)).expect("executable mode");
+        commands.refresh_from_path(Some(&OsString::from(&bin)));
+        assert!(provider.applies(&context(directory.path(), "ssh ", 2)));
     }
 }

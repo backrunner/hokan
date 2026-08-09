@@ -109,6 +109,22 @@ impl CommandHelpCache {
         lock(&self.pending).contains_key(command)
     }
 
+    fn peek_scope(&self, command: &str, scope: &[String]) -> Option<Arc<CommandHelp>> {
+        if scope.is_empty() {
+            self.peek(command)
+        } else {
+            self.peek(&scope_cache_key(command, scope))
+        }
+    }
+
+    fn scope_is_pending(&self, command: &str, scope: &[String]) -> bool {
+        if scope.is_empty() {
+            self.is_pending(command)
+        } else {
+            self.is_pending(&scope_cache_key(command, scope))
+        }
+    }
+
     /// Schedule one background fetch for a cold command. Completion queries
     /// never wait for `man` or `<command> --help`; the populated cache is used
     /// on the next keystroke. Pending and negative results are both deduped.
@@ -116,6 +132,24 @@ impl CommandHelpCache {
         let fetch_path = executable.clone();
         self.request_with_path(command, executable, move |command| {
             fetch_command_help_from(command, fetch_path.as_deref())
+        });
+    }
+
+    fn request_scope(
+        self: &Arc<Self>,
+        command: &str,
+        executable: Option<PathBuf>,
+        scope: Vec<String>,
+    ) {
+        if scope.is_empty() {
+            self.request(command, executable);
+            return;
+        }
+        let key = scope_cache_key(command, &scope);
+        let command = command.to_owned();
+        let fetch_path = executable.clone();
+        self.request_with_path(&key, executable, move |_| {
+            fetch_scoped_help_from(&command, fetch_path.as_deref(), &scope)
         });
     }
 
@@ -235,6 +269,13 @@ impl CommandHelpCache {
     }
 
     #[cfg(test)]
+    pub(crate) fn seed_scope(&self, command: &str, scope: &[&str], help: CommandHelp) {
+        let scope: Vec<String> = scope.iter().map(|word| (*word).to_owned()).collect();
+        lock(&self.entries).insert(scope_cache_key(command, &scope), (None, Arc::new(help)));
+        self.revision.fetch_add(1, Ordering::Release);
+    }
+
+    #[cfg(test)]
     pub(crate) fn fetch_count(&self) -> usize {
         self.fetches.load(Ordering::Relaxed)
     }
@@ -243,6 +284,17 @@ impl CommandHelpCache {
     pub(crate) fn bump_revision(&self) {
         self.revision.fetch_add(1, Ordering::Release);
     }
+}
+
+fn scope_cache_key(command: &str, scope: &[String]) -> String {
+    let mut key = String::from("\0help-scope");
+    key.push('\0');
+    key.push_str(command);
+    for word in scope {
+        key.push('\0');
+        key.push_str(word);
+    }
+    key
 }
 
 fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -288,61 +340,79 @@ impl CandidateProvider for CommandHelpProvider {
         // managers have a dedicated state machine with project-aware scripts;
         // probing their generic help would delay and duplicate those rows.
         if self.specs.get(command).is_some()
-            || crate::providers::package_manager(context).is_some()
             || !crate::providers::effective_command_accepts_external(context)
-            || !self.commands.contains(command)
         {
             return false;
         }
-        let Some((_, _)) = argument_progress(context) else {
+        let executable = crate::providers::resolved_executable_path(context, &self.commands);
+        if executable.is_none() {
             return false;
-        };
-        if let Some(help) = self.cache.peek(command) {
-            return help_position(context, &help).is_some();
         }
-        self.cache.request(command, self.commands.path(command));
-        true
+        if argument_progress(context).is_none() && !bare_command_position(context, command) {
+            return false;
+        }
+        !matches!(
+            lookup_help_scope(context, &self.cache, command, executable, true,),
+            HelpLookup::None
+        )
     }
 
     fn complete(&self, context: &CompletionContext) -> ProviderOutput {
         let Some(command) = context.command() else {
             return ProviderOutput::default();
         };
-        let Some(help) = self.cache.peek(command) else {
+        let executable = crate::providers::resolved_executable_path(context, &self.commands);
+        let HelpLookup::Ready(target) =
+            lookup_help_scope(context, &self.cache, command, executable, false)
+        else {
             return ProviderOutput::default();
         };
-        let Some(position) = help_position(context, &help) else {
-            return ProviderOutput::default();
-        };
+        let help = target.help;
+        let position = target.position;
         let flags_position = position == HelpPosition::Flags;
+        let bare_subcommands = position == HelpPosition::BareSubcommands;
         let entries = if flags_position {
             &help.flags
         } else {
             &help.subcommands
         };
-        let query = context.parsed.current_prefix.as_str();
+        let query = if bare_subcommands {
+            ""
+        } else {
+            context.parsed.current_prefix.as_str()
+        };
+        let folded_query = query.to_lowercase();
         let exact = entries.iter().any(|entry| entry.name == query)
             || (!flags_position && help.subcommand_aliases.iter().any(|alias| alias == query));
+        if exact {
+            return ProviderOutput::default();
+        }
         let candidates = entries
             .iter()
-            .filter(|entry| {
-                !exact || (entry.name.len() > query.len() && entry.name.starts_with(query))
+            .enumerate()
+            .filter(|(_, entry)| {
+                query.is_empty() || entry.name.to_lowercase().starts_with(&folded_query)
             })
-            .map(|entry| {
+            .map(|(index, entry)| {
+                let replacement = if bare_subcommands {
+                    format!("{command} {}", entry.name)
+                } else {
+                    entry.name.clone()
+                };
                 let display = crate::parser::apply_edit(
                     &context.buffer.text,
                     context.parsed.replacement.clone(),
-                    &entry.name,
+                    &replacement,
                 )
                 .map(|result| result.trim_end().to_owned())
                 .unwrap_or_else(|_| format!("{command} {}", entry.name));
-                Candidate::new(
+                let mut candidate = Candidate::new(
                     context.query_id,
                     display,
                     entry.description.as_str(),
                     Some(TextEdit {
                         range: context.parsed.replacement.clone(),
-                        replacement: entry.name.clone(),
+                        replacement,
                         cursor_after: CursorPlacement::End,
                     }),
                     if flags_position {
@@ -364,8 +434,18 @@ impl CandidateProvider for CommandHelpProvider {
                         },
                     },
                     RiskLevel::Low,
-                    format!("man:{command}"),
-                )
+                    if target.scope.is_empty() {
+                        format!("help:{command}")
+                    } else {
+                        format!("help:{command}:{}", target.scope.join(" "))
+                    },
+                );
+                // CLI authors generally put the most useful commands and
+                // flags first. Preserve that signal so short, obscure man-page
+                // entries cannot outrank the documented common workflow.
+                candidate.score.spec_priority =
+                    i16::try_from(MAX_ENTRIES.saturating_sub(index)).unwrap_or_default();
+                candidate
             })
             .collect();
         ProviderOutput {
@@ -379,15 +459,158 @@ impl CandidateProvider for CommandHelpProvider {
 enum HelpPosition {
     Flags,
     Subcommands,
+    BareSubcommands,
 }
 
-fn help_position(context: &CompletionContext, help: &CommandHelp) -> Option<HelpPosition> {
-    let (words, position) = argument_progress(context)?;
+struct HelpTarget {
+    help: Arc<CommandHelp>,
+    position: HelpPosition,
+    scope: Vec<String>,
+}
+
+enum HelpLookup {
+    Ready(HelpTarget),
+    Pending,
+    None,
+}
+
+enum CompletedScope<'a> {
+    Subcommand { word: &'a str, consumed: usize },
+    None,
+    Blocked,
+}
+
+fn lookup_help_scope(
+    context: &CompletionContext,
+    cache: &Arc<CommandHelpCache>,
+    command: &str,
+    executable: Option<PathBuf>,
+    request_missing: bool,
+) -> HelpLookup {
+    let Some(mut help) = cache.peek(command) else {
+        if request_missing {
+            cache.request(command, executable);
+            return HelpLookup::Pending;
+        }
+        return HelpLookup::None;
+    };
+    let Some((words, position)) = argument_progress(context) else {
+        return (help.has_subcommands()
+            && !crate::providers::known_standalone_command(command)
+            && (!help.accepts_positionals || crate::providers::known_subcommand_command(command))
+            && bare_command_position(context, command))
+        .then_some(HelpTarget {
+            help,
+            position: HelpPosition::BareSubcommands,
+            scope: Vec::new(),
+        })
+        .map_or(HelpLookup::None, HelpLookup::Ready);
+    };
     let before = words.get(1..=position).unwrap_or_default();
+    let mut scope = Vec::new();
+    let mut consumed = 0;
+    loop {
+        match completed_scope(command, scope.is_empty(), &help, &before[consumed..]) {
+            CompletedScope::Subcommand {
+                word,
+                consumed: scope_consumed,
+            } => {
+                if !supports_scoped_help(command) || scope.len() >= 3 {
+                    return HelpLookup::None;
+                }
+                consumed += scope_consumed;
+                scope.push(word.to_owned());
+                if let Some(scoped) = cache.peek_scope(command, &scope) {
+                    help = scoped;
+                    continue;
+                }
+                if request_missing {
+                    cache.request_scope(command, executable, scope);
+                    return HelpLookup::Pending;
+                }
+                return if cache.scope_is_pending(command, &scope) {
+                    HelpLookup::Pending
+                } else {
+                    HelpLookup::None
+                };
+            }
+            CompletedScope::None => {
+                let Some(position) = help_position_for_arguments(
+                    command,
+                    scope.is_empty(),
+                    &help,
+                    &before[consumed..],
+                    &context.parsed.current_prefix,
+                ) else {
+                    return HelpLookup::None;
+                };
+                return HelpLookup::Ready(HelpTarget {
+                    help,
+                    position,
+                    scope,
+                });
+            }
+            CompletedScope::Blocked => return HelpLookup::None,
+        }
+    }
+}
+
+fn completed_scope<'a>(
+    command: &str,
+    allow_toolchain_selector: bool,
+    help: &CommandHelp,
+    before: &'a [&'a str],
+) -> CompletedScope<'a> {
+    let mut index = 0;
+    while let Some(word) = before.get(index).copied() {
+        if word == "--" {
+            return CompletedScope::Blocked;
+        }
+        if allow_toolchain_selector && toolchain_selector(command, word) {
+            index += 1;
+            continue;
+        }
+        if word.starts_with('-') && word != "-" {
+            let Some((entry, attached_value)) = help_flag_usage(help, word) else {
+                return CompletedScope::Blocked;
+            };
+            index += 1;
+            if entry.takes_value && !attached_value {
+                if index >= before.len() {
+                    return CompletedScope::Blocked;
+                }
+                index += 1;
+            }
+            continue;
+        }
+        if help.subcommands.iter().any(|entry| entry.name == word)
+            || help.subcommand_aliases.iter().any(|alias| alias == word)
+        {
+            return CompletedScope::Subcommand {
+                word,
+                consumed: index + 1,
+            };
+        }
+        return CompletedScope::Blocked;
+    }
+    CompletedScope::None
+}
+
+fn help_position_for_arguments(
+    command: &str,
+    allow_toolchain_selector: bool,
+    help: &CommandHelp,
+    before: &[&str],
+    current_prefix: &str,
+) -> Option<HelpPosition> {
     let mut index = 0;
     while let Some(word) = before.get(index).copied() {
         if word == "--" {
             return None;
+        }
+        if allow_toolchain_selector && toolchain_selector(command, word) {
+            index += 1;
+            continue;
         }
         if word.starts_with('-') && word != "-" {
             let (entry, attached_value) = help_flag_usage(help, word)?;
@@ -400,31 +623,122 @@ fn help_position(context: &CompletionContext, help: &CommandHelp) -> Option<Help
             }
             continue;
         }
-        // A completed positional word commits the invocation to a
-        // subcommand (recognized or not), so top-level help must stay quiet.
         return None;
     }
 
-    if context.parsed.current_prefix.starts_with('-')
-        && let Some((entry, attached_value)) = help_flag_usage(help, &context.parsed.current_prefix)
+    if current_prefix.starts_with('-')
+        && let Some((entry, attached_value)) = help_flag_usage(help, current_prefix)
         && entry.takes_value
         && attached_value
     {
         return None;
     }
-    if context.parsed.current_prefix.starts_with('-')
-        && !context.parsed.current_prefix.contains('=')
-    {
+    if current_prefix.starts_with('-') && !current_prefix.contains('=') {
         Some(HelpPosition::Flags)
-    } else if !context.parsed.current_prefix.starts_with('-') {
+    } else if !current_prefix.starts_with('-') {
         Some(HelpPosition::Subcommands)
     } else {
         None
     }
 }
 
-pub(crate) fn dynamic_subcommand_position(context: &CompletionContext, help: &CommandHelp) -> bool {
-    help.has_subcommands() && help_position(context, help) == Some(HelpPosition::Subcommands)
+fn toolchain_selector(command: &str, word: &str) -> bool {
+    matches!(command_basename(command), "cargo" | "rustup")
+        && word
+            .strip_prefix('+')
+            .is_some_and(|selector| !selector.is_empty() && !selector.contains('/'))
+}
+
+fn bare_command_position(context: &CompletionContext, command: &str) -> bool {
+    (crate::providers::command_position_open(context)
+        || crate::providers::explicit_executable_path_position(context))
+        && context.parsed.current_prefix == command
+}
+
+pub(crate) fn dynamic_help_owns_position(
+    context: &CompletionContext,
+    cache: &Arc<CommandHelpCache>,
+) -> bool {
+    let Some(command) = context.command() else {
+        return false;
+    };
+    match lookup_help_scope(context, cache, command, None, false) {
+        HelpLookup::Ready(target) => match target.position {
+            HelpPosition::Flags => true,
+            HelpPosition::Subcommands | HelpPosition::BareSubcommands => {
+                target.help.has_subcommands()
+            }
+        },
+        HelpLookup::Pending => true,
+        HelpLookup::None => false,
+    }
+}
+
+fn supports_scoped_help(command: &str) -> bool {
+    super::is_pip_command(command)
+        || matches!(
+            command_basename(command),
+            "ansible"
+                | "apt"
+                | "aws"
+                | "az"
+                | "brew"
+                | "cargo"
+                | "claude"
+                | "codex"
+                | "composer"
+                | "consul"
+                | "diskutil"
+                | "dnf"
+                | "docker"
+                | "docker-compose"
+                | "dotnet"
+                | "eksctl"
+                | "firebase"
+                | "flyctl"
+                | "gcloud"
+                | "gem"
+                | "git"
+                | "gh"
+                | "glab"
+                | "go"
+                | "helm"
+                | "heroku"
+                | "istioctl"
+                | "kubectl"
+                | "launchctl"
+                | "mise"
+                | "nerdctl"
+                | "nix"
+                | "nomad"
+                | "oc"
+                | "ollama"
+                | "openssl"
+                | "pacman"
+                | "pip"
+                | "pip3"
+                | "pipx"
+                | "pnpm"
+                | "podman"
+                | "poetry"
+                | "railway"
+                | "rustup"
+                | "security"
+                | "snap"
+                | "svn"
+                | "systemctl"
+                | "terraform"
+                | "tofu"
+                | "uv"
+                | "vagrant"
+                | "vault"
+                | "vercel"
+                | "wrangler"
+                | "npm"
+                | "yarn"
+                | "bun"
+                | "deno"
+        )
 }
 
 fn help_flag_usage<'a>(help: &'a CommandHelp, word: &str) -> Option<(&'a HelpEntry, bool)> {
@@ -456,7 +770,7 @@ pub(crate) fn history_arguments_are_plausible(
     known_non_failure: bool,
     allows_external_subcommands: bool,
 ) -> bool {
-    if help.subcommands.is_empty() {
+    if help.subcommands.is_empty() && help.flags.is_empty() {
         return true;
     }
 
@@ -502,6 +816,113 @@ pub(crate) fn history_arguments_are_plausible(
         return !help_subcommand_typo(help, word);
     }
     true
+}
+
+/// Validate recorded arguments through each confirmed subcommand scope. A
+/// missing scoped help entry is requested asynchronously and returns `None`,
+/// allowing history to stay hidden until it can be checked instead of
+/// flashing a likely typo for one completion frame.
+pub(crate) fn scoped_history_arguments_are_plausible(
+    cache: &Arc<CommandHelpCache>,
+    command: &str,
+    executable: Option<PathBuf>,
+    root: Arc<CommandHelp>,
+    arguments: &[&str],
+    known_non_failure: bool,
+    allows_external_subcommands: bool,
+) -> Option<bool> {
+    let mut help = root;
+    let mut remaining = arguments;
+    let mut scope = Vec::new();
+    loop {
+        match history_help_step(
+            &help,
+            remaining,
+            known_non_failure,
+            scope.is_empty() && allows_external_subcommands,
+        ) {
+            HistoryHelpStep::Done(plausible) => return Some(plausible),
+            HistoryHelpStep::Subcommand { word, consumed } => {
+                remaining = &remaining[consumed..];
+                if remaining.is_empty() || known_non_failure {
+                    return Some(true);
+                }
+                if !supports_scoped_help(command) || scope.len() >= 3 {
+                    return Some(true);
+                }
+                scope.push(word.to_owned());
+                if let Some(scoped) = cache.peek_scope(command, &scope) {
+                    help = scoped;
+                    continue;
+                }
+                if !cache.scope_is_pending(command, &scope) {
+                    cache.request_scope(command, executable.clone(), scope.clone());
+                }
+                return None;
+            }
+        }
+    }
+}
+
+enum HistoryHelpStep<'a> {
+    Subcommand { word: &'a str, consumed: usize },
+    Done(bool),
+}
+
+fn history_help_step<'a>(
+    help: &CommandHelp,
+    arguments: &'a [&'a str],
+    known_non_failure: bool,
+    allows_external_subcommands: bool,
+) -> HistoryHelpStep<'a> {
+    if help.subcommands.is_empty() && help.flags.is_empty() {
+        return HistoryHelpStep::Done(true);
+    }
+
+    let mut index = 0;
+    while let Some(word) = arguments.get(index).copied() {
+        if has_dynamic_shell_syntax(word) || word == "--" {
+            return HistoryHelpStep::Done(true);
+        }
+        if word.starts_with('-') && word != "-" {
+            let Some((entry, attached_value)) = help_flag_usage(help, word) else {
+                let name = word.split_once('=').map_or(word, |(name, _)| name);
+                return HistoryHelpStep::Done(
+                    known_non_failure
+                        || !help
+                            .flags
+                            .iter()
+                            .any(|entry| one_edit_or_adjacent_transposition(name, &entry.name)),
+                );
+            };
+            index += 1;
+            if entry.takes_value && !attached_value {
+                if index >= arguments.len() {
+                    return HistoryHelpStep::Done(known_non_failure);
+                }
+                index += 1;
+            }
+            continue;
+        }
+
+        if help.subcommands.iter().any(|entry| entry.name == word)
+            || help.subcommand_aliases.iter().any(|alias| alias == word)
+        {
+            return HistoryHelpStep::Subcommand {
+                word,
+                consumed: index + 1,
+            };
+        }
+        if help.subcommands_exhaustive && !help.accepts_positionals && !allows_external_subcommands
+        {
+            return HistoryHelpStep::Done(known_non_failure);
+        }
+        if known_non_failure && !help.accepts_positionals {
+            return HistoryHelpStep::Done(true);
+        }
+        return HistoryHelpStep::Done(!help_subcommand_typo(help, word));
+    }
+    HistoryHelpStep::Done(true)
 }
 
 fn help_subcommand_typo(help: &CommandHelp, word: &str) -> bool {
@@ -576,6 +997,13 @@ pub(crate) fn one_edit_or_adjacent_transposition(left: &str, right: &str) -> boo
     true
 }
 
+fn command_basename(command: &str) -> &str {
+    Path::new(command)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(command)
+}
+
 fn fetch_man_page(command: &str) -> CommandHelp {
     let Ok(output) = crate::platform::run_bounded(
         "man",
@@ -594,22 +1022,36 @@ fn fetch_man_page(command: &str) -> CommandHelp {
 
 /// Full cold-miss fetch: try the man page, and when it yields no subcommands
 /// (kubectl has no man page at all; some pages document only flags) merge a
-/// single bounded `<cmd> --help` run. The man-page flags remain useful while
-/// the modern help output supplies its Commands surface.
+/// single bounded `<cmd> --help` run. Homebrew is also augmented because its
+/// man page omits common dispatcher commands that `brew --help` exposes.
 fn fetch_command_help(command: &str) -> CommandHelp {
-    fetch_with_fallback(command, fetch_man_page, fetch_help_output)
+    let help_command = command_basename(command);
+    fetch_with_fallback(help_command, fetch_man_page, |_| fetch_help_output(command))
 }
 
 fn fetch_command_help_from(command: &str, executable: Option<&Path>) -> CommandHelp {
-    let parsed = fetch_man_page(command);
-    if !parsed.subcommands.is_empty() {
+    let help_command = command_basename(command);
+    let parsed = fetch_man_page(help_command);
+    if !parsed.subcommands.is_empty() && !help_augments_man(help_command) {
         return parsed;
     }
     let fallback = executable.map_or_else(
         || fetch_help_output(command),
-        |path| fetch_help_program(path.as_os_str()),
+        |path| fetch_help_program(help_command, path.as_os_str()),
     );
-    merge_help(parsed, fallback)
+    merge_help_sources(help_command, parsed, fallback)
+}
+
+fn fetch_scoped_help_from(
+    command: &str,
+    executable: Option<&Path>,
+    scope: &[String],
+) -> CommandHelp {
+    let help_command = command_basename(command);
+    executable.map_or_else(
+        || fetch_help_program_for_scope(help_command, std::ffi::OsStr::new(command), scope),
+        |path| fetch_help_program_for_scope(help_command, path.as_os_str(), scope),
+    )
 }
 
 fn fetch_with_fallback(
@@ -618,10 +1060,27 @@ fn fetch_with_fallback(
     help: impl Fn(&str) -> CommandHelp,
 ) -> CommandHelp {
     let parsed = man(command);
-    if !parsed.subcommands.is_empty() {
+    if !parsed.subcommands.is_empty() && !help_augments_man(command) {
         return parsed;
     }
-    merge_help(parsed, help(command))
+    merge_help_sources(command, parsed, help(command))
+}
+
+fn help_augments_man(command: &str) -> bool {
+    // Homebrew's generated man page exposes a broad command surface but omits
+    // a few common dispatcher commands such as `update`; `brew --help` lists
+    // those canonical invocations. The two sources are complementary.
+    matches!(command, "brew")
+}
+
+fn merge_help_sources(command: &str, man: CommandHelp, help: CommandHelp) -> CommandHelp {
+    if help_augments_man(command) {
+        // Homebrew's concise help output is explicitly ordered around common
+        // workflows; keep it first and append the broader man-page surface.
+        merge_help(help, man)
+    } else {
+        merge_help(man, help)
+    }
 }
 
 fn merge_help(mut primary: CommandHelp, fallback: CommandHelp) -> CommandHelp {
@@ -638,11 +1097,35 @@ fn merge_help(mut primary: CommandHelp, fallback: CommandHelp) -> CommandHelp {
             primary.flags.push(flag);
         }
     }
-    if primary.subcommands.is_empty() {
-        primary.subcommands = fallback.subcommands;
-        primary.subcommand_aliases = fallback.subcommand_aliases;
-        primary.subcommands_exhaustive = fallback.subcommands_exhaustive;
+    let mut seen_subcommands: HashSet<String> = primary
+        .subcommands
+        .iter()
+        .map(|entry| entry.name.clone())
+        .chain(primary.subcommand_aliases.iter().cloned())
+        .collect();
+    let mut truncated = false;
+    for subcommand in fallback.subcommands {
+        if !seen_subcommands.insert(subcommand.name.clone()) {
+            continue;
+        }
+        if primary.subcommands.len() >= MAX_ENTRIES {
+            truncated = true;
+            break;
+        }
+        primary.subcommands.push(subcommand);
     }
+    for alias in fallback.subcommand_aliases {
+        if !seen_subcommands.insert(alias.clone()) {
+            continue;
+        }
+        if primary.subcommand_aliases.len() >= MAX_ENTRIES {
+            truncated = true;
+            break;
+        }
+        primary.subcommand_aliases.push(alias);
+    }
+    primary.subcommands_exhaustive =
+        (primary.subcommands_exhaustive || fallback.subcommands_exhaustive) && !truncated;
     primary.accepts_positionals |= fallback.accepts_positionals;
     primary
 }
@@ -653,46 +1136,195 @@ fn merge_help(mut primary: CommandHelp, fallback: CommandHelp) -> CommandHelp {
 /// literal `--help`, reads null stdin, and dies on timeout. A failing,
 /// hanging, or empty run degrades to an empty `CommandHelp`.
 fn fetch_help_output(command: &str) -> CommandHelp {
-    fetch_help_program(std::ffi::OsStr::new(command))
+    fetch_help_program(command_basename(command), std::ffi::OsStr::new(command))
 }
 
-fn fetch_help_program(program: &std::ffi::OsStr) -> CommandHelp {
-    let Ok(output) =
-        crate::platform::run_bounded(program, ["--help"], HELP_TIMEOUT, MAN_MAX_OUTPUT_BYTES)
-    else {
-        return CommandHelp::default();
-    };
-    if !output.status.success() || output.stdout.is_empty() {
-        return CommandHelp::default();
+fn fetch_help_program(command: &str, program: &std::ffi::OsStr) -> CommandHelp {
+    fetch_help_program_for_scope(command, program, &[])
+}
+
+fn fetch_help_program_for_scope(
+    command: &str,
+    program: &std::ffi::OsStr,
+    scope: &[String],
+) -> CommandHelp {
+    for arguments in help_probe_arguments(command, scope) {
+        let Ok(output) =
+            crate::platform::run_bounded(program, &arguments, HELP_TIMEOUT, MAN_MAX_OUTPUT_BYTES)
+        else {
+            continue;
+        };
+        let mut parsed = CommandHelp::default();
+        for bytes in [&output.stdout, &output.stderr] {
+            if bytes.is_empty() {
+                continue;
+            }
+            let text = String::from_utf8_lossy(bytes);
+            if output.status.success() || looks_like_help_output(&text) {
+                parsed = merge_help(parsed, parse_help_output_for_scope(command, scope, &text));
+            }
+        }
+        if !parsed.flags.is_empty() || !parsed.subcommands.is_empty() {
+            return parsed;
+        }
     }
-    let text = String::from_utf8_lossy(&output.stdout);
-    parse_help_output(&text)
+    CommandHelp::default()
+}
+
+fn help_probe_arguments(command: &str, scope: &[String]) -> Vec<Vec<String>> {
+    let command = command_basename(command);
+    let prefixed_help = || {
+        let mut arguments = Vec::with_capacity(scope.len() + 1);
+        arguments.push("help".to_owned());
+        arguments.extend(scope.iter().cloned());
+        arguments
+    };
+    let suffixed = |flag: &str| {
+        let mut arguments = Vec::with_capacity(scope.len() + 1);
+        arguments.extend(scope.iter().cloned());
+        arguments.push(flag.to_owned());
+        arguments
+    };
+    match command {
+        "defaults" | "diskutil" | "go" | "launchctl" | "openssl" | "security" => {
+            vec![prefixed_help()]
+        }
+        "brew" | "gem" | "svn" if !scope.is_empty() => vec![prefixed_help()],
+        "pnpm" if scope.is_empty() => {
+            vec![vec!["help".to_owned(), "-a".to_owned()], suffixed("--help")]
+        }
+        "git" if !scope.is_empty() => vec![suffixed("-h")],
+        "terraform" | "tofu" if !scope.is_empty() => {
+            vec![suffixed("-help"), suffixed("--help")]
+        }
+        "ffmpeg" | "ffplay" | "ffprobe" | "perl" | "tmux" if scope.is_empty() => {
+            vec![vec!["-h".to_owned()]]
+        }
+        "networksetup" | "sqlite3" | "xcodebuild" if scope.is_empty() => {
+            vec![vec!["-help".to_owned()]]
+        }
+        _ => vec![suffixed("--help")],
+    }
+}
+
+fn looks_like_help_output(text: &str) -> bool {
+    text.lines().any(|line| {
+        let line = line.trim().to_ascii_lowercase();
+        line.starts_with("usage:")
+            || line == "usage"
+            || line.starts_with("commands:")
+            || line.starts_with("available commands:")
+            || line.starts_with("subcommands:")
+            || line == "options:"
+            || line == "flags:"
+            || line == "standard commands"
+            || line == "the commands are:"
+    })
 }
 
 /// Conservative heuristics over `--help` text (kubectl/docker/cobra, cargo
 /// clap, and similar two-column layouts). Same philosophy as the man parser:
 /// skip anything unrecognized rather than guess.
-fn parse_help_output(text: &str) -> CommandHelp {
+#[cfg(test)]
+fn parse_help_output(command: &str, text: &str) -> CommandHelp {
+    parse_help_output_for_scope(command, &[], text)
+}
+
+pub(crate) fn parse_help_output_for_scope(
+    command: &str,
+    scope: &[String],
+    text: &str,
+) -> CommandHelp {
     let lines: Vec<String> = text.lines().map(str::to_owned).collect();
     let mut help = CommandHelp::default();
     let mut seen_flags = HashSet::new();
     let mut seen_subcommands = HashSet::new();
     let mut in_commands = false;
+    let mut in_command_grid = false;
+    let mut in_argument_choices = false;
+    let mut in_invocations = false;
+    let mut in_usage = false;
+    let mut command_row_indent = None;
     let mut saw_commands = false;
     let mut truncated = false;
     for (index, line) in lines.iter().enumerate() {
-        if is_commands_header(line) {
+        if let Some(signature) = usage_signature(line) {
+            in_commands = false;
+            in_command_grid = false;
+            in_argument_choices = false;
+            in_invocations = false;
+            in_usage = true;
+            command_row_indent = None;
+            help.accepts_positionals |= usage_has_free_positional(command, scope, signature);
+            if let Some((name, description)) = help_invocation_subcommand(command, scope, signature)
+            {
+                push_subcommand(
+                    &mut help,
+                    &mut seen_subcommands,
+                    name,
+                    description,
+                    &mut truncated,
+                );
+            }
+            continue;
+        }
+        if in_usage {
+            help.accepts_positionals |= usage_has_free_positional(command, scope, line);
+            if let Some((name, description)) = help_invocation_subcommand(command, scope, line) {
+                push_subcommand(
+                    &mut help,
+                    &mut seen_subcommands,
+                    name,
+                    description,
+                    &mut truncated,
+                );
+                continue;
+            }
+            if !line.trim().is_empty() && !line.starts_with(char::is_whitespace) {
+                in_usage = false;
+            }
+        }
+        if let Some(standard_commands) = openssl_command_group(command, line) {
+            in_commands = standard_commands;
+            in_command_grid = standard_commands;
+            in_argument_choices = false;
+            in_invocations = false;
+            command_row_indent = None;
+            saw_commands |= standard_commands;
+            continue;
+        }
+        if is_commands_header(command, line) {
             in_commands = true;
+            in_command_grid = false;
+            in_argument_choices = false;
+            in_invocations = false;
+            command_row_indent = None;
             saw_commands = true;
+            continue;
+        }
+        if is_invocation_section_header(line) {
+            in_commands = false;
+            in_command_grid = false;
+            in_argument_choices = false;
+            in_invocations = true;
+            command_row_indent = None;
             continue;
         }
         if is_arguments_header(line) {
             in_commands = false;
+            in_command_grid = false;
+            in_argument_choices = true;
+            in_invocations = false;
+            command_row_indent = None;
             help.accepts_positionals = true;
             continue;
         }
         if is_help_section_header(line) {
             in_commands = false;
+            in_command_grid = false;
+            in_argument_choices = false;
+            in_invocations = false;
+            command_row_indent = None;
             continue;
         }
         if let Some((names, rest)) = parse_flag_line(line) {
@@ -711,10 +1343,81 @@ fn parse_help_output(text: &str) -> CommandHelp {
             }
             continue;
         }
+        if !scope.is_empty()
+            && line.starts_with(char::is_whitespace)
+            && let Some((name, description)) = help_invocation_subcommand(command, scope, line)
+        {
+            push_subcommand(
+                &mut help,
+                &mut seen_subcommands,
+                name,
+                description,
+                &mut truncated,
+            );
+            continue;
+        }
+        if in_invocations {
+            if let Some((name, description)) = help_invocation_subcommand(command, scope, line) {
+                push_subcommand(
+                    &mut help,
+                    &mut seen_subcommands,
+                    name,
+                    description,
+                    &mut truncated,
+                );
+            }
+            continue;
+        }
+        if in_argument_choices {
+            if let Some((names, description)) = help_argument_choices(line) {
+                saw_commands = true;
+                for name in names {
+                    push_subcommand(
+                        &mut help,
+                        &mut seen_subcommands,
+                        name,
+                        description.clone(),
+                        &mut truncated,
+                    );
+                }
+            }
+            continue;
+        }
         if !in_commands {
             continue;
         }
+        if in_command_grid {
+            if let Some(names) = help_command_grid_row(line) {
+                for name in names {
+                    push_subcommand(
+                        &mut help,
+                        &mut seen_subcommands,
+                        name,
+                        String::new(),
+                        &mut truncated,
+                    );
+                }
+            }
+            continue;
+        }
+        if let Some(names) = help_comma_command_row(line) {
+            for name in names {
+                push_subcommand(
+                    &mut help,
+                    &mut seen_subcommands,
+                    name,
+                    String::new(),
+                    &mut truncated,
+                );
+            }
+            continue;
+        }
         if let Some((mut names, description)) = help_subcommand_row(line) {
+            let indent = indent_of(line);
+            if command_row_indent.is_some_and(|expected| indent > expected) {
+                continue;
+            }
+            command_row_indent = Some(command_row_indent.map_or(indent, |value| value.min(indent)));
             let description = match block_description(&lines, index, indent_of(line)) {
                 Some(continuation) => format!("{description} {continuation}"),
                 None => description,
@@ -724,17 +1427,13 @@ fn parse_help_output(text: &str) -> CommandHelp {
             let Some(name) = names.next() else {
                 continue;
             };
-            if seen_subcommands.insert(name.clone()) {
-                if help.subcommands.len() < MAX_ENTRIES {
-                    help.subcommands.push(HelpEntry {
-                        name,
-                        description: shorten(&description),
-                        takes_value: false,
-                    });
-                } else {
-                    truncated = true;
-                }
-            }
+            push_subcommand(
+                &mut help,
+                &mut seen_subcommands,
+                name,
+                shorten(&description),
+                &mut truncated,
+            );
             for alias in names {
                 if seen_subcommands.insert(alias.clone()) {
                     if help.subcommand_aliases.len() < MAX_ENTRIES {
@@ -750,10 +1449,31 @@ fn parse_help_output(text: &str) -> CommandHelp {
     help
 }
 
+fn push_subcommand(
+    help: &mut CommandHelp,
+    seen: &mut HashSet<String>,
+    name: String,
+    description: String,
+    truncated: &mut bool,
+) {
+    if !seen.insert(name.clone()) {
+        return;
+    }
+    if help.subcommands.len() < MAX_ENTRIES {
+        help.subcommands.push(HelpEntry {
+            name,
+            description,
+            takes_value: false,
+        });
+    } else {
+        *truncated = true;
+    }
+}
+
 /// Flush-left `Commands:`-family headers used by cobra/clap-style help:
 /// `Commands:`, `Available Commands:`, `Management Commands:`, and the
 /// parenthesized `Commands (…)` variants.
-fn is_commands_header(line: &str) -> bool {
+fn is_commands_header(command: &str, line: &str) -> bool {
     if line.starts_with(char::is_whitespace) {
         return false;
     }
@@ -763,8 +1483,40 @@ fn is_commands_header(line: &str) -> bool {
         .split('(')
         .next()
         .unwrap_or_default()
-        .trim_end();
-    head == "Commands" || head.ends_with(" Commands")
+        .trim_end()
+        .to_ascii_lowercase();
+    matches!(
+        head.as_str(),
+        "commands" | "subcommands" | "the commands are"
+    ) || head.ends_with(" commands")
+        || head.starts_with("these are common git commands")
+        || (command_basename(command) == "pnpm"
+            && matches!(
+                head.as_str(),
+                "manage your dependencies"
+                    | "patch your dependencies"
+                    | "review your dependencies"
+                    | "run your scripts"
+                    | "other"
+                    | "manage your engines"
+                    | "inspect your store"
+                    | "manage your store"
+                    | "manage your cache"
+            ))
+}
+
+fn help_comma_command_row(line: &str) -> Option<Vec<String>> {
+    if !line.starts_with(char::is_whitespace) || !line.contains(',') {
+        return None;
+    }
+    let names: Vec<_> = line
+        .trim()
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect();
+    (names.len() >= 2 && names.iter().all(|name| is_entry_name(name))).then_some(names)
 }
 
 fn is_arguments_header(line: &str) -> bool {
@@ -772,16 +1524,131 @@ fn is_arguments_header(line: &str) -> bool {
         return false;
     }
     matches!(
-        line.trim().trim_end_matches(':'),
-        "Arguments" | "Positionals" | "Positional Arguments"
+        line.trim()
+            .trim_end_matches(':')
+            .to_ascii_lowercase()
+            .as_str(),
+        "arguments" | "positionals" | "positional arguments"
     )
+}
+
+fn usage_signature(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
+    if trimmed.eq_ignore_ascii_case("usage") {
+        return Some("");
+    }
+    let (header, signature) = trimmed.split_once(':')?;
+    header
+        .trim()
+        .eq_ignore_ascii_case("usage")
+        .then_some(signature.trim_start())
+}
+
+fn usage_has_free_positional(command: &str, scope: &[String], line: &str) -> bool {
+    let command = command_basename(command);
+    let trimmed = line.trim();
+    let signature = split_help_columns(trimmed).map_or(trimmed, |(signature, _)| signature);
+    let mut words = signature.split_whitespace();
+    if words.next() != Some(command) {
+        return false;
+    }
+    for expected in scope {
+        if words.next() != Some(expected.as_str()) {
+            return false;
+        }
+    }
+    words.any(|word| {
+        if word.starts_with('-') || word.contains('|') {
+            return false;
+        }
+        let normalized = word
+            .trim_matches(|character: char| {
+                !character.is_ascii_alphanumeric() && !matches!(character, '_' | '-' | '.')
+            })
+            .to_ascii_lowercase();
+        matches!(
+            normalized.as_str(),
+            "arg"
+                | "args"
+                | "argument"
+                | "arguments"
+                | "directory"
+                | "expression"
+                | "file"
+                | "filename"
+                | "host"
+                | "module"
+                | "name"
+                | "package"
+                | "packages"
+                | "path"
+                | "pattern"
+                | "port"
+                | "prompt"
+                | "requirement"
+                | "requirements"
+                | "script"
+                | "script.js"
+                | "target"
+                | "url"
+                | "value"
+        )
+    })
+}
+
+/// Homebrew-style help groups executable examples under prose-oriented
+/// headings instead of a formal Commands section. Only exact
+/// `<command> <subcommand>` invocation rows are accepted from these groups.
+fn is_invocation_section_header(line: &str) -> bool {
+    if line.starts_with(char::is_whitespace) {
+        return false;
+    }
+    matches!(
+        line.trim()
+            .trim_end_matches(':')
+            .to_ascii_lowercase()
+            .as_str(),
+        "example usage" | "troubleshooting" | "contributing" | "further help"
+    )
+}
+
+fn help_invocation_subcommand(
+    command: &str,
+    scope: &[String],
+    line: &str,
+) -> Option<(String, String)> {
+    let command = Path::new(command)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(command);
+    let trimmed = line.trim();
+    let (signature, prose) = split_help_columns(trimmed).unwrap_or((trimmed, ""));
+    let mut words = signature.split_whitespace();
+    if words.next()? != command {
+        return None;
+    }
+    for expected in scope {
+        if words.next()? != expected {
+            return None;
+        }
+    }
+    let name = words.next()?;
+    if !is_entry_name(name) {
+        return None;
+    }
+    let syntax = words.collect::<Vec<_>>().join(" ");
+    let description = if prose.is_empty() { &syntax } else { prose };
+    Some((name.to_owned(), shorten(description)))
 }
 
 /// Any other flush-left `Something:` line ends a commands section (`Flags:`,
 /// `Options:`, `Global Flags:`, …). The commands header itself is matched
 /// first by the caller.
 fn is_help_section_header(line: &str) -> bool {
-    !line.starts_with(char::is_whitespace) && line.trim_end().ends_with(':')
+    if line.starts_with(char::is_whitespace) {
+        return false;
+    }
+    line.trim_end().ends_with(':') || is_all_caps_help_heading(line.trim())
 }
 
 /// Two-column `name   description` rows inside a `--help` commands section.
@@ -793,26 +1660,20 @@ fn help_subcommand_row(line: &str) -> Option<(Vec<String>, String)> {
         return None;
     }
     let trimmed = line.trim_start();
-    let name_end = trimmed.find(char::is_whitespace)?;
-    let name_token = &trimmed[..name_end];
-    let mut names = split_subcommand_names(name_token.trim_end_matches(','))?;
-    let mut rest = &trimmed[name_end..];
-    // Alias rows (`build, b    Compile…`): skip the single-word alias so the
-    // column gap is measured after it.
-    if name_token.ends_with(',') {
-        let alias = rest.trim_start();
-        let alias_end = alias.find(char::is_whitespace)?;
-        names.extend(split_subcommand_names(&alias[..alias_end])?);
-        rest = &alias[alias_end..];
+    let (signature, description) = split_help_columns(trimmed)?;
+    let mut signature_words = signature.split_whitespace();
+    let name_token = signature_words.next()?;
+    let comma_aliases = name_token.ends_with(',');
+    let mut names = split_subcommand_names(name_token.trim_end_matches([',', ':']))?;
+    if comma_aliases {
+        let alias = signature_words.next()?.trim_end_matches([',', ':']);
+        names.extend(split_subcommand_names(alias)?);
+        if let Some((canonical, _)) = names.iter().enumerate().max_by_key(|(_, name)| name.len())
+            && canonical != 0
+        {
+            names.swap(0, canonical);
+        }
     }
-    let gap = rest
-        .chars()
-        .take_while(|character| *character == ' ')
-        .count();
-    if gap < 2 {
-        return None;
-    }
-    let description = rest.trim_start();
     if description.is_empty() {
         return None;
     }
@@ -820,6 +1681,82 @@ fn help_subcommand_row(line: &str) -> Option<(Vec<String>, String)> {
     let mut seen = HashSet::new();
     names.retain(|name| seen.insert(name.clone()));
     Some((names, description.to_owned()))
+}
+
+fn split_help_columns(line: &str) -> Option<(&str, &str)> {
+    let mut gap_start = None;
+    let mut spaces = 0;
+    for (index, character) in line.char_indices() {
+        if character == '\t' {
+            let start = gap_start.unwrap_or(index);
+            let description = line[index + character.len_utf8()..].trim_start();
+            if !description.is_empty() {
+                return Some((line[..start].trim_end(), description));
+            }
+            gap_start = None;
+            spaces = 0;
+        } else if character == ' ' {
+            gap_start.get_or_insert(index);
+            spaces += 1;
+            if spaces >= 2 {
+                let start = gap_start?;
+                let description = line[index + 1..].trim_start();
+                if !description.is_empty() {
+                    return Some((line[..start].trim_end(), description));
+                }
+            }
+        } else {
+            gap_start = None;
+            spaces = 0;
+        }
+    }
+    None
+}
+
+fn is_all_caps_help_heading(line: &str) -> bool {
+    let mut letters = 0;
+    for character in line.chars().filter(char::is_ascii_alphabetic) {
+        if !character.is_ascii_uppercase() {
+            return false;
+        }
+        letters += 1;
+    }
+    letters >= 2
+}
+
+fn openssl_command_group(command: &str, line: &str) -> Option<bool> {
+    if command_basename(command) != "openssl" || line.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let heading = line.trim().to_ascii_lowercase();
+    (heading == "standard commands"
+        || heading.starts_with("message digest commands")
+        || heading.starts_with("cipher commands"))
+    .then_some(heading == "standard commands")
+}
+
+fn help_command_grid_row(line: &str) -> Option<Vec<String>> {
+    let names: Vec<_> = line.split_whitespace().map(str::to_owned).collect();
+    (!names.is_empty() && names.iter().all(|name| is_entry_name(name))).then_some(names)
+}
+
+fn help_argument_choices(line: &str) -> Option<(Vec<String>, String)> {
+    if !line.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let trimmed = line.trim_start();
+    let choices = trimmed.strip_prefix('{')?;
+    let end = choices.find('}')?;
+    let names: Vec<_> = choices[..end]
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if names.len() < 2 || !names.iter().all(|name| is_entry_name(name)) {
+        return None;
+    }
+    Some((names, shorten(choices[end + 1..].trim_start())))
 }
 
 fn split_subcommand_names(token: &str) -> Option<Vec<String>> {
@@ -909,6 +1846,26 @@ fn parse_man_page(command: &str, text: &str) -> CommandHelp {
                 description: shorten(&description),
                 takes_value: false,
             });
+        } else if let Some((names, description)) = man_signature_subcommand(command, &lines, index)
+        {
+            let mut names = names.into_iter();
+            let Some(name) = names.next() else {
+                continue;
+            };
+            if seen_subcommands.insert(name.clone()) && help.subcommands.len() < MAX_ENTRIES {
+                help.subcommands.push(HelpEntry {
+                    name,
+                    description: shorten(&description),
+                    takes_value: false,
+                });
+            }
+            for alias in names {
+                if seen_subcommands.insert(alias.clone())
+                    && help.subcommand_aliases.len() < MAX_ENTRIES
+                {
+                    help.subcommand_aliases.push(alias);
+                }
+            }
         }
     }
     help
@@ -1129,13 +2086,54 @@ fn two_column_subcommand(line: &str) -> Option<(String, String)> {
     Some((name.to_owned(), description.to_owned()))
 }
 
+/// Command headings in BSD-style man pages often use
+/// `subcommand [arguments]` on one line with the description in the deeper
+/// indented block below. Homebrew documents its complete command surface in
+/// this form rather than as two-column rows.
+fn man_signature_subcommand(
+    command: &str,
+    lines: &[String],
+    index: usize,
+) -> Option<(Vec<String>, String)> {
+    let line = lines.get(index)?;
+    if line.starts_with('-') || !line.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let trimmed = line.trim_start();
+    let name_end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
+    let name_token = &trimmed[..name_end];
+    let mut names = split_subcommand_names(name_token.trim_end_matches(','))?;
+    if names.first().is_some_and(|name| name == command) {
+        return None;
+    }
+    let mut usage = &trimmed[name_end..];
+    if name_token.ends_with(',') {
+        let alias = usage.trim_start();
+        let alias_end = alias.find(char::is_whitespace)?;
+        names.extend(split_subcommand_names(&alias[..alias_end])?);
+        usage = &alias[alias_end..];
+    }
+    let description = block_description(lines, index, indent_of(line))?;
+    let usage = usage.trim();
+    Some((
+        names,
+        if usage.is_empty() {
+            description
+        } else {
+            format!("{usage}: {description}")
+        },
+    ))
+}
+
 fn is_entry_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 32
         && name.chars().next().is_some_and(|c| c.is_ascii_lowercase())
+        && !name.ends_with(':')
+        && !name.contains("::")
         && name
             .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | ':'))
 }
 
 /// Collapse all whitespace, drop control characters, and truncate with `…`.
@@ -1293,6 +2291,36 @@ mod tests {
     }
 
     #[test]
+    fn parses_man_page_command_signatures_with_block_descriptions() {
+        let page = [
+            bold("COMMANDS"),
+            "   install formula|cask...".to_owned(),
+            "     Install a formula or cask.".to_owned(),
+            String::new(),
+            "   update".to_owned(),
+            "     Fetch the newest package metadata.".to_owned(),
+            String::new(),
+            "   doctor, dr [--list-checks]".to_owned(),
+            "     Check the system for potential problems.".to_owned(),
+            String::new(),
+            "     descriptive prose continues here".to_owned(),
+        ]
+        .join("\n");
+        let help = parse_man_page("brew", &page);
+        let names: Vec<_> = help
+            .subcommands
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, ["install", "update", "doctor"]);
+        assert_eq!(help.subcommand_aliases, ["dr"]);
+        assert_eq!(
+            help.subcommands[0].description,
+            "formula|cask...: Install a formula or cask."
+        );
+    }
+
+    #[test]
     fn command_named_non_subcommand_sections_do_not_leak_rows() {
         let page = [
             bold("COMMAND LINE OPTIONS"),
@@ -1388,9 +2416,276 @@ Options:
   -h, --help      Print help
 ";
 
+    const BREW_HELP: &str = "\
+Example usage:
+  brew search TEXT|/REGEX/
+  brew info [FORMULA|CASK...]
+  brew install FORMULA|CASK...
+  brew update
+  brew upgrade [FORMULA|CASK...]
+  brew uninstall FORMULA|CASK...
+  brew list [FORMULA|CASK...]
+
+Troubleshooting:
+  brew config
+  brew doctor
+  brew install --verbose --debug FORMULA|CASK
+
+Contributing:
+  brew create URL [--no-fetch]
+  brew edit [FORMULA|CASK...]
+
+Further help:
+  brew commands
+  brew help [COMMAND]
+  man brew
+  https://docs.brew.sh
+";
+
+    const GO_HELP: &str = "\
+Usage:
+\tgo <command> [arguments]
+
+The commands are:
+\tbug         start a bug report
+\tbuild       compile packages and dependencies
+\tmod         module maintenance
+
+Additional help topics:
+\tbuildconstraint build constraints
+";
+
+    const GH_HELP: &str = "\
+USAGE
+  gh <command> <subcommand> [flags]
+
+CORE COMMANDS
+  auth:          Authenticate gh and git with GitHub
+  pr:            Manage pull requests
+
+HELP TOPICS
+  accessibility: Learn about accessibility
+
+FLAGS
+  --help      Show help for command
+";
+
+    const GH_PR_HELP: &str = "\
+USAGE
+  gh pr <command> [flags]
+
+GENERAL COMMANDS
+  create:        Create a pull request
+  list:          List pull requests
+
+FLAGS
+  --help   Show help for command
+";
+
+    const OPENSSL_HELP: &str = "\
+help:
+
+Standard commands
+asn1parse         ca                ciphers           x509
+
+Message Digest commands (see the `dgst' command for more details)
+md5               sha1              sha256
+
+Cipher commands (see the `enc' command for more details)
+aes-128-cbc       aes-256-cbc
+";
+
+    const SIGNATURE_HELP: &str = "\
+Commands:
+  agents [options]                      Manage background agents
+  i, install                            Install dependencies
+  plugin|plugins                        Manage plugins
+";
+
+    #[test]
+    fn parses_go_prose_header_without_leaking_help_topics() {
+        let help = parse_help_output("go", GO_HELP);
+        let names: Vec<_> = help
+            .subcommands
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, ["bug", "build", "mod"]);
+        assert!(help.subcommands_exhaustive);
+    }
+
+    #[test]
+    fn parses_git_native_help_command_groups() {
+        let help = parse_help_output(
+            "git",
+            r#"These are common Git commands used in various situations:
+
+start a working area
+   clone      Clone a repository
+   init       Create an empty repository
+
+work on the current change
+   add        Add file contents to the index
+"#,
+        );
+        let names: Vec<_> = help
+            .subcommands
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, ["clone", "init", "add"]);
+    }
+
+    #[test]
+    fn parses_uppercase_colon_command_groups_without_help_topics() {
+        let help = parse_help_output("gh", GH_HELP);
+        let names: Vec<_> = help
+            .subcommands
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, ["auth", "pr"]);
+        assert!(!names.contains(&"accessibility"));
+    }
+
+    #[test]
+    fn parses_openssl_standard_command_grid_only() {
+        let help = parse_help_output("openssl", OPENSSL_HELP);
+        let names: Vec<_> = help
+            .subcommands
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, ["asn1parse", "ca", "ciphers", "x509"]);
+        assert!(!names.contains(&"sha256"));
+        assert!(!names.contains(&"aes-128-cbc"));
+    }
+
+    #[test]
+    fn parses_usage_signatures_and_prefers_full_comma_aliases() {
+        let help = parse_help_output("demo", SIGNATURE_HELP);
+        let names: Vec<_> = help
+            .subcommands
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, ["agents", "install", "plugin"]);
+        assert_eq!(help.subcommand_aliases, ["i", "plugins"]);
+    }
+
+    #[test]
+    fn parses_argparse_positional_command_choices() {
+        let help = parse_help_output(
+            "conda",
+            "usage: conda [-h] COMMAND ...\n\npositional arguments:\n  {activate,clean,create,install}\n                        Command to run\n\noptions:\n  -h, --help            show this help message\n",
+        );
+        let names: Vec<_> = help
+            .subcommands
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, ["activate", "clean", "create", "install"]);
+        assert!(help.accepts_positionals);
+        assert!(help.subcommands_exhaustive);
+    }
+
+    #[test]
+    fn parses_pnpm_categorized_and_npm_comma_command_lists() {
+        let pnpm = parse_help_output(
+            "pnpm",
+            "Manage your dependencies:\n  i, install       Install dependencies\n  clean            Remove node_modules\n\nManage your store:\n  store add        Add packages\n\nOptions:\n  -r, --recursive  Run recursively\n",
+        );
+        assert_eq!(
+            pnpm.subcommands
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["install", "clean", "store"]
+        );
+        assert_eq!(pnpm.subcommand_aliases, ["i"]);
+        assert!(pnpm.subcommands_exhaustive);
+
+        let npm = parse_help_output(
+            "npm",
+            "All commands:\n    access, adduser, audit, cache, config, install, run\n\nOptions:\n  -h, --help  Show help\n",
+        );
+        assert_eq!(
+            npm.subcommands
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "access", "adduser", "audit", "cache", "config", "install", "run"
+            ]
+        );
+        assert!(npm.subcommands_exhaustive);
+    }
+
+    #[test]
+    fn parses_scoped_usage_and_literal_invocation_rows() {
+        let npm_scope = vec!["cache".to_owned()];
+        let npm = parse_help_output_for_scope(
+            "npm",
+            &npm_scope,
+            "Usage:\nnpm cache add <package-spec>\nnpm cache clean [<key>]\nnpm cache ls [<name>]\nnpm cache verify\n\nOptions:\n  --cache <path>\n",
+        );
+        assert_eq!(
+            npm.subcommands
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["add", "clean", "ls", "verify"]
+        );
+        assert!(!npm.subcommands_exhaustive);
+
+        let bun_scope = vec!["pm".to_owned()];
+        let bun = parse_help_output_for_scope(
+            "bun",
+            &bun_scope,
+            "bun pm: Package manager utilities\n\n  bun pm pack       create a tarball\n  bun pm bin        print the bin folder\n  bun pm cache      print the cache folder\n  bun pm cache rm   clear the cache\n",
+        );
+        assert_eq!(
+            bun.subcommands
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["pack", "bin", "cache"]
+        );
+
+        let bun_cache_scope = vec!["pm".to_owned(), "cache".to_owned()];
+        let bun_cache = parse_help_output_for_scope(
+            "bun",
+            &bun_cache_scope,
+            "  bun pm cache      print the cache folder\n  bun pm cache rm   clear the cache\n",
+        );
+        assert_eq!(
+            bun_cache
+                .subcommands
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["rm"]
+        );
+    }
+
+    #[test]
+    fn pnpm_root_help_probes_the_complete_command_list_first() {
+        assert_eq!(
+            help_probe_arguments("pnpm", &[]),
+            [
+                vec!["help".to_owned(), "-a".to_owned()],
+                vec!["--help".to_owned()],
+            ]
+        );
+        assert_eq!(
+            help_probe_arguments("pnpm", &["store".to_owned()]),
+            [vec!["store".to_owned(), "--help".to_owned()]]
+        );
+    }
+
     #[test]
     fn parses_kubectl_style_help() {
-        let help = parse_help_output(KUBECTL_HELP);
+        let help = parse_help_output("kubectl", KUBECTL_HELP);
         assert!(help.subcommands_exhaustive);
         let names: Vec<&str> = help
             .subcommands
@@ -1419,7 +2714,7 @@ Options:
 
     #[test]
     fn parses_docker_style_help_with_management_commands() {
-        let help = parse_help_output(DOCKER_HELP);
+        let help = parse_help_output("docker", DOCKER_HELP);
         assert!(help.subcommands_exhaustive);
         let names: Vec<&str> = help
             .subcommands
@@ -1436,7 +2731,7 @@ Options:
 
     #[test]
     fn parses_cargo_style_help_with_aliases() {
-        let help = parse_help_output(CARGO_HELP);
+        let help = parse_help_output("cargo", CARGO_HELP);
         assert!(help.subcommands_exhaustive);
         let names: Vec<&str> = help
             .subcommands
@@ -1455,7 +2750,7 @@ Options:
 
     #[test]
     fn parses_pipe_and_description_subcommand_aliases() {
-        let help = parse_help_output(AI_CLI_HELP);
+        let help = parse_help_output("ai", AI_CLI_HELP);
         let names: Vec<_> = help
             .subcommands
             .iter()
@@ -1488,6 +2783,37 @@ Options:
     }
 
     #[test]
+    fn parses_homebrew_invocation_sections_without_claiming_exhaustiveness() {
+        let help = parse_help_output("brew", BREW_HELP);
+        let names: Vec<_> = help
+            .subcommands
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "search",
+                "info",
+                "install",
+                "update",
+                "upgrade",
+                "uninstall",
+                "list",
+                "config",
+                "doctor",
+                "create",
+                "edit",
+                "commands",
+                "help",
+            ]
+        );
+        assert_eq!(help.subcommands[2].description, "FORMULA|CASK...");
+        assert!(!help.subcommands_exhaustive);
+        assert!(!help.accepts_positionals);
+    }
+
+    #[test]
     fn proven_hidden_subcommands_survive_a_closed_help_surface() {
         let help = CommandHelp {
             flags: Vec::new(),
@@ -1516,15 +2842,15 @@ Options:
 
     #[test]
     fn help_garbage_yields_no_entries() {
-        assert_eq!(parse_help_output(""), CommandHelp::default());
+        assert_eq!(parse_help_output("demo", ""), CommandHelp::default());
         assert_eq!(
-            parse_help_output("just some prose\n"),
+            parse_help_output("demo", "just some prose\n"),
             CommandHelp::default()
         );
         // A commands header with no parseable rows still yields no
         // subcommands; rows outside any commands section are ignored.
         let orphan_rows = "  start   Start the service.\nCommands:\n\nFlags:\n";
-        let help = parse_help_output(orphan_rows);
+        let help = parse_help_output("demo", orphan_rows);
         assert!(help.subcommands.is_empty());
         assert!(!help.subcommands_exhaustive);
     }
@@ -1578,6 +2904,39 @@ Options:
     }
 
     #[test]
+    fn homebrew_help_augments_a_nonempty_man_command_list() {
+        let entry = |name: &str| HelpEntry {
+            name: name.into(),
+            description: String::new(),
+            takes_value: false,
+        };
+        let result = fetch_with_fallback(
+            "brew",
+            |_| CommandHelp {
+                flags: Vec::new(),
+                subcommands: vec![entry("install"), entry("doctor")],
+                subcommand_aliases: vec!["dr".into()],
+                accepts_positionals: false,
+                subcommands_exhaustive: false,
+            },
+            |_| CommandHelp {
+                flags: Vec::new(),
+                subcommands: vec![entry("install"), entry("update")],
+                subcommand_aliases: Vec::new(),
+                accepts_positionals: false,
+                subcommands_exhaustive: false,
+            },
+        );
+        let names: Vec<_> = result
+            .subcommands
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, ["install", "update", "doctor"]);
+        assert_eq!(result.subcommand_aliases, ["dr"]);
+    }
+
+    #[test]
     fn failing_or_hanging_help_degrades_to_empty() {
         let directory = tempfile::tempdir().expect("script directory");
         let failing = directory.path().join("failing");
@@ -1613,6 +2972,24 @@ Options:
         assert_eq!(help.subcommands.len(), 1);
         assert_eq!(help.subcommands[0].name, "deploy");
         assert_eq!(help.subcommands[0].description, "Ship it.");
+    }
+
+    #[test]
+    fn known_help_entrypoints_and_stderr_help_are_accepted() {
+        let directory = tempfile::tempdir().expect("script directory");
+        let go = directory.path().join("go");
+        fs::write(
+            &go,
+            "#!/bin/sh\n[ \"$1\" = help ] || exit 3\nprintf 'The commands are:\\n  build   Compile packages.\\n' >&2\n",
+        )
+        .expect("help script");
+        fs::set_permissions(&go, fs::Permissions::from_mode(0o700)).expect("script mode");
+        assert!(looks_like_help_output(
+            "error: help requested\nThe commands are:\n"
+        ));
+        let help = fetch_help_program("go", go.as_os_str());
+        assert_eq!(help.subcommands.len(), 1);
+        assert_eq!(help.subcommands[0].name, "build");
     }
 
     #[test]
@@ -1822,11 +3199,18 @@ Options:
                         takes_value: true,
                     },
                 ],
-                subcommands: vec![HelpEntry {
-                    name: "checkout".into(),
-                    description: "Switch branches.".into(),
-                    takes_value: false,
-                }],
+                subcommands: vec![
+                    HelpEntry {
+                        name: "checkout".into(),
+                        description: "Switch branches.".into(),
+                        takes_value: false,
+                    },
+                    HelpEntry {
+                        name: "checkout-index".into(),
+                        description: "Copy files from the index.".into(),
+                        takes_value: false,
+                    },
+                ],
                 subcommand_aliases: Vec::new(),
                 accepts_positionals: false,
                 subcommands_exhaustive: false,
@@ -1839,6 +3223,24 @@ Options:
         );
         let mut engine = CompletionEngine::new(100, 20);
         engine.register(provider);
+
+        let output = engine.complete(&context("git", 24));
+        let checkout = output
+            .candidates
+            .iter()
+            .find(|candidate| candidate.display.primary == "git checkout")
+            .expect("bare subcommand candidate");
+        let edit = checkout.edit.as_ref().expect("bare edit");
+        assert_eq!(edit.range, 0..3);
+        assert_eq!(edit.replacement, "git checkout");
+
+        assert!(
+            engine
+                .complete(&context("sudo git", 25))
+                .candidates
+                .iter()
+                .any(|candidate| candidate.display.primary == "sudo git checkout")
+        );
 
         let output = engine.complete(&context("git ", 1));
         let checkout = output
@@ -1898,6 +3300,13 @@ Options:
                 .is_empty(),
             "an exact completed subcommand must not leave fuzzy siblings"
         );
+        assert!(
+            engine
+                .complete(&context("git ckt", 26))
+                .candidates
+                .is_empty(),
+            "subcommands require a real token prefix"
+        );
 
         assert!(
             engine
@@ -1910,6 +3319,183 @@ Options:
         // Past the first argument without a dash the provider stays silent.
         let output = engine.complete(&context("git checkout ", 4));
         assert!(output.candidates.is_empty());
+    }
+
+    #[test]
+    fn standalone_prompt_clis_wait_for_a_space_before_help_rows() {
+        let directory = tempfile::tempdir().expect("command directory");
+        let path = directory.path().join("codex");
+        fs::write(&path, b"#!/bin/sh\n").expect("fake command");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).expect("command mode");
+        let commands = Arc::new(CommandPathCache::from_path(Some(&OsString::from(
+            directory.path(),
+        ))));
+        let cache = Arc::new(CommandHelpCache::default());
+        cache.seed(
+            "codex",
+            parse_help_output("codex", "Commands:\n  exec   Run non-interactively\n"),
+        );
+        let mut engine = CompletionEngine::new(100, 20);
+        engine.register(CommandHelpProvider::new(
+            Arc::new(SpecRegistry::load(None)),
+            commands,
+            cache,
+        ));
+
+        assert!(engine.complete(&context("codex", 27)).candidates.is_empty());
+        let rows: Vec<_> = engine
+            .complete(&context("codex ", 28))
+            .candidates
+            .into_iter()
+            .map(|candidate| candidate.display.primary)
+            .collect();
+        assert_eq!(rows, ["codex exec"]);
+    }
+
+    #[test]
+    fn engine_descends_through_confirmed_help_subcommands() {
+        let directory = tempfile::tempdir().expect("command directory");
+        let path = directory.path().join("gh");
+        fs::write(&path, b"#!/bin/sh\n").expect("fake command");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).expect("command mode");
+        let commands = Arc::new(CommandPathCache::from_path(Some(&OsString::from(
+            directory.path(),
+        ))));
+        let cache = Arc::new(CommandHelpCache::default());
+        cache.seed("gh", parse_help_output("gh", GH_HELP));
+        cache.seed_scope(
+            "gh",
+            &["pr"],
+            parse_help_output_for_scope("gh", &["pr".to_owned()], GH_PR_HELP),
+        );
+        cache.seed_scope(
+            "gh",
+            &["pr", "create"],
+            parse_help_output_for_scope(
+                "gh",
+                &["pr".to_owned(), "create".to_owned()],
+                "Options:\n  --fill     Use commit information for title and body\n",
+            ),
+        );
+        let mut engine = CompletionEngine::new(100, 20);
+        engine.register(CommandHelpProvider::new(
+            Arc::new(SpecRegistry::load(None)),
+            commands,
+            cache,
+        ));
+
+        let rows: Vec<_> = engine
+            .complete(&context("gh pr ", 40))
+            .candidates
+            .into_iter()
+            .map(|candidate| candidate.display.primary)
+            .collect();
+        assert_eq!(rows, ["gh pr create", "gh pr list"]);
+
+        let rows: Vec<_> = engine
+            .complete(&context("gh pr cr", 41))
+            .candidates
+            .into_iter()
+            .map(|candidate| candidate.display.primary)
+            .collect();
+        assert_eq!(rows, ["gh pr create"]);
+        assert!(
+            engine
+                .complete(&context("gh pr zzz", 42))
+                .candidates
+                .is_empty()
+        );
+
+        let rows: Vec<_> = engine
+            .complete(&context("gh pr create --f", 43))
+            .candidates
+            .into_iter()
+            .map(|candidate| candidate.display.primary)
+            .collect();
+        assert_eq!(rows, ["gh pr create --fill"]);
+    }
+
+    #[test]
+    fn explicit_executable_paths_receive_dynamic_help() {
+        let directory = tempfile::tempdir().expect("command directory");
+        let path = directory.path().join("demotool");
+        fs::write(&path, b"#!/bin/sh\n").expect("fake command");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).expect("command mode");
+        let commands = Arc::new(CommandPathCache::default());
+        let cache = Arc::new(CommandHelpCache::default());
+        cache.seed(
+            "./demotool",
+            parse_help_output("demotool", "Commands:\n  deploy   Ship it\n"),
+        );
+        let mut engine = CompletionEngine::new(100, 20);
+        engine.register(CommandHelpProvider::new(
+            Arc::new(SpecRegistry::load(None)),
+            commands,
+            cache,
+        ));
+        let mut spaced = context("./demotool ", 44);
+        spaced.cwd = Arc::new(directory.path().to_owned());
+        let rows: Vec<_> = engine
+            .complete(&spaced)
+            .candidates
+            .into_iter()
+            .map(|candidate| candidate.display.primary)
+            .collect();
+        assert_eq!(rows, ["./demotool deploy"]);
+
+        let mut bare = context("./demotool", 45);
+        bare.cwd = Arc::new(directory.path().to_owned());
+        let rows: Vec<_> = engine
+            .complete(&bare)
+            .candidates
+            .into_iter()
+            .map(|candidate| candidate.display.primary)
+            .collect();
+        assert_eq!(rows, ["./demotool deploy"]);
+    }
+
+    #[test]
+    fn homebrew_help_completes_bare_space_and_strict_prefix_positions() {
+        let directory = tempfile::tempdir().expect("command directory");
+        let path = directory.path().join("brew");
+        fs::write(&path, b"#!/bin/sh\n").expect("fake command");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).expect("command mode");
+        let commands = Arc::new(CommandPathCache::from_path(Some(&OsString::from(
+            directory.path(),
+        ))));
+        let cache = Arc::new(CommandHelpCache::default());
+        cache.seed("brew", parse_help_output("brew", BREW_HELP));
+        let mut engine = CompletionEngine::new(100, 20);
+        engine.register(CommandHelpProvider::new(
+            Arc::new(SpecRegistry::load(None)),
+            commands,
+            cache,
+        ));
+
+        for (text, query) in [("brew", 30), ("brew ", 31)] {
+            let rows: Vec<_> = engine
+                .complete(&context(text, query))
+                .candidates
+                .into_iter()
+                .map(|candidate| candidate.display.primary)
+                .collect();
+            assert!(rows.contains(&"brew install".to_owned()), "rows: {rows:?}");
+            assert!(rows.contains(&"brew update".to_owned()), "rows: {rows:?}");
+        }
+
+        let rows: Vec<_> = engine
+            .complete(&context("brew in", 32))
+            .candidates
+            .into_iter()
+            .map(|candidate| candidate.display.primary)
+            .collect();
+        assert_eq!(rows, ["brew info", "brew install"]);
+        assert!(
+            engine
+                .complete(&context("brew zzz", 33))
+                .candidates
+                .is_empty()
+        );
     }
 
     fn context(text: &str, query: u64) -> CompletionContext {

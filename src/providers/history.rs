@@ -15,10 +15,9 @@ use crate::{
     specs::SpecRegistry,
 };
 
-#[cfg(test)]
-use super::command_help::{CommandHelp, HelpEntry};
 use super::command_help::{
-    CommandHelpCache, history_arguments_are_plausible, one_edit_or_adjacent_transposition,
+    CommandHelp, CommandHelpCache, HelpEntry, one_edit_or_adjacent_transposition,
+    scoped_history_arguments_are_plausible,
 };
 
 pub struct HistoryProvider {
@@ -73,34 +72,31 @@ impl CandidateProvider for HistoryProvider {
         } else {
             &context.buffer.text
         };
-        // Past the command token a history row replaces the WHOLE buffer, so
-        // it is only relevant when the recorded command actually continues
-        // what is typed; substring/subsequence hits there (`docker build …`
-        // matching `kimi `) are unrelated commands and must not appear.
+        if context.mode == CompletionMode::Normal && search_text.trim().is_empty() {
+            return ProviderOutput::default();
+        }
+        // Normal completion replaces the whole buffer with a history row, so
+        // every non-empty input must be a literal line prefix. Broad fuzzy
+        // recall belongs only to explicit history search (Ctrl-R).
         let later_segment = context.parsed.active_segment.start > 0;
-        let anchor = (midline
-            || later_segment
-            || !crate::providers::command_position_open(context))
-        .then(|| {
+        let anchor = (context.mode == CompletionMode::Normal).then(|| {
             if midline {
-                context.buffer.text[..context.buffer.cursor].to_lowercase()
+                context.buffer.text[..context.buffer.cursor]
+                    .trim_start()
+                    .to_lowercase()
             } else {
                 continuation_prefix(&context.buffer.text)
             }
         });
-        let suffix =
-            midline.then(|| context.buffer.text[context.parsed.replacement.end..].to_lowercase());
+        let suffix = (context.mode == CompletionMode::Normal && midline)
+            .then(|| context.buffer.text[context.parsed.replacement.end..].to_lowercase());
         // Alias/function discovery fingerprints rc files. Load it once for
         // this query instead of repeating those filesystem checks for every
         // history record considered by the pre-top-k eligibility filter.
         let aliases = self.aliases.load(context.shell);
-        // When the command word is a prefix of a known executable/builtin/alias,
-        // history must stay in that command family. Otherwise a subsequence
-        // hit across an unrelated full line (`cod` -> `cargo doc`) can outrank
-        // the executable the user is plainly typing. If no known command has
-        // the prefix, broad fuzzy recall remains available for history-only
-        // abbreviations and remembered fragments.
-        let command_prefix = (!later_segment)
+        // In explicit history search, a known command prefix still narrows the
+        // result family; unknown fragments retain Ctrl-R's fuzzy recall.
+        let command_prefix = (context.mode == CompletionMode::HistoryOnly && !later_segment)
             .then(|| self.known_command_prefix_with_aliases(context, &aliases))
             .flatten();
         // Apply every eligibility constraint before HistoryIndex takes its
@@ -160,6 +156,7 @@ impl CandidateProvider for HistoryProvider {
 }
 
 fn continuation_prefix(text: &str) -> String {
+    let text = text.trim_start();
     let trimmed = text.trim_end();
     let mut prefix = trimmed.to_lowercase();
     if trimmed.len() < text.len() {
@@ -173,14 +170,14 @@ impl HistoryProvider {
         let Some(command) = context.command() else {
             return;
         };
-        if self.specs.get(command).is_some()
-            || super::is_package_manager(command)
-            || !super::effective_command_accepts_external(context)
-            || !self.commands.contains(command)
+        if self.specs.get(command).is_some() || !super::effective_command_accepts_external(context)
         {
             return;
         }
-        self.help.request(command, self.commands.path(command));
+        let Some(executable) = super::resolved_executable_path(context, &self.commands) else {
+            return;
+        };
+        self.help.request(command, Some(executable));
     }
 
     #[cfg(test)]
@@ -298,8 +295,20 @@ impl HistoryProvider {
             .is_some_and(|wrapper| *wrapper == "corepack");
         let path = if corepack_dispatch {
             self.commands.contains("corepack")
+        } else if word.contains('/') {
+            if word
+                .chars()
+                .any(|character| matches!(character, '$' | '`' | '*' | '?' | '[' | '{'))
+            {
+                true
+            } else {
+                let directory =
+                    super::wrapper_working_directory_before(context, &cooked, command_index);
+                let executable = super::resolve_directory(&directory, word);
+                crate::platform::is_executable(&executable)
+            }
         } else {
-            word.contains('/') || self.commands.contains(word)
+            self.commands.contains(word)
         };
         let builtin = super::is_shell_builtin(context.shell, word);
         let symbol = super::is_shell_builtin_or_keyword(context.shell, word);
@@ -311,11 +320,12 @@ impl HistoryProvider {
         };
         plausible
             && self.plausible_function_argument(context, words, command_index, aliases)
-            && self.plausible_executable_arguments(words, command_index, last_exit_code)
+            && self.plausible_executable_arguments(context, words, command_index, last_exit_code)
     }
 
     fn plausible_executable_arguments(
         &self,
+        context: &CompletionContext,
         words: &[String],
         command_index: usize,
         last_exit_code: Option<i32>,
@@ -327,24 +337,70 @@ impl HistoryProvider {
         let arguments = cooked.get(command_index + 1..).unwrap_or_default();
         let known_non_failure =
             last_exit_code.is_some_and(|code| !crate::history::is_failed_exit(Some(code)));
+        let executable = if context.command() == Some(command_word) {
+            crate::providers::resolved_executable_path(context, &self.commands)
+        } else if command_word.contains('/') {
+            None
+        } else {
+            self.commands.path(command_word)
+        };
+
+        if let Some(plausible) = super::python_module::history_python_module_is_plausible(
+            &self.help,
+            command_word,
+            executable.clone(),
+            arguments,
+            known_non_failure,
+        ) {
+            return plausible;
+        }
 
         if let Some(manager) = super::MANAGERS
             .iter()
-            .find(|manager| manager.name == command_word)
+            .find(|manager| manager.name == super::executable_basename(command_word))
         {
-            let Some(argument) = manager_command_argument(manager.name, arguments) else {
+            let Some(command_arguments) = manager_command_arguments(manager.name, arguments) else {
                 return true;
             };
+            let argument = command_arguments[0];
             if argument
                 .chars()
                 .any(|character| matches!(character, '$' | '`' | '*' | '?' | '[' | '{'))
-                || manager
-                    .subcommands
-                    .iter()
-                    .any(|(subcommand, _)| *subcommand == argument)
                 || known_non_failure
             {
                 return true;
+            }
+            if manager
+                .subcommands
+                .iter()
+                .any(|(subcommand, _)| *subcommand == argument)
+            {
+                if command_arguments.len() == 1
+                    || !manager_subcommand_has_commands(manager.name, argument)
+                {
+                    return true;
+                }
+                let root = Arc::new(CommandHelp {
+                    flags: Vec::new(),
+                    subcommands: vec![HelpEntry {
+                        name: argument.to_owned(),
+                        description: String::new(),
+                        takes_value: false,
+                    }],
+                    subcommand_aliases: Vec::new(),
+                    accepts_positionals: false,
+                    subcommands_exhaustive: false,
+                });
+                return scoped_history_arguments_are_plausible(
+                    &self.help,
+                    command_word,
+                    executable,
+                    root,
+                    command_arguments,
+                    false,
+                    false,
+                )
+                .unwrap_or(false);
             }
             return !manager
                 .subcommands
@@ -352,12 +408,16 @@ impl HistoryProvider {
                 .any(|(subcommand, _)| one_edit_or_adjacent_transposition(argument, subcommand));
         }
         if let Some(help) = self.help.peek(command_word) {
-            return history_arguments_are_plausible(
-                &help,
+            return scoped_history_arguments_are_plausible(
+                &self.help,
+                command_word,
+                executable,
+                help,
                 arguments,
                 known_non_failure,
                 allows_external_subcommands(command_word),
-            );
+            )
+            .unwrap_or(false);
         }
         // The runtime requests help as soon as an exact executable name is
         // typed. While that bounded background probe is pending, defer its
@@ -444,11 +504,13 @@ impl HistoryProvider {
     }
 }
 
-fn manager_command_argument<'a>(manager: &str, arguments: &'a [&'a str]) -> Option<&'a str> {
+fn manager_command_arguments<'a>(manager: &str, arguments: &'a [&'a str]) -> Option<&'a [&'a str]> {
     let mut index = 0;
     while let Some(argument) = arguments.get(index).copied() {
         if argument == "--" {
-            return arguments.get(index + 1).copied();
+            return arguments
+                .get(index + 1..)
+                .filter(|arguments| !arguments.is_empty());
         }
         if super::attached_manager_value(manager, argument).is_some()
             || super::attached_manager_boolean(manager, argument).is_some()
@@ -464,9 +526,19 @@ fn manager_command_argument<'a>(manager: &str, arguments: &'a [&'a str]) -> Opti
         if argument.starts_with('-') {
             return None;
         }
-        return Some(argument);
+        return Some(&arguments[index..]);
     }
     None
+}
+
+fn manager_subcommand_has_commands(manager: &str, command: &str) -> bool {
+    matches!(
+        (manager, command),
+        ("pnpm", "cache" | "config" | "env" | "runtime" | "store")
+            | ("npm", "cache" | "config" | "pkg" | "token")
+            | ("yarn", "config" | "set" | "workspaces")
+            | ("bun", "pm")
+    )
 }
 
 fn allows_external_subcommands(command: &str) -> bool {
@@ -735,13 +807,21 @@ mod tests {
         );
         assert_eq!(primaries("kimi w"), vec!["kimi web"]);
         assert_eq!(primaries("kimi > lo"), vec!["kimi > logs/output.log"]);
-        // On a known command prefix, fuzzy history stays in that command
-        // family instead of surfacing unrelated subsequence hits.
+        // Normal completion accepts literal prefixes only.
         assert_eq!(primaries("kim"), vec!["kimi > logs/output.log", "kimi web"]);
+        assert!(primaries("dob").is_empty());
 
-        // With no known command prefix, broad fuzzy history recall remains
-        // available for remembered fragments.
-        assert_eq!(primaries("dob"), vec!["docker build -t myimage ."]);
+        // Explicit history search keeps broad fuzzy recall for remembered
+        // fragments without leaking that low-confidence behavior into the
+        // normal recommendation list.
+        let history_only = context("dob", None).with_mode(CompletionMode::HistoryOnly);
+        let rows: Vec<_> = provider
+            .complete(&history_only)
+            .candidates
+            .into_iter()
+            .map(|candidate| candidate.display.primary)
+            .collect();
+        assert_eq!(rows, ["docker build -t myimage ."]);
     }
 
     #[test]
@@ -811,7 +891,7 @@ mod tests {
             ("builtin if", false),                     // keyword is not a callable builtin
             ("command if", false),                     // `command` cannot execute keywords
             ("for f in *; do git add $f; done", true), // shell keyword
-            ("./run.sh --fast", true),                 // explicit path
+            ("./run.sh --fast", false),                // missing explicit path
             ("echo done | gti log", false),            // later segments are validated too
         ] {
             index.ingest(command, 1_000, ShellKind::Zsh, None, Some(0), &policy);
@@ -832,6 +912,26 @@ mod tests {
             .collect();
         assert!(primaries.contains(&"git status"), "rows: {primaries:?}");
         assert!(!primaries.contains(&"gti status"), "rows: {primaries:?}");
+    }
+
+    #[test]
+    fn explicit_history_commands_must_still_be_executable() {
+        let directory = tempfile::tempdir().expect("directory");
+        let bin = directory.path().join("bin");
+        fs::create_dir(&bin).expect("bin");
+        let script = bin.join("run.sh");
+        fs::write(&script, b"#!/bin/sh\n").expect("script");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).expect("executable mode");
+        let provider = provider_with_executables(HistoryIndex::default(), &[]);
+        let mut current = context("./bin/run.sh --fast", None);
+        current.cwd = Arc::new(directory.path().to_owned());
+
+        assert!(provider.plausible_command(&current, "./bin/run.sh --fast"));
+        assert!(provider.plausible_command(&current, "env -C bin ./run.sh --fast"));
+
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o600)).expect("plain mode");
+        assert!(!provider.plausible_command(&current, "./bin/run.sh --fast"));
+        assert!(!provider.plausible_command(&current, "env -C bin ./run.sh --fast"));
     }
 
     #[test]
@@ -906,6 +1006,7 @@ mod tests {
                 subcommands_exhaustive: true,
             },
         );
+        help.seed_scope("git", &["push"], CommandHelp::default());
         let provider = provider_with_executables_and_help(index, &["git", "codex"], help);
 
         let rows = |text: &str| {
@@ -947,6 +1048,101 @@ mod tests {
             ["codex --config value resume"],
             "a one-edit top-level flag typo must not survive history"
         );
+    }
+
+    #[test]
+    fn nested_history_typos_are_filtered_against_scoped_help() {
+        let policy = HistoryPolicy::new(1024, &[]).expect("policy");
+        let mut index = HistoryIndex::default();
+        for (offset, command) in [
+            "gh pr create",
+            "gh pr creat",
+            "gh pr list",
+            "gh pr lits",
+            "gh pr create --fill",
+            "gh pr create --fil",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            index.ingest(
+                command,
+                1_000 + offset as i64,
+                ShellKind::Zsh,
+                None,
+                None,
+                &policy,
+            );
+        }
+
+        let entry = |name: &str| HelpEntry {
+            name: name.to_owned(),
+            description: String::new(),
+            takes_value: false,
+        };
+        let help = Arc::new(CommandHelpCache::default());
+        help.seed(
+            "gh",
+            CommandHelp {
+                flags: Vec::new(),
+                subcommands: vec![entry("pr")],
+                subcommand_aliases: Vec::new(),
+                accepts_positionals: false,
+                subcommands_exhaustive: true,
+            },
+        );
+        help.seed_scope(
+            "gh",
+            &["pr"],
+            CommandHelp {
+                flags: Vec::new(),
+                subcommands: vec![entry("create"), entry("list")],
+                subcommand_aliases: Vec::new(),
+                accepts_positionals: false,
+                subcommands_exhaustive: true,
+            },
+        );
+        help.seed_scope(
+            "gh",
+            &["pr", "create"],
+            CommandHelp {
+                flags: vec![HelpEntry {
+                    name: "--fill".into(),
+                    description: String::new(),
+                    takes_value: false,
+                }],
+                subcommands: Vec::new(),
+                subcommand_aliases: Vec::new(),
+                accepts_positionals: true,
+                subcommands_exhaustive: false,
+            },
+        );
+        let provider = provider_with_executables_and_help(index, &["gh"], help);
+        let rows = |text: &str| {
+            provider
+                .complete(&context(text, None))
+                .candidates
+                .into_iter()
+                .map(|candidate| candidate.display.primary)
+                .collect::<Vec<_>>()
+        };
+
+        let create = rows("gh pr c");
+        assert!(
+            create.contains(&"gh pr create".to_owned()),
+            "rows: {create:?}"
+        );
+        assert!(
+            create.contains(&"gh pr create --fill".to_owned()),
+            "rows: {create:?}"
+        );
+        assert!(
+            !create.contains(&"gh pr creat".to_owned()),
+            "rows: {create:?}"
+        );
+
+        assert_eq!(rows("gh pr l"), ["gh pr list"]);
+        assert_eq!(rows("gh pr create --f"), ["gh pr create --fill"]);
     }
 
     #[test]
@@ -1077,6 +1273,57 @@ mod tests {
         assert_eq!(rows("npm --prefix repo i"), ["npm --prefix repo install"]);
         assert_eq!(rows("pnpm -C repo i"), ["pnpm -C repo install"]);
         assert_eq!(rows("bun up"), ["bun upgrade"]);
+    }
+
+    #[test]
+    fn package_manager_nested_subcommand_typos_are_filtered() {
+        let policy = HistoryPolicy::new(1024, &[]).expect("policy");
+        let mut index = HistoryIndex::default();
+        for command in [
+            "pnpm store prune",
+            "pnpm store prun",
+            "npm cache clean",
+            "npm cache cler",
+        ] {
+            index.ingest(command, 1_000, ShellKind::Zsh, None, None, &policy);
+        }
+        let help = Arc::new(CommandHelpCache::default());
+        let scoped_help = |names: &[&str]| CommandHelp {
+            flags: Vec::new(),
+            subcommands: names
+                .iter()
+                .map(|name| HelpEntry {
+                    name: (*name).to_owned(),
+                    description: String::new(),
+                    takes_value: false,
+                })
+                .collect(),
+            subcommand_aliases: Vec::new(),
+            accepts_positionals: false,
+            subcommands_exhaustive: true,
+        };
+        help.seed_scope(
+            "pnpm",
+            &["store"],
+            scoped_help(&["add", "path", "prune", "status"]),
+        );
+        help.seed_scope(
+            "npm",
+            &["cache"],
+            scoped_help(&["add", "clean", "ls", "verify"]),
+        );
+        let provider =
+            provider_with_executables_and_help(index, &["npm", "pnpm"], Arc::clone(&help));
+        let rows = |text: &str| {
+            provider
+                .complete(&context(text, None))
+                .candidates
+                .into_iter()
+                .map(|candidate| candidate.display.primary)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(rows("pnpm store pr"), ["pnpm store prune"]);
+        assert_eq!(rows("npm cache cl"), ["npm cache clean"]);
     }
 
     #[test]

@@ -207,7 +207,12 @@ impl FilesystemProvider {
             slot.base_dir = Some(super::invocation_working_directory(context));
             return Some(slot);
         }
-        let command = context.command()?;
+        let raw_command = context.command()?;
+        let command = if super::python_module::is_python_command(raw_command) {
+            "python"
+        } else {
+            super::executable_basename(raw_command)
+        };
         let resolution = crate::providers::command_resolution_kind(context);
         if self.inferred_function_argument(context) {
             return None;
@@ -217,7 +222,10 @@ impl FilesystemProvider {
         {
             return None;
         }
-        let (words, argument_position) = argument_progress(context)?;
+        let (mut words, argument_position) = argument_progress(context)?;
+        if let Some(effective) = words.first_mut() {
+            *effective = command;
+        }
         let prefix = context.parsed.current_prefix.as_str();
         let command_base =
             command_directory_before_active(context, command, &words, argument_position);
@@ -391,9 +399,7 @@ impl FilesystemProvider {
                 // completion still applies. Peek only: the help provider is
                 // registered first and warms the shared cache from its
                 // applies pass; never spawn `man` from here.
-                if self.help.peek(command).is_some_and(|help| {
-                    super::command_help::dynamic_subcommand_position(context, &help)
-                }) {
+                if super::command_help::dynamic_help_owns_position(context, &self.help) {
                     return None;
                 }
                 explicit_path(prefix)
@@ -406,6 +412,8 @@ impl FilesystemProvider {
             slot.base_dir = Some(super::git::git_working_directory(context, &words));
         } else if super::is_package_manager(command) {
             slot.base_dir = super::manager_project_dir(context);
+        } else if let Some(directory) = super::delegated_command_working_directory(context) {
+            slot.base_dir = Some(directory);
         } else {
             slot.base_dir = Some(super::invocation_working_directory(context));
         }
@@ -636,10 +644,13 @@ fn attached_short_flags(command: &str) -> &'static [&'static str] {
         "just" => &["-d", "-f"],
         "curl" => &["-o", "-K", "-T", "-d"],
         "cargo" => &["-j"],
-        "python" | "python3" => &["-c", "-m", "-W", "-X"],
+        "python" => &["-c", "-m", "-W", "-X"],
         "ruby" => &["-e", "-r", "-E", "-C", "-I"],
         "perl" => &["-e", "-E", "-M", "-m", "-F", "-I"],
         "node" => &["-e", "-p", "-r"],
+        "uv" => &["-m", "-s", "-p", "-w", "-i", "-f", "-P", "-C"],
+        "poetry" => &["-C", "-P"],
+        "bundle" | "bundler" => &["-j", "-r"],
         "grep" | "egrep" | "fgrep" => &["-e", "-f", "-A", "-B", "-C", "-m"],
         "rg" => &["-e", "-f", "-A", "-B", "-C", "-m", "-g", "-t", "-T", "-j"],
         "ag" => &["-A", "-B", "-C", "-G", "-g", "-m", "-W"],
@@ -666,6 +677,9 @@ fn command_directory_before_active(
     if super::is_package_manager(command) {
         return super::manager_project_dir(context)
             .unwrap_or_else(|| super::invocation_working_directory(context));
+    }
+    if let Some(directory) = super::delegated_command_working_directory(context) {
+        return directory;
     }
 
     let mut directory = super::invocation_working_directory(context);
@@ -719,14 +733,16 @@ fn default_path_slot(command: &str, words: &[&str], argument_position: usize) ->
         | "realpath" | "dirname" | "basename" | "open" | "xdg-open" | "vi" | "vim" | "nvim"
         | "nano" | "emacs" | "code" | "diff" | "cmp" | "tee" | "zip" | "rsync" | "scp" | "gzip"
         | "gunzip" | "bzip2" | "bunzip2" | "xz" | "unxz" | "sha1sum" | "sha256sum" | "md5"
-        | "md5sum" | "gcc" | "clang" | "cc" | "g++" | "clang++" => Some(SlotKind::Path),
+        | "md5sum" | "gcc" | "clang" | "cc" | "g++" | "clang++" | "javac" | "rustc" => {
+            Some(SlotKind::Path)
+        }
         "source" | "." | "unzip"
             if positional_arguments_before(command, words, argument_position, &[])
                 .is_some_and(|count| count == 0) =>
         {
             Some(SlotKind::Path)
         }
-        "python" | "python3"
+        "python"
             if !flag_before_active(command, words, argument_position, &["-c", "-m"])
                 && positional_arguments_before(command, words, argument_position, &[])
                     .is_some_and(|count| count == 0) =>
@@ -929,6 +945,7 @@ fn package_manager_path_slot(
     argument_position: usize,
     prefix: &str,
 ) -> Option<SlotKind> {
+    let command = super::executable_basename(command);
     if non_local_path_prefix(prefix) {
         return None;
     }
@@ -1230,8 +1247,25 @@ fn flag_value_slot(command: &str, flag: &str) -> Option<SlotKind> {
         ("make", "-j" | "--jobs") => Some(SlotKind::Value),
         ("just", "-f" | "--justfile" | "--dotenv-path") => Some(SlotKind::Path),
         ("just", "-d" | "--working-directory") => Some(SlotKind::Directory),
+        ("uv", "-m" | "--module" | "--python" | "-p") => Some(SlotKind::Value),
+        (
+            "uv",
+            "-s"
+            | "--script"
+            | "--gui-script"
+            | "--env-file"
+            | "--with-requirements"
+            | "-f"
+            | "--find-links"
+            | "--config-file",
+        ) => Some(SlotKind::Path),
+        ("uv", "--directory" | "--project" | "--cache-dir")
+        | ("poetry", "-C" | "--directory" | "-P" | "--project") => Some(SlotKind::Directory),
+        ("pipenv", "--python" | "--categories" | "--extra-pip-args") => Some(SlotKind::Value),
+        ("bundle" | "bundler", "--gemfile") => Some(SlotKind::Path),
+        ("bundle" | "bundler", "-j" | "--jobs" | "-r" | "--retry") => Some(SlotKind::Value),
         ("bash" | "zsh" | "sh", "-c" | "-O" | "-o")
-        | ("python" | "python3", "-c" | "-m" | "-W" | "-X" | "--check-hash-based-pycs")
+        | ("python", "-c" | "-m" | "-W" | "-X" | "--check-hash-based-pycs")
         | ("ruby", "-e" | "-r" | "-E")
         | ("perl", "-e" | "-E" | "-M" | "-m" | "-F")
         | ("node", "-e" | "--eval" | "-p" | "--print" | "--import" | "--loader" | "--conditions")
@@ -1250,9 +1284,15 @@ fn flag_value_slot(command: &str, flag: &str) -> Option<SlotKind> {
         | ("sed", "-e" | "--expression")
         | ("awk", "-v" | "-F")
         | ("chown", "--from") => Some(SlotKind::Value),
-        ("python" | "python3", "--pycache-prefix") | ("ruby", "-C" | "-I") | ("perl", "-I") => {
+        ("python", "--pycache-prefix") | ("ruby", "-C" | "-I") | ("perl", "-I") => {
             Some(SlotKind::Directory)
         }
+        ("java", "-jar" | "-cp" | "-classpath" | "--class-path" | "--module-path")
+        | ("javac", "-cp" | "-classpath" | "--class-path" | "--module-path") => {
+            Some(SlotKind::Path)
+        }
+        ("javac", "-d") | ("rustc", "--out-dir") => Some(SlotKind::Directory),
+        ("rustc", "-o") => Some(SlotKind::NewFile),
         ("bash", "--rcfile" | "--init-file") => Some(SlotKind::Path),
         ("grep" | "egrep" | "fgrep" | "rg", "-f" | "--file")
         | ("grep" | "egrep" | "fgrep", "--exclude-from")
@@ -2083,6 +2123,53 @@ mod tests {
     }
 
     #[test]
+    fn versioned_python_and_compiler_path_slots_follow_the_command_family() {
+        let directory = tempfile::tempdir().expect("directory");
+        for name in ["script.py", "app.jar", "Main.java", "main.rs"] {
+            fs::write(directory.path().join(name), b"").expect("file");
+        }
+        fs::create_dir(directory.path().join("classes")).expect("classes directory");
+        fs::write(directory.path().join("plain.txt"), b"").expect("plain file");
+        let provider = provider(Arc::new(SpecRegistry::default()));
+
+        for (buffer, expected) in [
+            ("python3.14 sc", "script.py"),
+            ("pypy3.11 sc", "script.py"),
+            ("./bin/python3.14 sc", "script.py"),
+            ("java -jar ap", "app.jar"),
+            ("javac Ma", "Main.java"),
+            ("rustc ma", "main.rs"),
+            ("rustc -o cl", "classes/"),
+        ] {
+            assert!(
+                provider
+                    .complete(&context(directory.path(), buffer, 10))
+                    .candidates
+                    .iter()
+                    .any(|candidate| candidate.display.primary == expected),
+                "path slot missing for {buffer:?}"
+            );
+        }
+
+        assert!(
+            provider
+                .complete(&context(directory.path(), "javac -d cl", 11))
+                .candidates
+                .iter()
+                .any(|candidate| candidate.display.primary == "classes/")
+        );
+        for buffer in ["python3.14 -m sc", "pypy3.11 -W ", "./bin/ssh host pl"] {
+            assert!(
+                provider
+                    .complete(&context(directory.path(), buffer, 12))
+                    .candidates
+                    .is_empty(),
+                "literal or remote slot leaked local files for {buffer:?}"
+            );
+        }
+    }
+
+    #[test]
     fn directory_creation_removal_and_pushd_use_directory_slots() {
         let directory = tempfile::tempdir().expect("directory");
         fs::create_dir(directory.path().join("nested")).expect("nested directory");
@@ -2658,6 +2745,8 @@ mod tests {
         let runner = directory.path().join("app/runner");
         fs::write(&runner, b"#!/bin/sh\n").expect("runner");
         fs::set_permissions(&runner, fs::Permissions::from_mode(0o700)).expect("runner mode");
+        fs::write(directory.path().join("app/rubbish"), b"plain\n").expect("non-executable decoy");
+        fs::write(directory.path().join("app/script.py"), b"print('ok')\n").expect("Python script");
         let provider = provider(Arc::new(SpecRegistry::default()));
 
         for buffer in ["env -C app cat in", "sudo -D app cat in"] {
@@ -2697,6 +2786,8 @@ mod tests {
             "env -C app ./ru",
             "find . -exec ./app/ru",
             "find . -exec env -C app ./ru",
+            "uv --directory app run ./ru",
+            "poetry -C app run ./ru",
         ] {
             let output = provider.complete(&context(directory.path(), buffer, 3));
             assert!(
@@ -2706,7 +2797,37 @@ mod tests {
                     .any(|candidate| candidate.display.primary.ends_with("runner")),
                 "explicit executable missing for {buffer:?}"
             );
+            assert!(
+                output
+                    .candidates
+                    .iter()
+                    .all(|candidate| !candidate.display.primary.ends_with("rubbish")),
+                "non-executable leaked for {buffer:?}"
+            );
         }
+
+        let script = provider.complete(&context(
+            directory.path(),
+            "uv --directory app run --script scr",
+            5,
+        ));
+        assert!(
+            script
+                .candidates
+                .iter()
+                .any(|candidate| candidate.display.primary == "script.py")
+        );
+        assert!(
+            provider
+                .complete(&context(
+                    directory.path(),
+                    "uv --directory app run --module scr",
+                    6,
+                ))
+                .candidates
+                .is_empty(),
+            "Python module names must not degrade into filesystem rows"
+        );
     }
 
     #[test]

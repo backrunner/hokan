@@ -44,7 +44,29 @@ fn bare_executable_holds_suggestions_until_space() {
     let directory = tempfile::tempdir().expect("directory");
     let bin = directory.path().join("bin");
     std::fs::create_dir(&bin).expect("bin directory");
-    for name in ["kimi", "code", "codex", "deno", "git", "ls", "tar"] {
+    for name in [
+        "cat",
+        "kimi",
+        "code",
+        "codex",
+        "cp",
+        "curl",
+        "deno",
+        "git",
+        "grep",
+        "ls",
+        "ollama",
+        "openssl",
+        "pip3.14",
+        "pnpm",
+        "ssh",
+        "systemctl",
+        "tar",
+        "tmux",
+        "uv",
+        "vercel",
+        "yarn",
+    ] {
         let executable = bin.join(name);
         std::fs::write(&executable, b"#!/bin/sh\n").expect("write executable");
         let mut permissions = std::fs::metadata(&executable)
@@ -84,7 +106,16 @@ fn bare_executable_holds_suggestions_until_space() {
     // `cod`, before either exact name has been entered.
     assert!(awaiting("code"));
     assert!(awaiting("codex"));
-    assert!(!awaiting("deno"));
+    assert!(
+        awaiting("deno"),
+        "Deno starts its REPL without a subcommand"
+    );
+    for command in ["systemctl", "tmux", "vercel", "yarn"] {
+        assert!(
+            awaiting(command),
+            "{command} has useful no-argument behavior"
+        );
+    }
     // A trailing space commits to arguments: suggestions resume.
     assert!(!awaiting("kimi "));
     // Unknown prefix keeps path completion alive.
@@ -93,11 +124,31 @@ fn bare_executable_holds_suggestions_until_space() {
     // the same hold-back applies as for a plain `kimi`.
     assert!(awaiting("sudo kimi"));
     assert!(awaiting("sudo -u root kimi"));
+    assert!(awaiting("./bin/codex"));
+    assert!(awaiting("sudo ./bin/codex"));
+    assert!(!awaiting("./bin/git"));
+    assert!(!awaiting("sudo ./bin/git"));
+    assert!(!awaiting("./bin/pnpm"));
+    assert!(!awaiting("sudo ./bin/pnpm"));
     // A redirect target is an argument/path slot, even though
     // `argument_progress` intentionally hides it from argv semantics.
     assert!(!awaiting("kimi > lo"));
     // A subcommand-style CLI cannot run standalone: no holding back.
     assert!(!awaiting("git"));
+    assert!(!awaiting("pip3.14"));
+    for command in ["ollama", "openssl", "uv"] {
+        assert!(
+            !awaiting(command),
+            "{command} requires a command or argument"
+        );
+    }
+    for command in ["cp", "curl", "grep", "ssh"] {
+        assert!(
+            !awaiting(command),
+            "{command} requires a positional argument"
+        );
+    }
+    assert!(awaiting("cat"), "cat can read stdin without arguments");
     // Static recipes also wait for the argument-opening space when the command
     // itself is runnable; specs marked requires_arguments remain open.
     assert!(awaiting("ls"));
@@ -160,6 +211,23 @@ fn exact_executable_prefetches_dynamic_help_before_the_space() {
     // A repeated buffer event must share the same pending/cache entry.
     super::state::prefetch_command_help(&context, &commands, &specs, &help);
     assert_eq!(help.fetch_count(), 1);
+
+    let explicit_help = Arc::new(crate::providers::CommandHelpCache::default());
+    let explicit = CompletionContext::new(
+        QueryId::new(2),
+        ShellKind::Zsh,
+        directory.path().to_owned(),
+        BufferSnapshot::new(
+            Arc::<str>::from("./bin/codex-fixture"),
+            "./bin/codex-fixture".len(),
+            BufferRevision::ZERO,
+            SyncQuality::Exact,
+        )
+        .expect("snapshot"),
+    )
+    .expect("context");
+    super::state::prefetch_command_help(&explicit, &commands, &specs, &explicit_help);
+    assert_eq!(explicit_help.fetch_count(), 1);
 }
 
 #[test]

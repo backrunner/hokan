@@ -9,6 +9,7 @@ mod network_interface;
 mod path_command;
 mod process;
 mod project;
+mod python_module;
 mod ssh;
 
 pub use ai_action::{AiActionProvider, ai_error_candidate, ai_result_candidates};
@@ -22,6 +23,7 @@ pub use network_interface::NetworkInterfaceProvider;
 pub use path_command::PathCommandProvider;
 pub use process::ProcessProvider;
 pub use project::ProjectProvider;
+pub use python_module::PythonModuleProvider;
 pub use ssh::SshHostProvider;
 
 use crate::{completion::CompletionContext, parser::TokenKind};
@@ -514,6 +516,9 @@ fn executable_argument_slot(context: &CompletionContext) -> bool {
     if find_exec_command_position(context) {
         return true;
     }
+    if delegated_executable_slot(context).is_some() {
+        return true;
+    }
     if context.command() == Some("npx") {
         let Some((words, position)) = argument_progress(context) else {
             return false;
@@ -736,6 +741,303 @@ fn package_exec_executable_position(before: &[&str]) -> bool {
     true
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum DelegatedExecutableKind {
+    UvRun,
+    PoetryRun,
+    PipenvRun,
+    BundleExec,
+}
+
+impl DelegatedExecutableKind {
+    const fn action(self) -> &'static str {
+        match self {
+            Self::UvRun | Self::PoetryRun | Self::PipenvRun => "run",
+            Self::BundleExec => "exec",
+        }
+    }
+}
+
+fn delegated_executable_kind(command: &str) -> Option<DelegatedExecutableKind> {
+    match executable_basename(command) {
+        "uv" => Some(DelegatedExecutableKind::UvRun),
+        "poetry" => Some(DelegatedExecutableKind::PoetryRun),
+        "pipenv" => Some(DelegatedExecutableKind::PipenvRun),
+        "bundle" | "bundler" => Some(DelegatedExecutableKind::BundleExec),
+        _ => None,
+    }
+}
+
+fn delegated_executable_slot(context: &CompletionContext) -> Option<std::path::PathBuf> {
+    let kind = delegated_executable_kind(context.command()?)?;
+    let (words, position) = argument_progress(context)?;
+    let before = words.get(1..=position).unwrap_or_default();
+    let mut directory = invocation_working_directory(context);
+    let mut action_seen = false;
+    let mut index = 0;
+    while let Some(word) = before.get(index).copied() {
+        if !action_seen && word == kind.action() {
+            action_seen = true;
+            index += 1;
+            continue;
+        }
+        if word == "--" {
+            return (action_seen && index + 1 == before.len()).then_some(directory);
+        }
+        if delegated_terminal_option(kind, word)
+            || action_seen && delegated_non_executable_mode(kind, word)
+        {
+            return None;
+        }
+        if let Some((flag, value)) = word.split_once('=') {
+            if !delegated_value_option(kind, action_seen, flag) {
+                return None;
+            }
+            apply_delegated_directory(kind, flag, value, &mut directory);
+            index += 1;
+            continue;
+        }
+        if let Some((flag, value)) = delegated_attached_short_value(kind, action_seen, word) {
+            apply_delegated_directory(kind, flag, value, &mut directory);
+            index += 1;
+            continue;
+        }
+        if delegated_value_option(kind, action_seen, word) {
+            let value = before.get(index + 1).copied()?;
+            apply_delegated_directory(kind, word, value, &mut directory);
+            index += 2;
+            continue;
+        }
+        if delegated_boolean_option(kind, action_seen, word) {
+            index += 1;
+            continue;
+        }
+        return None;
+    }
+    action_seen.then_some(directory)
+}
+
+pub(crate) fn delegated_command_working_directory(
+    context: &CompletionContext,
+) -> Option<std::path::PathBuf> {
+    let kind = delegated_executable_kind(context.command()?)?;
+    let (words, position) = argument_progress(context)?;
+    let before = words.get(1..=position).unwrap_or_default();
+    let mut directory = invocation_working_directory(context);
+    let mut index = 0;
+    while let Some(word) = before.get(index).copied() {
+        if let Some((flag, value)) = word.split_once('=') {
+            apply_delegated_directory(kind, flag, value, &mut directory);
+            index += 1;
+            continue;
+        }
+        if kind == DelegatedExecutableKind::PoetryRun && word.len() > 2 && word.starts_with("-C") {
+            apply_delegated_directory(kind, "-C", &word[2..], &mut directory);
+            index += 1;
+            continue;
+        }
+        if word == "--directory" || kind == DelegatedExecutableKind::PoetryRun && word == "-C" {
+            let value = before.get(index + 1).copied()?;
+            apply_delegated_directory(kind, word, value, &mut directory);
+            index += 2;
+            continue;
+        }
+        index += 1;
+    }
+    Some(directory)
+}
+
+fn delegated_terminal_option(kind: DelegatedExecutableKind, word: &str) -> bool {
+    matches!(word, "-h" | "--help" | "--version")
+        || word == "-V" && kind != DelegatedExecutableKind::BundleExec
+        || kind == DelegatedExecutableKind::PipenvRun
+            && matches!(
+                word,
+                "--where" | "--venv" | "--py" | "--envs" | "--rm" | "--man" | "--support"
+            )
+}
+
+fn delegated_non_executable_mode(kind: DelegatedExecutableKind, word: &str) -> bool {
+    kind == DelegatedExecutableKind::UvRun
+        && (matches!(word, "-m" | "--module" | "-s" | "--script" | "--gui-script")
+            || word.starts_with("--module=")
+            || word.starts_with("--script=")
+            || word.starts_with("--gui-script=")
+            || word.len() > 2 && matches!(&word[..2], "-m" | "-s"))
+}
+
+fn delegated_value_option(kind: DelegatedExecutableKind, action_seen: bool, word: &str) -> bool {
+    let global = match kind {
+        DelegatedExecutableKind::UvRun => matches!(
+            word,
+            "--color" | "--allow-insecure-host" | "--directory" | "--project" | "--config-file"
+        ),
+        DelegatedExecutableKind::PoetryRun => {
+            matches!(word, "-C" | "--directory" | "-P" | "--project")
+        }
+        DelegatedExecutableKind::PipenvRun => matches!(
+            word,
+            "--python" | "--pypi-mirror" | "--categories" | "--extra-pip-args"
+        ),
+        DelegatedExecutableKind::BundleExec => matches!(
+            word,
+            "--gemfile" | "--path" | "-j" | "--jobs" | "-r" | "--retry"
+        ),
+    };
+    global
+        || action_seen
+            && kind == DelegatedExecutableKind::UvRun
+            && matches!(
+                word,
+                "--extra"
+                    | "--no-extra"
+                    | "--group"
+                    | "--no-group"
+                    | "--only-group"
+                    | "--no-editable-package"
+                    | "--env-file"
+                    | "-w"
+                    | "--with"
+                    | "--with-editable"
+                    | "--with-requirements"
+                    | "--package"
+                    | "--python-platform"
+                    | "--index"
+                    | "--default-index"
+                    | "-i"
+                    | "--index-url"
+                    | "--extra-index-url"
+                    | "-f"
+                    | "--find-links"
+                    | "--index-strategy"
+                    | "--keyring-provider"
+                    | "-P"
+                    | "--upgrade-package"
+                    | "--upgrade-group"
+                    | "--resolution"
+                    | "--prerelease"
+                    | "--fork-strategy"
+                    | "--exclude-newer"
+                    | "--exclude-newer-package"
+                    | "--no-sources-package"
+                    | "--reinstall-package"
+                    | "--link-mode"
+                    | "-C"
+                    | "--config-setting"
+                    | "--config-settings-package"
+                    | "--no-build-isolation-package"
+                    | "--no-build-package"
+                    | "--no-binary-package"
+                    | "--cache-dir"
+                    | "--refresh-package"
+                    | "-p"
+                    | "--python"
+            )
+}
+
+fn delegated_boolean_option(kind: DelegatedExecutableKind, action_seen: bool, word: &str) -> bool {
+    if matches!(
+        kind,
+        DelegatedExecutableKind::UvRun | DelegatedExecutableKind::PoetryRun
+    ) && word.len() >= 2
+        && word.starts_with('-')
+        && word[1..]
+            .chars()
+            .all(|character| matches!(character, 'q' | 'v'))
+    {
+        return true;
+    }
+    let global = match kind {
+        DelegatedExecutableKind::UvRun => matches!(
+            word,
+            "--system-certs" | "--offline" | "--no-progress" | "--no-config"
+        ),
+        DelegatedExecutableKind::PoetryRun => matches!(
+            word,
+            "-n" | "--no-interaction" | "--ansi" | "--no-ansi" | "--no-plugins" | "--no-cache"
+        ),
+        DelegatedExecutableKind::PipenvRun => matches!(
+            word,
+            "--bare" | "--site-packages" | "--clear" | "--quiet" | "--verbose"
+        ),
+        DelegatedExecutableKind::BundleExec => matches!(
+            word,
+            "--keep-file-descriptors"
+                | "--no-keep-file-descriptors"
+                | "--no-color"
+                | "-V"
+                | "--verbose"
+                | "--no-verbose"
+        ),
+    };
+    global
+        || action_seen
+            && kind == DelegatedExecutableKind::UvRun
+            && matches!(
+                word,
+                "--all-extras"
+                    | "--no-dev"
+                    | "--no-default-groups"
+                    | "--all-groups"
+                    | "--only-dev"
+                    | "--no-editable"
+                    | "--exact"
+                    | "--no-env-file"
+                    | "--isolated"
+                    | "--active"
+                    | "--no-sync"
+                    | "--locked"
+                    | "--frozen"
+                    | "--all-packages"
+                    | "--no-project"
+                    | "--no-index"
+                    | "-U"
+                    | "--upgrade"
+                    | "--no-sources"
+                    | "--reinstall"
+                    | "--compile-bytecode"
+                    | "--no-build-isolation"
+                    | "--no-build"
+                    | "--no-binary"
+                    | "-n"
+                    | "--no-cache"
+                    | "--refresh"
+                    | "--managed-python"
+                    | "--no-managed-python"
+                    | "--no-python-downloads"
+            )
+}
+
+fn delegated_attached_short_value(
+    kind: DelegatedExecutableKind,
+    action_seen: bool,
+    word: &str,
+) -> Option<(&'static str, &str)> {
+    let flags: &[&str] = match kind {
+        DelegatedExecutableKind::UvRun if action_seen => &["-w", "-i", "-f", "-P", "-C", "-p"],
+        DelegatedExecutableKind::PoetryRun => &["-C", "-P"],
+        DelegatedExecutableKind::PipenvRun => &[],
+        DelegatedExecutableKind::BundleExec => &["-j", "-r"],
+        DelegatedExecutableKind::UvRun => &[],
+    };
+    flags.iter().find_map(|flag| {
+        (word.len() > flag.len() && word.starts_with(flag)).then_some((*flag, &word[flag.len()..]))
+    })
+}
+
+fn apply_delegated_directory(
+    kind: DelegatedExecutableKind,
+    flag: &str,
+    value: &str,
+    directory: &mut std::path::PathBuf,
+) {
+    let changes_directory =
+        flag == "--directory" || kind == DelegatedExecutableKind::PoetryRun && flag == "-C";
+    if changes_directory {
+        *directory = resolve_directory(directory, value);
+    }
+}
+
 pub(crate) fn path_executable_name_allowed(context: &CompletionContext, name: &str) -> bool {
     context.command() != Some("corepack")
         || matches!(name, "npm" | "npx" | "pnpm" | "pnpx" | "yarn" | "yarnpkg")
@@ -926,6 +1228,167 @@ pub(crate) fn invocation_working_directory(context: &CompletionContext) -> std::
     wrapper_working_directory_before(context, &words, command_index)
 }
 
+/// Resolve the effective external command to a file that is executable by
+/// the current user. PATH names use the shared command snapshot; explicit
+/// paths are resolved relative to wrapper-adjusted cwd and checked directly.
+pub(crate) fn resolved_executable_path(
+    context: &CompletionContext,
+    commands: &crate::platform::CommandPathCache,
+) -> Option<std::path::PathBuf> {
+    let command = context.command()?;
+    if let Some(path) = commands.path(command) {
+        return Some(path);
+    }
+    if !command.contains('/')
+        || command_resolution_kind(context) == crate::parser::EffectiveCommandKind::Builtin
+    {
+        return None;
+    }
+    let path = resolve_directory(&invocation_working_directory(context), command);
+    crate::platform::is_executable(&path).then_some(path)
+}
+
+pub(crate) fn known_standalone_command(command: &str) -> bool {
+    matches!(
+        executable_basename(command),
+        "claude" | "codex" | "deno" | "systemctl" | "tmux" | "vercel" | "yarn"
+    )
+}
+
+pub(crate) fn known_subcommand_command(command: &str) -> bool {
+    let command = executable_basename(command);
+    is_pip_command(command)
+        || matches!(
+            command,
+            "adb"
+                | "ansible"
+                | "apt"
+                | "aws"
+                | "az"
+                | "brew"
+                | "cargo"
+                | "composer"
+                | "consul"
+                | "defaults"
+                | "diskutil"
+                | "dnf"
+                | "docker"
+                | "docker-compose"
+                | "dotnet"
+                | "eksctl"
+                | "firebase"
+                | "flyctl"
+                | "gcloud"
+                | "gem"
+                | "gh"
+                | "glab"
+                | "go"
+                | "gradle"
+                | "helm"
+                | "heroku"
+                | "istioctl"
+                | "kubectl"
+                | "launchctl"
+                | "mise"
+                | "mvn"
+                | "nerdctl"
+                | "nix"
+                | "nomad"
+                | "oc"
+                | "ollama"
+                | "openssl"
+                | "pacman"
+                | "pip"
+                | "pip3"
+                | "pipx"
+                | "podman"
+                | "poetry"
+                | "railway"
+                | "rustup"
+                | "security"
+                | "snap"
+                | "supabase"
+                | "svn"
+                | "terraform"
+                | "tofu"
+                | "uv"
+                | "vagrant"
+                | "vault"
+                | "wrangler"
+                | "git"
+        )
+}
+
+pub(crate) fn known_required_argument_command(command: &str) -> bool {
+    matches!(
+        executable_basename(command),
+        "awk"
+            | "basename"
+            | "cc"
+            | "chgrp"
+            | "chmod"
+            | "chown"
+            | "clang"
+            | "clang++"
+            | "cmp"
+            | "comm"
+            | "cp"
+            | "curl"
+            | "cut"
+            | "diff"
+            | "dirname"
+            | "g++"
+            | "gcc"
+            | "grep"
+            | "java"
+            | "javac"
+            | "join"
+            | "ln"
+            | "man"
+            | "mkdir"
+            | "mosh"
+            | "mv"
+            | "open"
+            | "readlink"
+            | "rm"
+            | "rmdir"
+            | "rsync"
+            | "rustc"
+            | "scp"
+            | "sed"
+            | "sftp"
+            | "ssh"
+            | "stat"
+            | "touch"
+            | "tr"
+            | "unlink"
+            | "wget"
+            | "which"
+            | "xdg-open"
+    )
+}
+
+pub(crate) fn executable_basename(command: &str) -> &str {
+    std::path::Path::new(command)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(command)
+}
+
+pub(crate) fn is_pip_command(command: &str) -> bool {
+    let name = executable_basename(command);
+    let Some(suffix) = name.strip_prefix("pip") else {
+        return false;
+    };
+    suffix.is_empty()
+        || suffix.split('.').all(|component| {
+            !component.is_empty()
+                && component
+                    .chars()
+                    .all(|character| character.is_ascii_digit())
+        })
+}
+
 pub(crate) fn wrapper_working_directory_before(
     context: &CompletionContext,
     words: &[&str],
@@ -951,6 +1414,7 @@ pub(crate) struct ManagerSpec {
 pub(crate) const NPM_SUBCOMMANDS: &[(&str, &str)] = &[
     ("install", "安装全部依赖"),
     ("run", "运行 package.json 脚本"),
+    ("run-script", "运行 package.json 脚本"),
     ("test", "运行 test 脚本"),
     ("start", "运行 start 脚本"),
     ("ci", "按 lockfile 干净安装"),
@@ -961,6 +1425,30 @@ pub(crate) const NPM_SUBCOMMANDS: &[(&str, &str)] = &[
     ("audit", "依赖安全审计"),
     ("outdated", "检查过期依赖"),
     ("publish", "发布包"),
+    ("cache", "管理 npm 缓存"),
+    ("config", "读取或修改 npm 配置"),
+    ("dedupe", "减少重复依赖"),
+    ("doctor", "检查 npm 环境"),
+    ("explain", "解释依赖安装原因"),
+    ("fund", "查看依赖资助信息"),
+    ("ls", "列出已安装依赖"),
+    ("pack", "创建包归档"),
+    ("ping", "检查 registry 连通性"),
+    ("prune", "移除多余依赖"),
+    ("rebuild", "重新构建依赖"),
+    ("search", "搜索 registry 包"),
+    ("view", "查看包元数据"),
+    ("version", "修改包版本"),
+    ("whoami", "显示当前 registry 用户"),
+    ("login", "登录 registry"),
+    ("logout", "退出 registry"),
+    ("link", "链接本地包"),
+    ("pkg", "管理 package.json 字段"),
+    ("prefix", "显示 npm 前缀目录"),
+    ("query", "查询依赖选择器"),
+    ("root", "显示 node_modules 目录"),
+    ("token", "管理访问令牌"),
+    ("unpublish", "撤下已发布版本"),
 ];
 
 pub(crate) const PNPM_SUBCOMMANDS: &[(&str, &str)] = &[
@@ -979,7 +1467,31 @@ pub(crate) const PNPM_SUBCOMMANDS: &[(&str, &str)] = &[
     ("audit", "依赖安全审计"),
     ("publish", "发布包"),
     ("pack", "创建发布归档"),
-    ("--filter", "筛选 workspace 成员"),
+    ("clean", "清理 workspace 的 node_modules"),
+    ("dedupe", "减少 lockfile 中的重复依赖"),
+    ("fetch", "预取 lockfile 中的依赖"),
+    ("import", "从 npm lockfile 生成 pnpm lockfile"),
+    ("link", "链接本地包"),
+    ("prune", "移除多余依赖"),
+    ("rebuild", "重新构建依赖"),
+    ("unlink", "取消本地包链接"),
+    ("patch", "准备依赖补丁"),
+    ("patch-commit", "提交依赖补丁"),
+    ("patch-remove", "移除依赖补丁"),
+    ("licenses", "检查依赖许可证"),
+    ("approve-builds", "批准依赖构建脚本"),
+    ("ignored-builds", "列出被阻止的构建脚本"),
+    ("start", "运行 start 脚本"),
+    ("test", "运行 test 脚本"),
+    ("bin", "显示依赖可执行文件目录"),
+    ("config", "管理 pnpm 配置"),
+    ("deploy", "部署 workspace 包"),
+    ("root", "显示有效 node_modules 目录"),
+    ("stage", "暂存待发布包"),
+    ("runtime", "管理 JavaScript 运行时"),
+    ("self-update", "更新 pnpm"),
+    ("store", "管理 pnpm store"),
+    ("cache", "管理包元数据缓存"),
 ];
 
 pub(crate) const YARN_SUBCOMMANDS: &[(&str, &str)] = &[
@@ -987,6 +1499,7 @@ pub(crate) const YARN_SUBCOMMANDS: &[(&str, &str)] = &[
     ("add", "添加依赖"),
     ("remove", "移除依赖"),
     ("up", "升级依赖"),
+    ("upgrade", "升级依赖"),
     ("run", "显式运行 package.json 脚本"),
     ("exec", "执行依赖提供的命令"),
     ("dlx", "临时下载并执行包"),
@@ -997,6 +1510,13 @@ pub(crate) const YARN_SUBCOMMANDS: &[(&str, &str)] = &[
     ("config", "管理 Yarn 配置"),
     ("cache", "管理下载缓存"),
     ("set", "更新 Yarn 或项目配置"),
+    ("create", "从模板创建项目"),
+    ("init", "初始化项目"),
+    ("link", "链接本地包"),
+    ("unlink", "取消本地包链接"),
+    ("pack", "创建包归档"),
+    ("publish", "发布包"),
+    ("version", "管理包版本"),
 ];
 
 pub(crate) const BUN_SUBCOMMANDS: &[(&str, &str)] = &[
@@ -1006,11 +1526,15 @@ pub(crate) const BUN_SUBCOMMANDS: &[(&str, &str)] = &[
     ("update", "更新依赖"),
     ("run", "显式运行 package.json 脚本"),
     ("x", "执行包提供的命令"),
+    ("exec", "执行 shell 脚本"),
+    ("repl", "启动 Bun REPL"),
     ("create", "从模板创建项目"),
     ("init", "初始化项目"),
     ("test", "运行 Bun 测试"),
     ("build", "构建入口文件"),
     ("pm", "管理 Bun 包管理器状态"),
+    ("outdated", "检查过期依赖"),
+    ("patch", "准备依赖补丁"),
     ("publish", "发布包"),
     ("link", "链接本地包"),
     ("unlink", "移除本地包链接"),
@@ -1028,6 +1552,20 @@ pub(crate) const DENO_SUBCOMMANDS: &[(&str, &str)] = &[
     ("compile", "编译为可执行文件"),
     ("eval", "求值一段代码"),
     ("init", "初始化项目"),
+    ("bench", "运行基准测试"),
+    ("check", "类型检查模块"),
+    ("coverage", "生成测试覆盖率报告"),
+    ("doc", "显示模块文档"),
+    ("info", "显示模块依赖信息"),
+    ("jupyter", "启动 Jupyter kernel"),
+    ("lsp", "启动语言服务器"),
+    ("outdated", "检查过期依赖"),
+    ("publish", "发布 JSR 包"),
+    ("remove", "移除依赖"),
+    ("repl", "启动交互式 REPL"),
+    ("serve", "运行 HTTP 服务"),
+    ("uninstall", "卸载已安装命令"),
+    ("upgrade", "升级 Deno"),
 ];
 
 pub(crate) const MANAGERS: &[ManagerSpec] = &[
@@ -1124,7 +1662,7 @@ pub(crate) fn manager_position(context: &CompletionContext) -> Option<ManagerPos
         if active.is_some_and(|word| word.starts_with('-')) {
             return None;
         }
-        if active.is_some_and(|word| is_script_keyword(scan.spec, word)) {
+        if active.is_some_and(|word| is_primary_script_keyword(scan.spec, word)) {
             Position::KeywordWord
         } else {
             Position::CommandToken
@@ -1178,11 +1716,13 @@ pub(crate) fn manager_project_dir(context: &CompletionContext) -> Option<std::pa
 
 pub(crate) fn package_manager(context: &CompletionContext) -> Option<&'static ManagerSpec> {
     let command = context.command()?;
+    let command = executable_basename(command);
     MANAGERS.iter().find(|spec| spec.name == command)
 }
 
 #[must_use]
 pub(crate) fn is_package_manager(command: &str) -> bool {
+    let command = executable_basename(command);
     MANAGERS.iter().any(|spec| spec.name == command)
 }
 
@@ -1294,9 +1834,8 @@ fn scan_manager(context: &CompletionContext) -> Option<ManagerScanResult<'_>> {
         return None;
     }
     let words = segment_words(context);
-    let spec = MANAGERS
-        .iter()
-        .find(|spec| Some(spec.name) == words.first().copied())?;
+    let manager = words.first().map(|word| executable_basename(word))?;
+    let spec = MANAGERS.iter().find(|spec| spec.name == manager)?;
     let active_word = context.parsed.replacement.start < context.parsed.replacement.end
         && context.parsed.replacement.start <= context.buffer.cursor
         && context.buffer.cursor <= context.parsed.replacement.end;
@@ -1783,6 +2322,10 @@ fn apply_manager_boolean(
 }
 
 fn is_script_keyword(spec: &ManagerSpec, word: &str) -> bool {
+    is_primary_script_keyword(spec, word) || spec.name == "npm" && word == "run-script"
+}
+
+fn is_primary_script_keyword(spec: &ManagerSpec, word: &str) -> bool {
     Some(word) == spec.keyword || (spec.keyword.is_none() && word == "run")
 }
 
@@ -1929,6 +2472,29 @@ mod tests {
     }
 
     #[test]
+    fn standalone_command_hints_apply_to_explicit_paths() {
+        for command in ["codex", "./bin/codex", "claude", "/opt/bin/claude"] {
+            assert!(known_standalone_command(command));
+        }
+        for command in ["git", "./bin/git", "brew", "/opt/bin/openssl"] {
+            assert!(!known_standalone_command(command));
+        }
+        for command in ["ssh", "./bin/curl", "/usr/bin/cp", "grep"] {
+            assert!(known_required_argument_command(command));
+        }
+        for command in ["pip", "pip3", "pip3.14", "/opt/bin/pip3.13"] {
+            assert!(is_pip_command(command));
+            assert!(known_subcommand_command(command));
+        }
+        for command in ["pipeline", "pipx", "pip3.", "pip3x"] {
+            assert!(!is_pip_command(command));
+        }
+        for command in ["cat", "python", "./bin/codex"] {
+            assert!(!known_required_argument_command(command));
+        }
+    }
+
+    #[test]
     fn cursor_at_a_word_start_makes_that_word_the_active_one() {
         // `ls -la |foo` (cursor at the start of `foo`, whitespace before it):
         // `foo` is the ACTIVE word with an empty prefix, so the word before
@@ -1999,6 +2565,9 @@ mod tests {
         assert_eq!(position("npm ru"), Some(Position::CommandToken));
         assert_eq!(position("npm run"), Some(Position::KeywordWord));
         assert_eq!(position("npm run "), Some(Position::ScriptToken));
+        assert_eq!(position("npm run-script"), Some(Position::CommandToken));
+        assert_eq!(position("npm run-script "), Some(Position::ScriptToken));
+        assert_eq!(position("npm run-script bu"), Some(Position::ScriptToken));
         assert_eq!(
             position("npm run --if-present bu"),
             Some(Position::ScriptToken)

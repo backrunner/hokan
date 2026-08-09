@@ -579,6 +579,149 @@ pub(crate) fn wrapper_working_directories_for_shell<'a>(
     wrapper_working_directories_impl(words, command_index, Some(shell))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EnvironmentChange<'a> {
+    Clear,
+    Set { name: &'a str, value: &'a str },
+    Unset(&'a str),
+}
+
+/// Environment changes applied before the effective command. This follows the
+/// same wrapper grammar as command discovery, but records only statically
+/// knowable assignment, `env -i/-u`, and `exec -c` effects.
+pub(crate) fn wrapper_environment_changes_for_shell<'a>(
+    words: &'a [&'a str],
+    command_index: usize,
+    shell: crate::shell::ShellKind,
+) -> Vec<EnvironmentChange<'a>> {
+    let mut changes = Vec::new();
+    let mut index = 0;
+    while index < command_index
+        && words
+            .get(index)
+            .is_some_and(|word| is_assignment_word(word))
+    {
+        push_environment_assignment(&mut changes, words[index]);
+        index += 1;
+    }
+
+    while index < command_index {
+        let wrapper = basename(words[index]);
+        if !COMMAND_WRAPPERS.contains(&wrapper) || !wrapper_supported(wrapper, Some(shell)) {
+            break;
+        }
+        index += 1;
+        while index < command_index {
+            let word = words[index];
+            if matches!(wrapper, "env" | "sudo") && is_assignment_word(word) {
+                push_environment_assignment(&mut changes, word);
+                index += 1;
+                continue;
+            }
+            if word == "--" {
+                index += 1;
+                break;
+            }
+            if !word.starts_with('-') || word == "-" {
+                break;
+            }
+            if wrapper == "env" {
+                if let Some((name, consumed)) = env_unset_name(words, index, command_index) {
+                    changes.push(EnvironmentChange::Unset(name));
+                    index += consumed;
+                    continue;
+                }
+                if env_clears_environment(word) {
+                    changes.push(EnvironmentChange::Clear);
+                    index += 1;
+                    continue;
+                }
+            } else if wrapper == "exec" && exec_clears_environment(word) {
+                changes.push(EnvironmentChange::Clear);
+                index += 1;
+                continue;
+            }
+            if wrapper == "env"
+                && matches!(
+                    word.split_once('=').map_or(word, |(flag, _)| flag),
+                    "-S" | "--split-string"
+                )
+            {
+                return changes;
+            }
+            if option_takes_value(wrapper, word) {
+                index += if option_has_attached_value(wrapper, word) {
+                    1
+                } else {
+                    2
+                };
+                continue;
+            }
+            if option_without_value(wrapper, word) {
+                index += 1;
+                continue;
+            }
+            return changes;
+        }
+
+        while index < command_index
+            && matches!(wrapper, "env" | "sudo")
+            && words
+                .get(index)
+                .is_some_and(|word| is_assignment_word(word))
+        {
+            push_environment_assignment(&mut changes, words[index]);
+            index += 1;
+        }
+        if wrapper == "timeout" && index < command_index {
+            index += 1;
+        }
+    }
+    changes
+}
+
+fn push_environment_assignment<'a>(changes: &mut Vec<EnvironmentChange<'a>>, word: &'a str) {
+    if let Some((name, value)) = word.split_once('=') {
+        changes.push(EnvironmentChange::Set { name, value });
+    }
+}
+
+fn env_unset_name<'a>(
+    words: &'a [&'a str],
+    index: usize,
+    command_index: usize,
+) -> Option<(&'a str, usize)> {
+    let word = *words.get(index)?;
+    if let Some((flag, value)) = word.split_once('=')
+        && matches!(flag, "-u" | "--unset")
+        && !value.is_empty()
+    {
+        return Some((value, 1));
+    }
+    if let Some(value) = word.strip_prefix("-u")
+        && !value.is_empty()
+    {
+        return Some((value, 1));
+    }
+    if !matches!(word, "-u" | "--unset") || index + 1 >= command_index {
+        return None;
+    }
+    Some((words[index + 1], 2))
+}
+
+fn env_clears_environment(word: &str) -> bool {
+    let option = word.split_once('=').map_or(word, |(name, _)| name);
+    option == "--ignore-environment"
+        || option
+            .strip_prefix('-')
+            .is_some_and(|flags| !flags.starts_with('-') && flags.contains('i'))
+}
+
+fn exec_clears_environment(word: &str) -> bool {
+    word.strip_prefix('-')
+        .is_some_and(|flags| !flags.starts_with('-') && flags.contains('c'))
+}
+
 fn wrapper_working_directories_impl<'a>(
     words: &'a [&'a str],
     command_index: usize,
@@ -1665,6 +1808,75 @@ mod tests {
                 "wrapper directories for {words:?}"
             );
         }
+    }
+
+    #[test]
+    fn wrapper_environment_changes_follow_execution_order() {
+        let words = [
+            "A=one", "env", "-i", "B=two", "env", "-u", "A", "C=three", "python",
+        ];
+        let command_index = effective_command_index(&words).expect("effective command");
+        assert_eq!(
+            wrapper_environment_changes_for_shell(
+                &words,
+                command_index,
+                crate::shell::ShellKind::Bash,
+            ),
+            [
+                EnvironmentChange::Set {
+                    name: "A",
+                    value: "one",
+                },
+                EnvironmentChange::Clear,
+                EnvironmentChange::Set {
+                    name: "B",
+                    value: "two",
+                },
+                EnvironmentChange::Unset("A"),
+                EnvironmentChange::Set {
+                    name: "C",
+                    value: "three",
+                },
+            ]
+        );
+
+        let words = [
+            "sudo",
+            "-p",
+            "PYTHONPATH=not-an-assignment",
+            "env",
+            "--unset=PYTHONHOME",
+            "PYTHONPATH=src",
+            "exec",
+            "-c",
+            "python",
+        ];
+        let command_index = effective_command_index(&words).expect("effective command");
+        assert_eq!(
+            wrapper_environment_changes_for_shell(
+                &words,
+                command_index,
+                crate::shell::ShellKind::Bash,
+            ),
+            [
+                EnvironmentChange::Unset("PYTHONHOME"),
+                EnvironmentChange::Set {
+                    name: "PYTHONPATH",
+                    value: "src",
+                },
+            ]
+        );
+
+        let words = ["exec", "-c", "python"];
+        let command_index = effective_command_index(&words).expect("effective command");
+        assert_eq!(
+            wrapper_environment_changes_for_shell(
+                &words,
+                command_index,
+                crate::shell::ShellKind::Bash,
+            ),
+            [EnvironmentChange::Clear]
+        );
     }
 
     #[test]

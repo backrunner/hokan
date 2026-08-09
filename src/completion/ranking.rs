@@ -15,6 +15,24 @@ pub fn rank_and_dedupe(
     limit: usize,
 ) -> Vec<Candidate> {
     let query = context.parsed.current_prefix.as_str();
+    let exact_path_command = !query.is_empty()
+        && candidates.iter().any(|candidate| {
+            candidate.query_id == context.query_id
+                && has_valid_edit(context, candidate)
+                && candidate.source == crate::completion::CandidateSource::PathCommand
+                && candidate.kind == CandidateKind::Command
+                && produces_current_buffer(context, candidate)
+        });
+    let exact_explicit_executable = !query.is_empty()
+        && (crate::providers::explicit_executable_path_position(context)
+            || crate::providers::explicit_executable_argument_path_position(context))
+        && candidates.iter().any(|candidate| {
+            candidate.query_id == context.query_id
+                && has_valid_edit(context, candidate)
+                && candidate.source == crate::completion::CandidateSource::Filesystem
+                && candidate.kind == CandidateKind::File
+                && produces_current_buffer(context, candidate)
+        });
     let direct_command_match = !query.is_empty()
         && candidates.iter().any(|candidate| {
             candidate.query_id == context.query_id
@@ -58,6 +76,19 @@ pub fn rank_and_dedupe(
         {
             continue;
         }
+        if exact_path_command
+            && candidate.source == crate::completion::CandidateSource::PathCommand
+            && candidate.kind == CandidateKind::Command
+            && !produces_current_buffer(context, &candidate)
+        {
+            continue;
+        }
+        if exact_explicit_executable
+            && candidate.source == crate::completion::CandidateSource::Filesystem
+            && !produces_current_buffer(context, &candidate)
+        {
+            continue;
+        }
         if exact_token_sources.contains(&candidate.source)
             && exact_token_domain(&candidate)
             && !produces_current_buffer(context, &candidate)
@@ -85,6 +116,24 @@ pub fn rank_and_dedupe(
             })
             .max(replacement_match)
             .max(display_match);
+        // Command-token providers are completion domains, not search results.
+        // In normal mode, substring/subsequence matches are too weak to
+        // justify changing what the user typed. Curated specs retain their
+        // provider-level compatibility checks and the generic match gate
+        // below.
+        if context.mode == crate::completion::CompletionMode::Normal
+            && !query.is_empty()
+            && candidate.kind == CandidateKind::Command
+            && matches!(
+                candidate.source,
+                crate::completion::CandidateSource::PathCommand
+                    | crate::completion::CandidateSource::CommandHelp
+                    | crate::completion::CandidateSource::Project
+            )
+            && best_match.priority < 3
+        {
+            continue;
+        }
         candidate.score.match_priority = best_match.priority;
         candidate.score.continuation_priority = u8::from(continuation_match.is_some());
         candidate.score.command_priority = command_priority(context, &candidate);
@@ -691,6 +740,84 @@ mod tests {
     }
 
     #[test]
+    fn exact_path_command_closes_longer_executable_siblings() {
+        let context = buffer_context("git");
+        let command = |name: &str| {
+            Candidate::new(
+                context.query_id,
+                name,
+                "command",
+                Some(TextEdit {
+                    range: 0..3,
+                    replacement: name.into(),
+                    cursor_after: CursorPlacement::End,
+                }),
+                CandidateAction::Insert,
+                CandidateSource::PathCommand,
+                CandidateKind::Command,
+                Completeness::Runnable,
+                RiskLevel::Low,
+                format!("path:{name}"),
+            )
+        };
+        let help = Candidate::new(
+            context.query_id,
+            "git status",
+            "subcommand",
+            Some(TextEdit {
+                range: 0..3,
+                replacement: "git status".into(),
+                cursor_after: CursorPlacement::End,
+            }),
+            CandidateAction::InsertAndContinue {
+                next_slot: crate::completion::SlotKind::Path,
+            },
+            CandidateSource::CommandHelp,
+            CandidateKind::Command,
+            Completeness::NeedsInput {
+                slot: crate::completion::SlotKind::Path,
+            },
+            RiskLevel::Low,
+            "help:git",
+        );
+
+        let ranked = rank_and_dedupe(
+            &context,
+            vec![command("git"), command("git-helper"), help],
+            10,
+        );
+        assert_eq!(
+            ranked
+                .iter()
+                .map(|candidate| candidate.display.primary.as_str())
+                .collect::<Vec<_>>(),
+            ["git status"]
+        );
+    }
+
+    #[test]
+    fn command_rows_require_a_prefix_even_without_a_direct_sibling() {
+        let context = buffer_context("cgd");
+        let fuzzy = Candidate::new(
+            context.query_id,
+            "cargo-doc",
+            "command",
+            Some(TextEdit {
+                range: 0..3,
+                replacement: "cargo-doc".into(),
+                cursor_after: CursorPlacement::End,
+            }),
+            CandidateAction::Insert,
+            CandidateSource::PathCommand,
+            CandidateKind::Command,
+            Completeness::Runnable,
+            RiskLevel::Unknown,
+            "path:cargo-doc",
+        );
+        assert!(rank_and_dedupe(&context, vec![fuzzy], 10).is_empty());
+    }
+
+    #[test]
     fn executable_name_beats_same_family_history_at_the_command_slot() {
         let context = buffer_context("cod");
         let mut history = history_candidate(&context, "codex --resume latest", 3);
@@ -748,7 +875,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_token_suppresses_scattered_fuzzy_rows_but_keeps_longer_prefixes() {
+    fn exact_explicit_executable_closes_longer_and_fuzzy_path_rows() {
         let context = buffer_context("./run");
         let path = |name: &str| {
             Candidate::new(
@@ -778,7 +905,7 @@ mod tests {
             .iter()
             .map(|candidate| candidate.display.primary.as_str())
             .collect();
-        assert_eq!(rows, ["./runner"]);
+        assert!(rows.is_empty());
     }
 
     #[test]

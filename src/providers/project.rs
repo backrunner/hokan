@@ -19,11 +19,14 @@ use crate::{
     terminal::RiskLevel,
 };
 
+use super::CommandHelpCache;
+
 pub struct ProjectProvider {
     cache: Arc<ProjectCache>,
     makefiles: MakefileCache,
     commands: Arc<CommandPathCache>,
     history: Arc<RwLock<HistoryIndex>>,
+    help: Option<Arc<CommandHelpCache>>,
     workspaces: NodeWorkspaceCache,
 }
 
@@ -39,8 +42,15 @@ impl ProjectProvider {
             makefiles: MakefileCache::default(),
             commands,
             history,
+            help: None,
             workspaces: NodeWorkspaceCache::default(),
         }
+    }
+
+    #[must_use]
+    pub fn with_help(mut self, help: Arc<CommandHelpCache>) -> Self {
+        self.help = Some(help);
+        self
     }
 }
 
@@ -50,17 +60,22 @@ impl CandidateProvider for ProjectProvider {
     }
 
     fn applies(&self, context: &CompletionContext) -> bool {
+        if node_run_position(context).is_some() {
+            let Some(executable) =
+                crate::providers::resolved_executable_path(context, &self.commands)
+            else {
+                return false;
+            };
+            return self.node_run_supported(context, executable);
+        }
         if filter_position(context).is_some()
             || manager_option_position(context).is_some()
             || manager_position(context).is_some()
         {
-            let Some(command) = context.command() else {
-                return false;
-            };
             return if crate::providers::corepack_dispatch(context) {
                 self.commands.contains("corepack")
             } else {
-                self.commands.contains(command)
+                crate::providers::resolved_executable_path(context, &self.commands).is_some()
             };
         }
         rule_file_invocation(context).is_some_and(|invocation| {
@@ -74,7 +89,9 @@ impl CandidateProvider for ProjectProvider {
     }
 
     fn complete(&self, context: &CompletionContext) -> ProviderOutput {
-        let mut output = if let Some(position) = manager_option_position(context) {
+        let mut output = if let Some(position) = node_run_position(context) {
+            self.complete_node_run_scripts(context, &position)
+        } else if let Some(position) = manager_option_position(context) {
             self.complete_manager_options(context, position)
         } else if let Some(position) = filter_position(context) {
             self.complete_filtered(context, position)
@@ -110,6 +127,92 @@ impl CandidateProvider for ProjectProvider {
 }
 
 impl ProjectProvider {
+    fn node_run_supported(
+        &self,
+        context: &CompletionContext,
+        executable: std::path::PathBuf,
+    ) -> bool {
+        let Some(cache) = self.help.as_ref() else {
+            return true;
+        };
+        let Some(command) = context.command() else {
+            return false;
+        };
+        if let Some(help) = cache.peek(command) {
+            return help.flags.iter().any(|entry| entry.name == "--run");
+        }
+        cache.request(command, Some(executable));
+        false
+    }
+
+    fn complete_node_run_scripts(
+        &self,
+        context: &CompletionContext,
+        position: &NodeRunPosition<'_>,
+    ) -> ProviderOutput {
+        let Some(manifest) = (match self.cache.load_nearest(&position.project_dir) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                return ProviderOutput {
+                    candidates: Vec::new(),
+                    diagnostics: vec![ProviderDiagnostic {
+                        provider: self.id(),
+                        code: "HK-PROJ-001",
+                        message: error.to_string(),
+                    }],
+                };
+            }
+        }) else {
+            return ProviderOutput::default();
+        };
+        let origin = manifest
+            .path
+            .strip_prefix(context.cwd.as_ref())
+            .unwrap_or(&manifest.path)
+            .display()
+            .to_string();
+        let folded_prefix = position.prefix.to_lowercase();
+        let now_ms = crate::history_now_ms();
+        let invocation = context.command().unwrap_or("node");
+        let candidates = manifest
+            .scripts
+            .iter()
+            .filter(|(name, _)| name.to_lowercase().starts_with(&folded_prefix))
+            .map(|(name, command)| {
+                let escaped = escape_for_shell(name, QuoteContext::Unquoted, context.shell);
+                let replacement = format!("--run={escaped}");
+                let display =
+                    resulting_primary(context, &replacement, &format!("{invocation} --run={name}"));
+                let mut candidate = Candidate::new(
+                    context.query_id,
+                    &display,
+                    truncate(command, 100),
+                    Some(TextEdit {
+                        range: context.parsed.replacement.clone(),
+                        replacement,
+                        cursor_after: CursorPlacement::End,
+                    }),
+                    CandidateAction::Insert,
+                    CandidateSource::Project,
+                    CandidateKind::ProjectScript,
+                    Completeness::Runnable,
+                    crate::safety::classify_command(command).level,
+                    format!("project:{origin}:node-run:{name}"),
+                );
+                candidate.display.annotation = Some(origin.clone());
+                candidate.score.cwd_affinity = 100;
+                if let Ok(index) = self.history.read() {
+                    candidate.score.frecency = index.usage_frecency(&display, now_ms);
+                }
+                candidate
+            })
+            .collect();
+        ProviderOutput {
+            candidates,
+            diagnostics: Vec::new(),
+        }
+    }
+
     fn complete_manager_options(
         &self,
         context: &CompletionContext,
@@ -222,6 +325,9 @@ impl ProjectProvider {
                 {
                     return None;
                 }
+                if !script_name_matches(context, position, &name) {
+                    return None;
+                }
                 let mut candidate = self.script_candidate(
                     context,
                     spec,
@@ -288,11 +394,12 @@ impl ProjectProvider {
             .scripts
             .iter()
             .filter(|(name, _)| {
-                !command_position
-                    || !spec
-                        .subcommands
-                        .iter()
-                        .any(|(subcommand, _)| *subcommand == name.as_str())
+                script_name_matches(context, position, name)
+                    && (!command_position
+                        || !spec
+                            .subcommands
+                            .iter()
+                            .any(|(subcommand, _)| *subcommand == name.as_str()))
             })
             .map(|(name, script)| {
                 self.script_candidate(context, spec, position, name, script, &relative, now_ms)
@@ -333,6 +440,7 @@ impl ProjectProvider {
             candidates: manifest
                 .tasks
                 .iter()
+                .filter(|(name, _)| script_name_matches(context, position, name))
                 .map(|(name, command)| {
                     self.script_candidate(context, spec, position, name, command, &relative, now_ms)
                 })
@@ -354,20 +462,21 @@ impl ProjectProvider {
     ) -> Candidate {
         let escaped = escape_for_shell(name, QuoteContext::Unquoted, context.shell);
         let keyword = spec.keyword.unwrap_or("run");
+        let invocation = context.command().unwrap_or(spec.name);
         // Native form: pnpm/yarn/bun run scripts directly, npm needs `run`,
         // deno needs `task`. The keyword positions keep the keyword in place.
         let canonical = match (spec.keyword, position) {
             (None, Position::KeywordWord | Position::ScriptToken) => {
-                format!("{} run {name}", spec.name)
+                format!("{invocation} run {name}")
             }
-            (None, _) => format!("{} {name}", spec.name),
-            (Some(keyword), _) => format!("{} {keyword} {name}", spec.name),
+            (None, _) => format!("{invocation} {name}"),
+            (Some(keyword), _) => format!("{invocation} {keyword} {name}"),
         };
         let replacement = match position {
             Position::ScriptToken => escaped.clone(),
             Position::KeywordWord => format!("{keyword} {escaped}"),
             Position::CommandToken => escaped.clone(),
-            Position::ManagerWord => format!("{} {escaped}", spec.name),
+            Position::ManagerWord => format!("{invocation} {escaped}"),
         };
         let display = resulting_primary(context, &replacement, &canonical);
         let mut candidate = Candidate::new(
@@ -404,16 +513,18 @@ impl ProjectProvider {
         position: Position,
     ) -> ProviderOutput {
         let now_ms = crate::history_now_ms();
+        let invocation = context.command().unwrap_or(spec.name);
         let candidates = spec
             .subcommands
             .iter()
-            .map(|(name, description)| {
+            .enumerate()
+            .map(|(index, (name, description))| {
                 let replacement = match position {
-                    Position::ManagerWord => format!("{} {name}", spec.name),
+                    Position::ManagerWord => format!("{invocation} {name}"),
                     _ => (*name).to_owned(),
                 };
                 let display =
-                    resulting_primary(context, &replacement, &format!("{} {name}", spec.name));
+                    resulting_primary(context, &replacement, &format!("{invocation} {name}"));
                 let mut candidate = Candidate::new(
                     context.query_id,
                     &display,
@@ -435,6 +546,8 @@ impl ProjectProvider {
                 if let Ok(index) = self.history.read() {
                     candidate.score.frecency = index.usage_frecency(&display, now_ms);
                 }
+                candidate.score.spec_priority =
+                    i16::try_from(spec.subcommands.len().saturating_sub(index)).unwrap_or_default();
                 candidate
             })
             .collect();
@@ -600,6 +713,7 @@ impl ProjectProvider {
             member
                 .scripts
                 .iter()
+                .filter(|(name, _)| script_name_matches(context, position, name))
                 .map(|(name, script)| {
                     self.member_script_candidate(
                         context,
@@ -704,6 +818,7 @@ impl ProjectProvider {
         let candidates = manifest
             .targets
             .iter()
+            .filter(|target| token_name_matches(context, &target.name))
             .map(|target| {
                 let escaped = escape_for_shell(&target.name, QuoteContext::Unquoted, context.shell);
                 let mut candidate = Candidate::new(
@@ -735,6 +850,140 @@ impl ProjectProvider {
             diagnostics: Vec::new(),
         }
     }
+}
+
+fn script_name_matches(context: &CompletionContext, position: Position, name: &str) -> bool {
+    matches!(position, Position::ManagerWord | Position::KeywordWord)
+        || token_name_matches(context, name)
+}
+
+fn token_name_matches(context: &CompletionContext, name: &str) -> bool {
+    let query = context.parsed.current_prefix.as_str();
+    query.is_empty() || name.to_lowercase().starts_with(&query.to_lowercase())
+}
+
+struct NodeRunPosition<'a> {
+    prefix: &'a str,
+    project_dir: std::path::PathBuf,
+}
+
+fn node_run_position(context: &CompletionContext) -> Option<NodeRunPosition<'_>> {
+    if crate::providers::redirect_target(context)
+        || !crate::providers::effective_command_accepts_external(context)
+    {
+        return None;
+    }
+    let command = crate::providers::executable_basename(context.command()?);
+    if !matches!(command, "node" | "nodejs") {
+        return None;
+    }
+    let prefix = context.parsed.current_prefix.strip_prefix("--run=")?;
+    if prefix
+        .chars()
+        .any(|character| matches!(character, '$' | '`' | '*' | '?' | '[' | '{'))
+    {
+        return None;
+    }
+    let (words, position) = crate::providers::argument_progress(context)?;
+    let before = words.get(1..=position).unwrap_or_default();
+    node_options_allow_run(before).then(|| NodeRunPosition {
+        prefix,
+        project_dir: crate::providers::invocation_working_directory(context),
+    })
+}
+
+fn node_options_allow_run(arguments: &[&str]) -> bool {
+    let mut index = 0;
+    while let Some(word) = arguments.get(index).copied() {
+        if word == "--"
+            || word == "-"
+            || word == "--run"
+            || word.starts_with("--run=")
+            || matches!(
+                word,
+                "-c" | "--check"
+                    | "-e"
+                    | "--eval"
+                    | "-p"
+                    | "--print"
+                    | "--completion-bash"
+                    | "-h"
+                    | "--help"
+                    | "-v"
+                    | "--version"
+                    | "--v8-options"
+                    | "--prof-process"
+            )
+            || word.starts_with("--eval=")
+            || word.starts_with("--print=")
+            || word.len() > 2 && matches!(&word[..2], "-e" | "-p")
+        {
+            return false;
+        }
+        if node_option_takes_separate_value(word) {
+            if index + 1 >= arguments.len() {
+                return false;
+            }
+            index += 2;
+            continue;
+        }
+        if !word.starts_with('-') {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
+fn node_option_takes_separate_value(word: &str) -> bool {
+    matches!(
+        word,
+        "-C" | "--conditions"
+            | "--cpu-prof-dir"
+            | "--cpu-prof-interval"
+            | "--cpu-prof-name"
+            | "--diagnostic-dir"
+            | "--disable-proto"
+            | "--disable-warning"
+            | "--dns-result-order"
+            | "--env-file"
+            | "--env-file-if-exists"
+            | "--experimental-config-file"
+            | "--experimental-default-type"
+            | "--experimental-loader"
+            | "--loader"
+            | "--heap-prof-dir"
+            | "--heap-prof-interval"
+            | "--heap-prof-name"
+            | "--icu-data-dir"
+            | "--import"
+            | "--input-type"
+            | "--inspect-port"
+            | "--localstorage-file"
+            | "--openssl-config"
+            | "--redirect-warnings"
+            | "--report-directory"
+            | "--report-filename"
+            | "-r"
+            | "--require"
+            | "--snapshot-blob"
+            | "--test-name-pattern"
+            | "--test-reporter"
+            | "--test-reporter-destination"
+            | "--test-shard"
+            | "--test-skip-pattern"
+            | "--test-timeout"
+            | "--title"
+            | "--tls-cipher-list"
+            | "--tls-keylog"
+            | "--trace-event-categories"
+            | "--trace-event-file-pattern"
+            | "--unhandled-rejections"
+            | "--use-largepages"
+            | "--v8-pool-size"
+            | "--watch-kill-signal"
+            | "--watch-path"
+    )
 }
 
 struct RecursiveScript {
@@ -904,12 +1153,17 @@ fn restrict_after_exact_edit(context: &CompletionContext, candidates: &mut Vec<C
         return;
     }
     let escaped = escape_for_shell(query, QuoteContext::Unquoted, context.shell);
-    let exact = candidates.iter().any(|candidate| {
+    let exact_choice = candidates.iter().find(|candidate| {
         candidate
             .edit
             .as_ref()
             .is_some_and(|edit| edit.replacement == escaped)
     });
+    if exact_choice.is_some_and(|candidate| candidate.kind == CandidateKind::Command) {
+        candidates.clear();
+        return;
+    }
+    let exact = exact_choice.is_some();
     if !exact {
         return;
     }
@@ -1201,6 +1455,120 @@ mod tests {
         );
     }
 
+    #[test]
+    fn node_run_completes_only_attached_package_script_values() {
+        let directory = tempfile::tempdir().expect("project");
+        fs::write(
+            directory.path().join("package.json"),
+            r#"{"scripts":{"build":"vite build","build docs":"vitepress build","test":"vitest"}}"#,
+        )
+        .expect("manifest");
+        fs::create_dir(directory.path().join("app")).expect("nested project");
+        fs::write(
+            directory.path().join("app/package.json"),
+            r#"{"scripts":{"bundle":"vite build"}}"#,
+        )
+        .expect("nested manifest");
+        let commands = command_cache(directory.path(), &["node", "nodejs"]);
+        let mut engine = CompletionEngine::new(100, 20);
+        engine.register(ProjectProvider::new(
+            Arc::new(ProjectCache::default()),
+            commands,
+            Arc::new(RwLock::new(HistoryIndex::default())),
+        ));
+        let rows = |text: &str, query: u64| {
+            let context = CompletionContext::new(
+                QueryId::new(query),
+                ShellKind::Zsh,
+                directory.path().to_owned(),
+                BufferSnapshot::new(
+                    text,
+                    text.len(),
+                    BufferRevision::new(query),
+                    SyncQuality::Exact,
+                )
+                .expect("buffer"),
+            )
+            .expect("context");
+            engine
+                .complete(&context)
+                .candidates
+                .into_iter()
+                .map(|candidate| candidate.display.primary)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            rows("node --run=bu", 30),
+            ["node --run=build", "node --run='build docs'"]
+        );
+        assert_eq!(
+            rows("node -r preload --run=bu", 31),
+            [
+                "node -r preload --run=build",
+                "node -r preload --run='build docs'",
+            ]
+        );
+        assert_eq!(rows("nodejs --run=te", 32), ["nodejs --run=test"]);
+        assert_eq!(
+            rows("env -C app node --run=bu", 33),
+            ["env -C app node --run=bundle"]
+        );
+        for text in [
+            "node --run bu",
+            "node app.js --run=bu",
+            "node --eval code --run=bu",
+            "node --run=missing",
+        ] {
+            assert!(rows(text, 34).is_empty(), "unexpected row for {text:?}");
+        }
+    }
+
+    #[test]
+    fn node_run_requires_the_installed_node_help_to_expose_the_flag() {
+        let directory = tempfile::tempdir().expect("project");
+        let commands = command_cache(directory.path(), &["node"]);
+        let help = Arc::new(CommandHelpCache::default());
+        let provider = ProjectProvider::new(
+            Arc::new(ProjectCache::default()),
+            commands,
+            Arc::new(RwLock::new(HistoryIndex::default())),
+        )
+        .with_help(Arc::clone(&help));
+        let context = CompletionContext::new(
+            QueryId::new(40),
+            ShellKind::Zsh,
+            directory.path().to_owned(),
+            BufferSnapshot::new(
+                "node --run=bu",
+                "node --run=bu".len(),
+                BufferRevision::new(40),
+                SyncQuality::Exact,
+            )
+            .expect("buffer"),
+        )
+        .expect("context");
+
+        help.seed(
+            "node",
+            crate::providers::command_help::CommandHelp::default(),
+        );
+        assert!(!provider.applies(&context));
+
+        help.seed(
+            "node",
+            crate::providers::command_help::CommandHelp {
+                flags: vec![crate::providers::command_help::HelpEntry {
+                    name: "--run".into(),
+                    description: "Run a package.json script".into(),
+                    takes_value: false,
+                }],
+                ..crate::providers::command_help::CommandHelp::default()
+            },
+        );
+        assert!(provider.applies(&context));
+    }
+
     fn bare_prefix_setup(buffer: &str) -> (tempfile::TempDir, CompletionContext, CompletionEngine) {
         let directory = tempfile::tempdir().expect("project");
         fs::write(
@@ -1245,6 +1613,92 @@ mod tests {
         let edit = candidate.edit.as_ref().expect("edit");
         assert_eq!(edit.range, 5..7);
         assert_eq!(edit.replacement, "'build docs'");
+
+        let (_directory, context, engine) = bare_prefix_setup("npm run-script bu");
+        let output = engine.complete(&context);
+        let candidate = output.candidates.first().expect("npm script candidate");
+        assert_eq!(candidate.display.primary, "npm run-script 'build docs'");
+        assert_eq!(
+            candidate.edit.as_ref().expect("edit").replacement,
+            "'build docs'"
+        );
+    }
+
+    #[test]
+    fn explicit_manager_paths_preserve_the_invocation() {
+        let (directory, _, engine) = bare_prefix_setup("pnpm");
+        let rows = |text: &str, query: u64| {
+            let context = CompletionContext::new(
+                QueryId::new(query),
+                ShellKind::Zsh,
+                directory.path().to_owned(),
+                BufferSnapshot::new(
+                    text,
+                    text.len(),
+                    BufferRevision::new(query),
+                    SyncQuality::Exact,
+                )
+                .expect("buffer"),
+            )
+            .expect("context");
+            engine
+                .complete(&context)
+                .candidates
+                .into_iter()
+                .map(|candidate| candidate.display.primary)
+                .collect::<Vec<_>>()
+        };
+
+        assert!(
+            rows("./bin/pnpm", 20)
+                .iter()
+                .any(|row| row == "./bin/pnpm install")
+        );
+        assert_eq!(rows("./bin/pnpm bu", 21), ["./bin/pnpm 'build docs'"]);
+    }
+
+    #[test]
+    fn project_scripts_require_a_real_name_prefix() {
+        for buffer in ["pnpm bid", "pnpm run bid", "npm run bid"] {
+            let (_directory, context, engine) = bare_prefix_setup(buffer);
+            assert!(
+                engine.complete(&context).candidates.is_empty(),
+                "a scattered script-name match leaked for {buffer:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn manager_command_surfaces_cover_common_prefixes() {
+        for (buffer, expected) in [
+            ("npm ca", "npm cache"),
+            ("pnpm pat", "pnpm patch"),
+            ("yarn upgr", "yarn upgrade"),
+            ("bun rep", "bun repl"),
+            ("deno cov", "deno coverage"),
+        ] {
+            let (_directory, context, engine) = bare_prefix_setup(buffer);
+            let rows: Vec<_> = engine
+                .complete(&context)
+                .candidates
+                .into_iter()
+                .map(|candidate| candidate.display.primary)
+                .collect();
+            assert!(
+                rows.iter().any(|row| row == expected),
+                "missing {expected:?} for {buffer:?}: {rows:?}"
+            );
+        }
+
+        let (_directory, context, engine) = bare_prefix_setup("npm ");
+        assert_eq!(
+            engine
+                .complete(&context)
+                .candidates
+                .first()
+                .map(|candidate| candidate.display.primary.as_str()),
+            Some("npm install")
+        );
     }
 
     #[test]
