@@ -246,10 +246,38 @@ impl FilesystemProvider {
             slot.base_dir = Some(command_base);
             return Some(slot);
         }
+        if let Some(value) = response_file_prefix(command, prefix) {
+            return Some(FilesystemSlot {
+                kind: SlotKind::Path,
+                prefix: value,
+                edit_prefix: "@",
+                base_dir: Some(command_base.clone()),
+            });
+        }
         if command == "tar" {
             return tar_slot(context, &words, argument_position);
         }
         let flags_ended = flags_ended_before(&words, argument_position);
+        if !flags_ended
+            && let Some(mut slot) = structured_path_value_slot(
+                command,
+                words.get(argument_position).copied().unwrap_or_default(),
+                prefix,
+            )
+        {
+            slot.base_dir = Some(command_base.clone());
+            return Some(slot);
+        }
+        if !flags_ended
+            && let Some(mut slot) = hybrid_explicit_path_slot(
+                command,
+                words.get(argument_position).copied().unwrap_or_default(),
+                prefix,
+            )
+        {
+            slot.base_dir = Some(command_base.clone());
+            return Some(slot);
+        }
         // An attached flag value (`--output=fi`, `-Cdir`) owns only the value
         // suffix. Literal-value flags suppress filesystem rows; path flags
         // preserve the flag spelling in the edit.
@@ -579,6 +607,135 @@ fn explicit_path(prefix: &str) -> bool {
     prefix.starts_with(['.', '~', '/']) || (prefix.contains('/') && !non_local_path_prefix(prefix))
 }
 
+fn response_file_prefix<'a>(command: &str, prefix: &'a str) -> Option<&'a str> {
+    let supported = super::is_c_family_compiler(command)
+        || matches!(
+            command,
+            "javac"
+                | "rustc"
+                | "rustdoc"
+                | "swiftc"
+                | "kotlinc"
+                | "kotlinc-jvm"
+                | "kotlinc-js"
+                | "kotlinc-native"
+                | "konanc"
+        );
+    supported.then(|| prefix.strip_prefix('@')).flatten()
+}
+
+fn hybrid_explicit_path_slot<'a>(
+    command: &str,
+    previous: &str,
+    prefix: &'a str,
+) -> Option<FilesystemSlot<'a>> {
+    let flags: &[&str] = match command {
+        "cargo" => &["--target", "--config"],
+        "rustc" | "rustdoc" => &["--target"],
+        "conan" => &[
+            "-pr",
+            "--profile",
+            "-pr:h",
+            "--profile:host",
+            "-pr:b",
+            "--profile:build",
+        ],
+        _ => return None,
+    };
+    if flags.contains(&previous) && explicit_path(prefix) {
+        return Some(FilesystemSlot::plain(SlotKind::Path, prefix));
+    }
+    for flag in flags {
+        let attached = format!("{flag}=");
+        if let Some(value) = prefix.strip_prefix(&attached)
+            && explicit_path(value)
+        {
+            return Some(FilesystemSlot {
+                kind: SlotKind::Path,
+                prefix: value,
+                edit_prefix: &prefix[..attached.len()],
+                base_dir: None,
+            });
+        }
+    }
+    None
+}
+
+fn structured_path_value_slot<'a>(
+    command: &str,
+    previous: &str,
+    prefix: &'a str,
+) -> Option<FilesystemSlot<'a>> {
+    let classpath_flags: &[&str] = match command {
+        "java" | "javac" => &[
+            "-cp",
+            "-classpath",
+            "--class-path",
+            "-p",
+            "--module-path",
+            "-sourcepath",
+            "--source-path",
+            "-processorpath",
+            "--processor-path",
+            "--processor-module-path",
+            "--module-source-path",
+            "--upgrade-module-path",
+        ],
+        "kotlin" | "kotlinc" | "kotlinc-jvm" | "kotlinc-js" => &["-cp", "-classpath"],
+        _ => &[],
+    };
+    if classpath_flags.contains(&previous)
+        && let Some(index) = prefix.rfind(':')
+    {
+        return Some(FilesystemSlot {
+            kind: SlotKind::Path,
+            prefix: &prefix[index + 1..],
+            edit_prefix: &prefix[..=index],
+            base_dir: None,
+        });
+    }
+    for flag in classpath_flags {
+        let attached = format!("{flag}=");
+        if let Some(value) = prefix.strip_prefix(&attached)
+            && let Some(index) = value.rfind(':')
+        {
+            let path_start = attached.len() + index + 1;
+            return Some(FilesystemSlot {
+                kind: SlotKind::Path,
+                prefix: &prefix[path_start..],
+                edit_prefix: &prefix[..path_start],
+                base_dir: None,
+            });
+        }
+    }
+
+    if matches!(command, "rustc" | "rustdoc") {
+        let value_start = if previous == "-L" {
+            0
+        } else if prefix.starts_with("-L") {
+            2
+        } else {
+            return None;
+        };
+        let value = &prefix[value_start..];
+        if let Some(index) = value.find('=')
+            && matches!(
+                &value[..index],
+                "all" | "dependency" | "crate" | "native" | "framework"
+            )
+        {
+            let path_start = value_start + index + 1;
+            return Some(FilesystemSlot {
+                kind: SlotKind::Directory,
+                prefix: &prefix[path_start..],
+                edit_prefix: &prefix[..path_start],
+                base_dir: None,
+            });
+        }
+    }
+    None
+}
+
 fn explicit_git_path(prefix: &str) -> bool {
     prefix.starts_with("./")
         || prefix.starts_with("../")
@@ -637,13 +794,39 @@ fn attached_flag_value<'a>(command: &str, word: &'a str) -> Option<AttachedFlagV
 }
 
 fn attached_short_flags(command: &str) -> &'static [&'static str] {
+    if super::is_c_family_compiler(command) {
+        return &[
+            "-isystem",
+            "-iquote",
+            "-idirafter",
+            "-include-pch",
+            "-include",
+            "-imacros",
+            "-I",
+            "-L",
+            "-F",
+            "-B",
+            "-D",
+            "-U",
+            "-o",
+            "-x",
+        ];
+    }
     match command {
         "git" | "make" => &["-C"],
         "pnpm" => &["-C", "-F"],
         "npm" => &["-w"],
         "just" => &["-d", "-f"],
         "curl" => &["-o", "-K", "-T", "-d"],
-        "cargo" => &["-j"],
+        "cargo" => &["-C", "-F", "-p", "-j"],
+        "rustc" => &["-L", "-l", "-o", "-A", "-W", "-D", "-F", "-C"],
+        "rustdoc" => &["-L", "-o", "-A", "-W", "-D", "-F"],
+        "cmake" => &["-S", "-B", "-C", "-P", "-G", "-D", "-U"],
+        "ninja" => &["-C", "-f", "-j", "-k", "-l"],
+        "meson" => &["-C"],
+        "gradle" | "gradlew" => &["-b", "-c", "-g", "-I", "-p"],
+        "mvn" | "mvnw" | "mvnDebug" => &["-f", "-s", "-t"],
+        "swift" | "swiftc" => &["-I", "-L", "-F", "-D", "-o", "-j"],
         "python" => &["-c", "-m", "-W", "-X"],
         "ruby" => &["-e", "-r", "-E", "-C", "-I"],
         "perl" => &["-e", "-E", "-M", "-m", "-F", "-I"],
@@ -733,9 +916,37 @@ fn default_path_slot(command: &str, words: &[&str], argument_position: usize) ->
         | "realpath" | "dirname" | "basename" | "open" | "xdg-open" | "vi" | "vim" | "nvim"
         | "nano" | "emacs" | "code" | "diff" | "cmp" | "tee" | "zip" | "rsync" | "scp" | "gzip"
         | "gunzip" | "bzip2" | "bunzip2" | "xz" | "unxz" | "sha1sum" | "sha256sum" | "md5"
-        | "md5sum" | "gcc" | "clang" | "cc" | "g++" | "clang++" | "javac" | "rustc" => {
+        | "md5sum" | "javac" | "swiftc" | "kotlinc" | "kotlinc-jvm" | "kotlinc-js"
+        | "kotlinc-native" | "konanc" | "rustfmt" | "gofmt" | "goimports" | "clang-format"
+        | "clang-tidy" | "swift-format" | "swiftformat" | "ktlint" => Some(SlotKind::Path),
+        command if super::is_c_family_compiler(command) => Some(SlotKind::Path),
+        "rustc" | "rustdoc" if rust_input_path_slot(command, words, argument_position) => {
             Some(SlotKind::Path)
         }
+        "kotlin"
+            if !flag_before_active(command, words, argument_position, &["-e", "-expression"])
+                && positional_arguments_before(command, words, argument_position, &[])
+                    .is_some_and(|count| count == 0) =>
+        {
+            Some(SlotKind::Path)
+        }
+        "swift"
+            if positional_arguments_before(command, words, argument_position, &[])
+                .is_some_and(|count| count == 0) =>
+        {
+            Some(SlotKind::Path)
+        }
+        "cargo" if cargo_positional_path_slot(words, argument_position) => Some(SlotKind::NewFile),
+        "go" if go_source_path_slot(words, argument_position) => Some(SlotKind::Path),
+        "go" if go_work_directory_slot(words, argument_position) => Some(SlotKind::Directory),
+        "go" if go_version_path_slot(words, argument_position) => Some(SlotKind::Path),
+        "cmake" if cmake_source_directory_slot(words, argument_position) => {
+            Some(SlotKind::Directory)
+        }
+        "rustup" if rustup_toolchain_link_path_slot(words, argument_position) => {
+            Some(SlotKind::Directory)
+        }
+        "meson" if meson_directory_slot(words, argument_position) => Some(SlotKind::Directory),
         "source" | "." | "unzip"
             if positional_arguments_before(command, words, argument_position, &[])
                 .is_some_and(|count| count == 0) =>
@@ -775,6 +986,78 @@ fn default_path_slot(command: &str, words: &[&str], argument_position: usize) ->
         "git" if git_path_slot(words, argument_position) => Some(SlotKind::Path),
         _ => None,
     }
+}
+
+fn cargo_positional_path_slot(words: &[&str], argument_position: usize) -> bool {
+    positional_words_before("cargo", words, argument_position).is_some_and(|positionals| {
+        matches!(positionals.as_slice(), ["new"] | ["init"] | ["vendor"])
+    })
+}
+
+fn go_work_directory_slot(words: &[&str], argument_position: usize) -> bool {
+    positional_words_before("go", words, argument_position).is_some_and(|positionals| {
+        matches!(
+            positionals.as_slice(),
+            ["work", "use", ..] | ["work", "init", ..]
+        )
+    })
+}
+
+fn go_version_path_slot(words: &[&str], argument_position: usize) -> bool {
+    positional_words_before("go", words, argument_position)
+        .is_some_and(|positionals| matches!(positionals.as_slice(), ["version", ..]))
+}
+
+fn cmake_source_directory_slot(words: &[&str], argument_position: usize) -> bool {
+    !flag_before_active(
+        "cmake",
+        words,
+        argument_position,
+        &[
+            "--preset",
+            "--build",
+            "--install",
+            "--open",
+            "-P",
+            "-E",
+            "--workflow",
+        ],
+    ) && positional_arguments_before("cmake", words, argument_position, &[])
+        .is_some_and(|count| count == 0)
+}
+
+fn rustup_toolchain_link_path_slot(words: &[&str], argument_position: usize) -> bool {
+    positional_words_before("rustup", words, argument_position)
+        .is_some_and(|positionals| matches!(positionals.as_slice(), ["toolchain", "link", _]))
+}
+
+fn meson_directory_slot(words: &[&str], argument_position: usize) -> bool {
+    positional_words_before("meson", words, argument_position).is_some_and(|positionals| {
+        matches!(
+            positionals.as_slice(),
+            ["setup"] | ["setup", _] | ["configure"]
+        )
+    })
+}
+
+fn go_source_path_slot(words: &[&str], argument_position: usize) -> bool {
+    positional_words_before("go", words, argument_position).is_some_and(|positionals| {
+        match positionals.as_slice() {
+            ["run"] | ["build"] => true,
+            ["build", inputs @ ..] => inputs.iter().all(|input| input.ends_with(".go")),
+            _ => false,
+        }
+    })
+}
+
+fn rust_input_path_slot(command: &str, words: &[&str], argument_position: usize) -> bool {
+    positional_words_before(command, words, argument_position).is_some_and(|positionals| {
+        positionals
+            .iter()
+            .filter(|word| !word.starts_with('+'))
+            .count()
+            == 0
+    })
 }
 
 fn find_start_path_slot(words: &[&str], argument_position: usize) -> bool {
@@ -833,7 +1116,7 @@ fn positional_arguments_before(
                 return None;
             }
             index += 2;
-        } else if options && word.starts_with('-') {
+        } else if options && word.starts_with('-') && word != "-" {
             index += 1;
         } else {
             positional += 1;
@@ -841,6 +1124,36 @@ fn positional_arguments_before(
         }
     }
     Some(positional)
+}
+
+fn positional_words_before<'a>(
+    command: &str,
+    words: &'a [&'a str],
+    argument_position: usize,
+) -> Option<Vec<&'a str>> {
+    let before = words.get(1..=argument_position).unwrap_or_default();
+    let mut positionals = Vec::new();
+    let mut options = true;
+    let mut index = 0;
+    while let Some(word) = before.get(index).copied() {
+        if options && word == "--" {
+            options = false;
+            index += 1;
+        } else if options && attached_flag_value(command, word).is_some() {
+            index += 1;
+        } else if options && flag_value_slot(command, word).is_some() {
+            if index + 1 >= before.len() {
+                return None;
+            }
+            index += 2;
+        } else if options && word.starts_with('-') && word != "-" {
+            index += 1;
+        } else {
+            positionals.push(word);
+            index += 1;
+        }
+    }
+    Some(positionals)
 }
 
 fn flag_before_active(
@@ -1209,14 +1522,511 @@ fn tar_old_style_options(word: &str) -> bool {
             .any(|character| matches!(character, 'c' | 'x' | 't'))
 }
 
+fn language_tool_flag_value_slot(command: &str, flag: &str) -> Option<SlotKind> {
+    if super::is_c_family_compiler(command) {
+        return c_compiler_flag_value_slot(flag);
+    }
+    match command {
+        "cargo" => cargo_flag_value_slot(flag),
+        "rustc" => rustc_flag_value_slot(flag),
+        "rustdoc" => rustdoc_flag_value_slot(flag),
+        "go" => go_flag_value_slot(flag),
+        "cmake" => cmake_flag_value_slot(flag),
+        "ctest" => ctest_flag_value_slot(flag),
+        "cpack" => cpack_flag_value_slot(flag),
+        "ninja" => ninja_flag_value_slot(flag),
+        "meson" => meson_flag_value_slot(flag),
+        "conan" => conan_flag_value_slot(flag),
+        "vcpkg" => vcpkg_flag_value_slot(flag),
+        "gradle" | "gradlew" => gradle_flag_value_slot(flag),
+        "mvn" | "mvnw" | "mvnDebug" => maven_flag_value_slot(flag),
+        "java" | "javac" => java_flag_value_slot(command, flag),
+        "kotlinc" | "kotlinc-jvm" | "kotlinc-js" | "kotlinc-native" | "konanc" | "kotlin" => {
+            kotlin_flag_value_slot(flag)
+        }
+        "swift" | "swiftc" => swift_flag_value_slot(flag),
+        "xcodebuild" => xcodebuild_flag_value_slot(flag),
+        "rustfmt" => rustfmt_flag_value_slot(flag),
+        "gofmt" | "goimports" => go_formatter_flag_value_slot(command, flag),
+        "clang-format" | "clang-tidy" => clang_tool_flag_value_slot(command, flag),
+        "swift-format" | "swiftformat" => swift_formatter_flag_value_slot(command, flag),
+        "ktlint" => ktlint_flag_value_slot(flag),
+        _ => None,
+    }
+}
+
+fn c_compiler_flag_value_slot(flag: &str) -> Option<SlotKind> {
+    match flag {
+        "-I" | "-L" | "-F" | "-Fsystem" | "-B" | "-isystem" | "-iquote" | "-idirafter"
+        | "-iframework" | "-cxx-isystem" | "--sysroot" | "-isysroot" | "--gcc-toolchain"
+        | "--cuda-path" | "--rocm-path" | "-resource-dir" => Some(SlotKind::Directory),
+        "-include" | "-imacros" | "-include-pch" | "--config" | "-fmodule-map-file"
+        | "-ivfsoverlay" => Some(SlotKind::Path),
+        "-o" | "-MF" | "-MJ" | "-dependency-file" | "-serialize-diagnostics" => {
+            Some(SlotKind::NewFile)
+        }
+        "-D" | "-U" | "-x" | "-std" | "--std" | "-stdlib" | "-target" | "--target" | "-arch"
+        | "-Xclang" | "-Xlinker" | "-mllvm" | "-fuse-ld" | "-rtlib" | "-unwindlib" | "-march"
+        | "-mcpu" | "-mtune" | "--analyzer-output" => Some(SlotKind::Value),
+        _ => None,
+    }
+}
+
+fn cargo_flag_value_slot(flag: &str) -> Option<SlotKind> {
+    match flag {
+        "-C" | "--target-dir" | "--artifact-dir" | "--path" | "--root" => Some(SlotKind::Directory),
+        "--manifest-path" | "--lockfile-path" => Some(SlotKind::Path),
+        "-p" | "--package" | "--exclude" | "-F" | "--features" | "--bin" | "--example"
+        | "--test" | "--bench" | "-j" | "--jobs" | "--target" | "--profile" | "--color"
+        | "--message-format" | "--config" | "-Z" => Some(SlotKind::Value),
+        _ => None,
+    }
+}
+
+fn rustc_flag_value_slot(flag: &str) -> Option<SlotKind> {
+    match flag {
+        "-L" | "--out-dir" | "--sysroot" => Some(SlotKind::Directory),
+        "-o" => Some(SlotKind::NewFile),
+        "--cfg" | "--check-cfg" | "-l" | "--crate-type" | "--crate-name" | "--edition"
+        | "--emit" | "--print" | "--explain" | "--target" | "-A" | "--allow" | "-W" | "--warn"
+        | "-D" | "--deny" | "-F" | "--forbid" | "--force-warn" | "--cap-lints" | "-C"
+        | "--codegen" | "--error-format" | "--json" => Some(SlotKind::Value),
+        _ => None,
+    }
+}
+
+fn rustdoc_flag_value_slot(flag: &str) -> Option<SlotKind> {
+    match flag {
+        "-L" | "-o" | "--output" | "--test-run-directory" => Some(SlotKind::Directory),
+        "--extend-css"
+        | "--markdown-css"
+        | "--html-in-header"
+        | "--html-before-content"
+        | "--html-after-content" => Some(SlotKind::Path),
+        "--cfg"
+        | "--check-cfg"
+        | "--crate-type"
+        | "--crate-name"
+        | "--edition"
+        | "--emit"
+        | "--target"
+        | "--extern"
+        | "-A"
+        | "--allow"
+        | "-W"
+        | "--warn"
+        | "-D"
+        | "--deny"
+        | "-F"
+        | "--forbid"
+        | "--cap-lints"
+        | "--error-format"
+        | "--json"
+        | "--extern-html-root-url" => Some(SlotKind::Value),
+        _ => None,
+    }
+}
+
+fn go_flag_value_slot(flag: &str) -> Option<SlotKind> {
+    match flag {
+        "-C" | "-pkgdir" | "-outputdir" => Some(SlotKind::Directory),
+        "-modfile" | "-overlay" | "-pgo" | "-vettool" => Some(SlotKind::Path),
+        "-o" | "-coverprofile" | "-cpuprofile" | "-memprofile" | "-mutexprofile" | "-trace" => {
+            Some(SlotKind::NewFile)
+        }
+        "-p"
+        | "-asmflags"
+        | "-buildmode"
+        | "-compiler"
+        | "-covermode"
+        | "-coverpkg"
+        | "-exec"
+        | "-gccgoflags"
+        | "-gcflags"
+        | "-installsuffix"
+        | "-ldflags"
+        | "-mod"
+        | "-tags"
+        | "-toolexec"
+        | "-cpu"
+        | "-list"
+        | "-run"
+        | "-shuffle"
+        | "-timeout"
+        | "-count"
+        | "-parallel"
+        | "-benchtime"
+        | "-blockprofilerate"
+        | "-memprofilerate"
+        | "-mutexprofilefraction" => Some(SlotKind::Value),
+        _ => None,
+    }
+}
+
+fn cmake_flag_value_slot(flag: &str) -> Option<SlotKind> {
+    match flag {
+        "-S" | "--source" | "-B" | "--build" | "--install" | "--open" | "--install-prefix" => {
+            Some(SlotKind::Directory)
+        }
+        "-C" | "-P" | "--toolchain" | "--project-file" | "--trace-source" => Some(SlotKind::Path),
+        "--graphviz" | "--trace-redirect" => Some(SlotKind::NewFile),
+        "-D"
+        | "-U"
+        | "-G"
+        | "-A"
+        | "-T"
+        | "--preset"
+        | "--target"
+        | "--config"
+        | "--parallel"
+        | "-j"
+        | "--resolve-package-references" => Some(SlotKind::Value),
+        _ => None,
+    }
+}
+
+fn ctest_flag_value_slot(flag: &str) -> Option<SlotKind> {
+    match flag {
+        "--test-dir" => Some(SlotKind::Directory),
+        "--resource-spec-file" => Some(SlotKind::Path),
+        "--output-log" | "--output-junit" => Some(SlotKind::NewFile),
+        "--preset" | "-C" | "--build-config" | "-R" | "-E" | "-L" | "-LE" | "-I" | "-j"
+        | "--parallel" | "--repeat" | "--timeout" => Some(SlotKind::Value),
+        _ => None,
+    }
+}
+
+fn cpack_flag_value_slot(flag: &str) -> Option<SlotKind> {
+    match flag {
+        "--config" => Some(SlotKind::Path),
+        "-B" | "--package-directory" => Some(SlotKind::Directory),
+        "--preset" | "-G" | "-C" | "-D" | "-P" | "-R" | "-V" => Some(SlotKind::Value),
+        _ => None,
+    }
+}
+
+fn ninja_flag_value_slot(flag: &str) -> Option<SlotKind> {
+    match flag {
+        "-C" => Some(SlotKind::Directory),
+        "-f" => Some(SlotKind::Path),
+        "-j" | "-k" | "-l" | "-d" | "-w" | "-t" => Some(SlotKind::Value),
+        _ => None,
+    }
+}
+
+fn meson_flag_value_slot(flag: &str) -> Option<SlotKind> {
+    match flag {
+        "-C" | "--wd" | "--prefix" | "--bindir" | "--datadir" | "--includedir" | "--infodir"
+        | "--libdir" | "--libexecdir" | "--localedir" | "--localstatedir" | "--mandir"
+        | "--sbindir" | "--sharedstatedir" | "--sysconfdir" => Some(SlotKind::Directory),
+        "--cross-file" | "--native-file" => Some(SlotKind::Path),
+        "-D"
+        | "--backend"
+        | "--buildtype"
+        | "--default-library"
+        | "--layout"
+        | "--optimization"
+        | "--unity"
+        | "--warnlevel"
+        | "--wrap-mode"
+        | "--jobs"
+        | "--num-processes"
+        | "--maxfail"
+        | "--suite"
+        | "--no-suite"
+        | "--setup"
+        | "--wrapper"
+        | "--logbase"
+        | "--test-args"
+        | "--ninja-args"
+        | "--vs-args"
+        | "--xcode-args"
+        | "--force-fallback-for"
+        | "--pkg-config-path"
+        | "--cmake-prefix-path" => Some(SlotKind::Value),
+        _ => None,
+    }
+}
+
+fn conan_flag_value_slot(flag: &str) -> Option<SlotKind> {
+    match flag {
+        "-of" | "--output-folder" | "--deployer-folder" => Some(SlotKind::Directory),
+        "--lockfile" => Some(SlotKind::Path),
+        "--lockfile-out" => Some(SlotKind::NewFile),
+        "-pr" | "--profile" | "-pr:h" | "--profile:host" | "-pr:b" | "--profile:build" | "-s"
+        | "--settings" | "-o" | "--options" | "-c" | "--conf" | "-b" | "--build" | "-r"
+        | "--remote" | "--deployer" | "--format" | "--core-conf" => Some(SlotKind::Value),
+        _ => None,
+    }
+}
+
+fn vcpkg_flag_value_slot(flag: &str) -> Option<SlotKind> {
+    match flag {
+        "--vcpkg-root"
+        | "--x-install-root"
+        | "--downloads-root"
+        | "--x-buildtrees-root"
+        | "--x-packages-root"
+        | "--overlay-ports"
+        | "--overlay-triplets"
+        | "--x-manifest-root" => Some(SlotKind::Directory),
+        "--triplet" | "--host-triplet" | "--x-feature" => Some(SlotKind::Value),
+        _ => None,
+    }
+}
+
+fn gradle_flag_value_slot(flag: &str) -> Option<SlotKind> {
+    match flag {
+        "-g" | "--gradle-user-home" | "-p" | "--project-dir" | "--project-cache-dir" => {
+            Some(SlotKind::Directory)
+        }
+        "-b" | "--build-file" | "-c" | "--settings-file" | "-I" | "--init-script" => {
+            Some(SlotKind::Path)
+        }
+        "-D"
+        | "--system-prop"
+        | "-P"
+        | "--project-prop"
+        | "--max-workers"
+        | "--priority"
+        | "--console"
+        | "--warning-mode"
+        | "--dependency-verification" => Some(SlotKind::Value),
+        _ => None,
+    }
+}
+
+fn maven_flag_value_slot(flag: &str) -> Option<SlotKind> {
+    match flag {
+        "-f" | "--file" | "-s" | "--settings" | "-gs" | "--global-settings" | "-t"
+        | "--toolchains" => Some(SlotKind::Path),
+        "-D"
+        | "-P"
+        | "--activate-profiles"
+        | "-pl"
+        | "--projects"
+        | "-rf"
+        | "--resume-from"
+        | "-T"
+        | "--threads"
+        | "--builder" => Some(SlotKind::Value),
+        _ => None,
+    }
+}
+
+fn java_flag_value_slot(command: &str, flag: &str) -> Option<SlotKind> {
+    match (command, flag) {
+        ("java", "-jar") => Some(SlotKind::Path),
+        ("java" | "javac", "-cp" | "-classpath" | "--class-path" | "-p" | "--module-path") => {
+            Some(SlotKind::Path)
+        }
+        (
+            "javac",
+            "-sourcepath"
+            | "--source-path"
+            | "-processorpath"
+            | "--processor-path"
+            | "--processor-module-path"
+            | "--module-source-path"
+            | "--upgrade-module-path",
+        ) => Some(SlotKind::Path),
+        ("javac", "-d" | "-s" | "-h") => Some(SlotKind::Directory),
+        (
+            "java" | "javac",
+            "--add-modules" | "--limit-modules" | "--add-exports" | "--add-opens" | "--add-reads"
+            | "--patch-module",
+        ) => Some(SlotKind::Value),
+        ("javac", "-encoding" | "-source" | "--source" | "-target" | "--target" | "--release") => {
+            Some(SlotKind::Value)
+        }
+        _ => None,
+    }
+}
+
+fn kotlin_flag_value_slot(flag: &str) -> Option<SlotKind> {
+    match flag {
+        "-jdk-home" | "-kotlin-home" | "-repo" => Some(SlotKind::Directory),
+        "-classpath" | "-cp" | "-d" | "-Xplugin" | "-Xfriend-paths" | "-library" => {
+            Some(SlotKind::Path)
+        }
+        "-module-name" | "-language-version" | "-api-version" | "-jvm-target" | "-P"
+        | "-script-templates" | "-Xjdk-release" | "-howtorun" | "-e" | "-expression"
+        | "-target" | "-produce" | "-entry" => Some(SlotKind::Value),
+        _ => None,
+    }
+}
+
+fn swift_flag_value_slot(flag: &str) -> Option<SlotKind> {
+    match flag {
+        "-I" | "-L" | "-F" | "-Fsystem" | "-Isystem" | "-module-cache-path" | "-sdk"
+        | "-sysroot" | "-working-directory" | "-plugin-path" | "--package-path"
+        | "--cache-path" | "--config-path" | "--security-path" | "--scratch-path"
+        | "--swift-sdks-path" | "--pkg-config-path" => Some(SlotKind::Directory),
+        "-import-bridging-header"
+        | "-vfsoverlay"
+        | "-load-plugin-library"
+        | "--toolset"
+        | "--netrc-file" => Some(SlotKind::Path),
+        "-o"
+        | "-emit-module-path"
+        | "-serialize-diagnostics-path"
+        | "-index-store-path"
+        | "-emit-dependencies-path"
+        | "-emit-reference-dependencies-path" => Some(SlotKind::NewFile),
+        "-D" | "-module-name" | "-package-name" | "-target" | "-swift-version" | "-sanitize"
+        | "-j" | "--jobs" | "--configuration" | "--target" | "--product" | "--traits"
+        | "--triple" | "--swift-sdk" | "--toolchain" | "--build-system" | "-Xcc" | "-Xswiftc"
+        | "-Xlinker" | "-Xcxx" => Some(SlotKind::Value),
+        _ => None,
+    }
+}
+
+fn xcodebuild_flag_value_slot(flag: &str) -> Option<SlotKind> {
+    match flag {
+        "-project"
+        | "-workspace"
+        | "-xcconfig"
+        | "-resultStreamPath"
+        | "-exportOptionsPlist"
+        | "-importPath"
+        | "-localizationPath"
+        | "-xctestrun"
+        | "-testProductsPath"
+        | "-authenticationKeyPath" => Some(SlotKind::Path),
+        "-resultBundlePath"
+        | "-clonedSourcePackagesDirPath"
+        | "-derivedDataPath"
+        | "-archivePath"
+        | "-exportPath"
+        | "-packageCachePath" => Some(SlotKind::Directory),
+        "-projectName"
+        | "-target"
+        | "-scheme"
+        | "-configuration"
+        | "-arch"
+        | "-sdk"
+        | "-toolchain"
+        | "-destination"
+        | "-destination-timeout"
+        | "-jobs"
+        | "-parallel-testing-enabled"
+        | "-parallel-testing-worker-count"
+        | "-testPlan"
+        | "-only-testing"
+        | "-skip-testing"
+        | "-testLanguage"
+        | "-testRegion" => Some(SlotKind::Value),
+        _ => None,
+    }
+}
+
+fn rustfmt_flag_value_slot(flag: &str) -> Option<SlotKind> {
+    match flag {
+        "--config-path" | "--out-dir" => Some(SlotKind::Directory),
+        "--edition" | "--style-edition" | "--emit" | "--file-lines" | "--config" => {
+            Some(SlotKind::Value)
+        }
+        _ => None,
+    }
+}
+
+fn go_formatter_flag_value_slot(command: &str, flag: &str) -> Option<SlotKind> {
+    match (command, flag) {
+        ("gofmt" | "goimports", "-cpuprofile") => Some(SlotKind::NewFile),
+        ("goimports", "-srcdir") => Some(SlotKind::Directory),
+        ("gofmt", "-r") | ("goimports", "-local") => Some(SlotKind::Value),
+        _ => None,
+    }
+}
+
+fn clang_tool_flag_value_slot(command: &str, flag: &str) -> Option<SlotKind> {
+    match (command, flag) {
+        ("clang-format", "-assume-filename" | "--assume-filename") => Some(SlotKind::Path),
+        (
+            "clang-format",
+            "-style"
+            | "--style"
+            | "-fallback-style"
+            | "--fallback-style"
+            | "-cursor"
+            | "--cursor"
+            | "-offset"
+            | "--offset"
+            | "-length"
+            | "--length"
+            | "-lines"
+            | "--lines"
+            | "-qualifier-alignment"
+            | "--qualifier-alignment",
+        ) => Some(SlotKind::Value),
+        ("clang-tidy", "-p" | "--p") => Some(SlotKind::Directory),
+        ("clang-tidy", "-config-file" | "--config-file") => Some(SlotKind::Path),
+        ("clang-tidy", "-export-fixes" | "--export-fixes") => Some(SlotKind::NewFile),
+        (
+            "clang-tidy",
+            "-checks"
+            | "--checks"
+            | "-config"
+            | "--config"
+            | "-header-filter"
+            | "--header-filter"
+            | "-exclude-header-filter"
+            | "--exclude-header-filter"
+            | "-line-filter"
+            | "--line-filter"
+            | "-extra-arg"
+            | "--extra-arg"
+            | "-extra-arg-before"
+            | "--extra-arg-before"
+            | "-warnings-as-errors"
+            | "--warnings-as-errors"
+            | "-format-style",
+        ) => Some(SlotKind::Value),
+        _ => None,
+    }
+}
+
+fn swift_formatter_flag_value_slot(command: &str, flag: &str) -> Option<SlotKind> {
+    match (command, flag) {
+        ("swift-format", "--configuration" | "--assume-filename")
+        | ("swiftformat", "--config" | "--baseconfig") => Some(SlotKind::Path),
+        ("swiftformat", "--output") => Some(SlotKind::NewFile),
+        ("swift-format", "--selection")
+        | ("swiftformat", "--cache" | "--exclude" | "--rules" | "--disable" | "--enable") => {
+            Some(SlotKind::Value)
+        }
+        _ => None,
+    }
+}
+
+fn ktlint_flag_value_slot(flag: &str) -> Option<SlotKind> {
+    match flag {
+        "--editorconfig" | "--baseline" | "--ruleset" => Some(SlotKind::Path),
+        "--reporter" | "--disabled_rules" => Some(SlotKind::Value),
+        _ => None,
+    }
+}
+
 /// Well-known flags whose value is literal text (`Value` — no filesystem
 /// rows) versus a path (`Path`/`Directory`). Best-effort heuristics for the
 /// common commands; unknown flags fall through to the caller's default.
 fn flag_value_slot(command: &str, flag: &str) -> Option<SlotKind> {
+    if command == "clang-cl" && flag.starts_with('/') {
+        return match flag {
+            "/I" => Some(SlotKind::Directory),
+            "/FI" => Some(SlotKind::Path),
+            "/Fo" | "/Fe" | "/Fd" | "/Fa" | "/Fp" => Some(SlotKind::NewFile),
+            "/D" | "/U" | "/std" | "/arch" => Some(SlotKind::Value),
+            _ => None,
+        };
+    }
     if !flag.starts_with('-') {
         return None;
     }
     if let Some(slot) = super::ssh::flag_value_slot(command, flag) {
+        return Some(slot);
+    }
+    if let Some(slot) = language_tool_flag_value_slot(command, flag) {
         return Some(slot);
     }
     match (command, flag) {
@@ -1797,6 +2607,7 @@ mod tests {
     fn help_subcommands_suppress_files_at_the_real_top_level_command_slot() {
         let directory = tempfile::tempdir().expect("directory");
         fs::write(directory.path().join("plain.txt"), b"").expect("file");
+        fs::write(directory.path().join("plain.swift"), b"").expect("swift file");
         let help = Arc::new(CommandHelpCache::default());
         help.seed(
             "git",
@@ -1843,6 +2654,42 @@ mod tests {
                 .candidates
                 .iter()
                 .any(|candidate| candidate.display.primary == "plain.txt")
+        );
+        help.seed(
+            "swift",
+            CommandHelp {
+                flags: Vec::new(),
+                subcommands: vec![HelpEntry {
+                    name: "build".into(),
+                    description: String::new(),
+                    takes_value: false,
+                }],
+                subcommand_aliases: Vec::new(),
+                accepts_positionals: false,
+                subcommands_exhaustive: true,
+            },
+        );
+        assert!(
+            provider
+                .complete(&context(directory.path(), "swift ", 30))
+                .candidates
+                .is_empty(),
+            "SwiftPM subcommands own the empty slot"
+        );
+        assert!(
+            provider
+                .complete(&context(directory.path(), "swift b", 31))
+                .candidates
+                .is_empty(),
+            "a matching SwiftPM subcommand prefix must suppress files"
+        );
+        assert!(
+            provider
+                .complete(&context(directory.path(), "swift pl", 32))
+                .candidates
+                .iter()
+                .any(|candidate| candidate.display.primary == "plain.swift"),
+            "a non-subcommand Swift prefix must fall back to source files"
         );
         // Help without subcommands (e.g. `cp`) never suppresses files.
         help.seed(
@@ -1976,6 +2823,8 @@ mod tests {
     fn value_flags_suppress_file_rows_and_path_flags_offer_them() {
         let directory = tempfile::tempdir().expect("directory");
         fs::write(directory.path().join("plain.txt"), b"plain").expect("file");
+        fs::write(directory.path().join("main.go"), b"package main\n").expect("go file");
+        fs::write(directory.path().join("main.rs"), b"fn main() {}\n").expect("rust file");
         fs::create_dir(directory.path().join("nested")).expect("nested directory");
         let provider = provider(Arc::new(SpecRegistry::default()));
 
@@ -1990,6 +2839,21 @@ mod tests {
             "zsh -o pl",
             "grep -A ",
             "curl --data-binary literal",
+            "gcc -D ",
+            "clang -std ",
+            "rustc --edition ",
+            "cargo build --target ",
+            "go test -run ",
+            "cmake -G ",
+            "gradle -P ",
+            "mvn -P ",
+            "kotlinc -jvm-target ",
+            "swiftc -module-name ",
+            "xcodebuild -scheme ",
+            "rustfmt --edition ",
+            "clang-format --style ",
+            "goimports -local ",
+            "ktlint --reporter ",
         ] {
             let context = context(directory.path(), buffer, 1);
             let output = provider.complete(&context);
@@ -2013,6 +2877,22 @@ mod tests {
             "ssh -E pl",
             "bash --rcfile pl",
             "bash --init-file=pl",
+            "clang -include pl",
+            "cargo --manifest-path pl",
+            "go build -modfile pl",
+            "ctest --resource-spec-file pl",
+            "cpack --config pl",
+            "meson --cross-file pl",
+            "conan --lockfile pl",
+            "gradle -b pl",
+            "mvn -f pl",
+            "kotlinc -cp pl",
+            "swiftc -import-bridging-header pl",
+            "xcodebuild -xcconfig pl",
+            "java -jar pl",
+            "swift-format --configuration pl",
+            "clang-tidy --config-file pl",
+            "ktlint --editorconfig pl",
         ] {
             let context = context(directory.path(), buffer, 1);
             let output = provider.complete(&context);
@@ -2031,6 +2911,28 @@ mod tests {
             "just -d ",
             "just -dne",
             "just --working-directory=ne",
+            "gcc -I ne",
+            "gcc -Ine",
+            "clang --sysroot=ne",
+            "cmake -S ne",
+            "cmake -Bne",
+            "cmake ne",
+            "ctest --test-dir ne",
+            "cpack -B ne",
+            "ninja -C ne",
+            "meson setup ne",
+            "meson -C ne",
+            "conan --output-folder ne",
+            "vcpkg --overlay-ports ne",
+            "cargo install --path ne",
+            "go work use ne",
+            "rustup toolchain link custom ne",
+            "gradle -p ne",
+            "swiftc -I ne",
+            "clang-cl /I ne",
+            "rustfmt --config-path ne",
+            "clang-tidy -p ne",
+            "goimports -srcdir ne",
         ] {
             let output = provider.complete(&context(directory.path(), buffer, 1));
             assert!(
@@ -2120,12 +3022,101 @@ mod tests {
         let flag_context = context(directory.path(), "curl -", 1);
         let output = provider.complete(&flag_context);
         assert!(output.candidates.is_empty());
+
+        for buffer in [
+            "cargo build --target ./pl",
+            "rustc --target=./pl",
+            "rustdoc --target ./pl",
+            "cargo --config=./pl",
+        ] {
+            let output = provider.complete(&context(directory.path(), buffer, 5));
+            assert!(
+                output
+                    .candidates
+                    .iter()
+                    .any(|candidate| candidate.display.primary == "./plain.txt"),
+                "explicit hybrid path missing for {buffer:?}"
+            );
+        }
+
+        let response = provider.complete(&context(directory.path(), "rustc @pl", 6));
+        assert!(response.candidates.iter().any(|candidate| {
+            candidate
+                .edit
+                .as_ref()
+                .is_some_and(|edit| edit.replacement == "@plain.txt")
+        }));
+        for (buffer, replacement) in [
+            ("kotlinc -cp nested:pl", "nested:plain.txt"),
+            (
+                "javac --class-path=nested:pl",
+                "--class-path=nested:plain.txt",
+            ),
+            ("rustc -Ldependency=ne", "-Ldependency=nested/"),
+        ] {
+            assert!(
+                provider
+                    .complete(&context(directory.path(), buffer, 6))
+                    .candidates
+                    .iter()
+                    .any(|candidate| candidate
+                        .edit
+                        .as_ref()
+                        .is_some_and(|edit| edit.replacement == replacement)),
+                "structured path value missing for {buffer:?}"
+            );
+        }
+        for buffer in [
+            "go run main.go pl",
+            "go doc . pl",
+            "go build ./cmd ",
+            "rustc main.rs ",
+            "rustc +nightly main.rs ",
+            "rustc - ",
+            "rustdoc main.rs ",
+            "kotlin MainKt ",
+            "kotlin -e expression ",
+        ] {
+            assert!(
+                provider
+                    .complete(&context(directory.path(), buffer, 7))
+                    .candidates
+                    .is_empty(),
+                "literal Go argument position leaked filesystem rows: {buffer:?}"
+            );
+        }
+        for buffer in ["go build main.go pl", "rustc +nightly ma", "rustdoc ma"] {
+            assert!(
+                provider
+                    .complete(&context(directory.path(), buffer, 8))
+                    .candidates
+                    .iter()
+                    .any(|candidate| candidate.display.primary == "main.rs"
+                        || candidate.display.primary == "plain.txt"),
+                "compiler/source input path missing for {buffer:?}"
+            );
+        }
+        for buffer in [
+            "gofmt pl",
+            "rustfmt pl",
+            "swift-format format pl",
+            "ktlint pl",
+        ] {
+            assert!(
+                provider
+                    .complete(&context(directory.path(), buffer, 8))
+                    .candidates
+                    .iter()
+                    .any(|candidate| candidate.display.primary == "plain.txt"),
+                "formatter input path missing for {buffer:?}"
+            );
+        }
     }
 
     #[test]
     fn versioned_python_and_compiler_path_slots_follow_the_command_family() {
         let directory = tempfile::tempdir().expect("directory");
-        for name in ["script.py", "app.jar", "Main.java", "main.rs"] {
+        for name in ["script.py", "app.jar", "Main.java", "Main.kt", "main.rs"] {
             fs::write(directory.path().join(name), b"").expect("file");
         }
         fs::create_dir(directory.path().join("classes")).expect("classes directory");
@@ -2139,6 +3130,11 @@ mod tests {
             ("java -jar ap", "app.jar"),
             ("javac Ma", "Main.java"),
             ("rustc ma", "main.rs"),
+            ("rustdoc +nightly ma", "main.rs"),
+            ("gcc-14 ma", "main.rs"),
+            ("aarch64-linux-gnu-g++-13 ma", "main.rs"),
+            ("kotlin Ma", "Main.java"),
+            ("kotlinc-native Ma", "Main.java"),
             ("rustc -o cl", "classes/"),
         ] {
             assert!(
@@ -2165,6 +3161,15 @@ mod tests {
                     .candidates
                     .is_empty(),
                 "literal or remote slot leaked local files for {buffer:?}"
+            );
+        }
+        for buffer in ["rustc main.rs ", "rustdoc main.rs ", "kotlin MainKt "] {
+            assert!(
+                provider
+                    .complete(&context(directory.path(), buffer, 13))
+                    .candidates
+                    .is_empty(),
+                "program argument slot leaked filesystem rows for {buffer:?}"
             );
         }
     }

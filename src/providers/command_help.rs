@@ -129,6 +129,9 @@ impl CommandHelpCache {
     /// never wait for `man` or `<command> --help`; the populated cache is used
     /// on the next keystroke. Pending and negative results are both deduped.
     pub fn request(self: &Arc<Self>, command: &str, executable: Option<PathBuf>) {
+        if !help_probe_allowed(command, executable.as_deref()) {
+            return;
+        }
         let fetch_path = executable.clone();
         self.request_with_path(command, executable, move |command| {
             fetch_command_help_from(command, fetch_path.as_deref())
@@ -141,6 +144,9 @@ impl CommandHelpCache {
         executable: Option<PathBuf>,
         scope: Vec<String>,
     ) {
+        if !help_probe_allowed(command, executable.as_deref()) {
+            return;
+        }
         if scope.is_empty() {
             self.request(command, executable);
             return;
@@ -348,11 +354,12 @@ impl CandidateProvider for CommandHelpProvider {
         if executable.is_none() {
             return false;
         }
+        let request_missing = help_probe_allowed(command, executable.as_deref());
         if argument_progress(context).is_none() && !bare_command_position(context, command) {
             return false;
         }
         !matches!(
-            lookup_help_scope(context, &self.cache, command, executable, true,),
+            lookup_help_scope(context, &self.cache, command, executable, request_missing,),
             HelpLookup::None
         )
     }
@@ -369,6 +376,9 @@ impl CandidateProvider for CommandHelpProvider {
         };
         let help = target.help;
         let position = target.position;
+        if let HelpPosition::Values(flag_index) = position {
+            return complete_help_values(context, command, &target.scope, &help, flag_index);
+        }
         let flags_position = position == HelpPosition::Flags;
         let bare_subcommands = position == HelpPosition::BareSubcommands;
         let entries = if flags_position {
@@ -455,11 +465,143 @@ impl CandidateProvider for CommandHelpProvider {
     }
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+fn complete_help_values(
+    context: &CompletionContext,
+    command: &str,
+    scope: &[String],
+    help: &CommandHelp,
+    flag_index: usize,
+) -> ProviderOutput {
+    let Some(entry) = help.flags.get(flag_index) else {
+        return ProviderOutput::default();
+    };
+    let choices = documented_value_choices(&entry.description);
+    if choices.is_empty() {
+        return ProviderOutput::default();
+    }
+
+    let prefix = context.parsed.current_prefix.as_str();
+    let mut edit_prefix = String::new();
+    let mut query = prefix;
+    if let Some(rest) = prefix.strip_prefix(&entry.name) {
+        if let Some(value) = rest.strip_prefix('=') {
+            edit_prefix = format!("{}=", entry.name);
+            query = value;
+        } else if entry.name.len() == 2 && !rest.is_empty() {
+            edit_prefix = entry.name.clone();
+            query = rest;
+        }
+    }
+    let folded_query = query.to_ascii_lowercase();
+    if choices
+        .iter()
+        .any(|choice| choice.eq_ignore_ascii_case(query))
+    {
+        return ProviderOutput::default();
+    }
+
+    let candidates = choices
+        .into_iter()
+        .enumerate()
+        .filter(|(_, choice)| {
+            folded_query.is_empty() || choice.to_ascii_lowercase().starts_with(&folded_query)
+        })
+        .map(|(index, choice)| {
+            let replacement = format!("{edit_prefix}{choice}");
+            let display = crate::parser::apply_edit(
+                &context.buffer.text,
+                context.parsed.replacement.clone(),
+                &replacement,
+            )
+            .map(|result| result.trim_end().to_owned())
+            .unwrap_or_else(|_| format!("{command} {replacement}"));
+            let scope = if scope.is_empty() {
+                String::new()
+            } else {
+                format!(":{}", scope.join(" "))
+            };
+            let mut candidate = Candidate::new(
+                context.query_id,
+                display,
+                format!("{} 的文档可选值", entry.name),
+                Some(TextEdit {
+                    range: context.parsed.replacement.clone(),
+                    replacement,
+                    cursor_after: CursorPlacement::End,
+                }),
+                CandidateAction::Insert,
+                CandidateSource::CommandHelp,
+                CandidateKind::Recipe,
+                Completeness::NeedsInput {
+                    slot: SlotKind::Value,
+                },
+                RiskLevel::Low,
+                format!("help:{command}{scope}:{}:{choice}", entry.name),
+            );
+            candidate.score.spec_priority =
+                i16::try_from(MAX_ENTRIES.saturating_sub(index)).unwrap_or_default();
+            candidate
+        })
+        .collect();
+    ProviderOutput {
+        candidates,
+        diagnostics: Vec::new(),
+    }
+}
+
+fn documented_value_choices(description: &str) -> Vec<String> {
+    let folded = description.to_ascii_lowercase();
+    let Some((start, marker_len)) = [
+        "valid values are:",
+        "possible values:",
+        "valid values:",
+        "values are:",
+        "values:",
+    ]
+    .iter()
+    .filter_map(|marker| folded.find(marker).map(|start| (start, marker.len())))
+    .min_by_key(|(start, _)| *start) else {
+        return Vec::new();
+    };
+    let tail = description[start + marker_len..].trim_start();
+    let end = tail.find([']', ')', ';']).unwrap_or(tail.len());
+    let list = tail[..end].trim();
+    if !list.contains([',', '|']) {
+        return Vec::new();
+    }
+
+    let mut choices = Vec::new();
+    for raw in list.split([',', '|']) {
+        let choice = raw
+            .trim()
+            .trim_matches(['`', '\'', '"', '<', '>', '[', ']', '(', ')']);
+        if choice.is_empty()
+            || choice.len() > 64
+            || choice.contains(char::is_whitespace)
+            || !choice.chars().all(|character| {
+                character.is_ascii_alphanumeric()
+                    || matches!(character, '-' | '_' | '+' | '.' | '/' | ':')
+            })
+        {
+            continue;
+        }
+        if !choices.iter().any(|existing: &String| existing == choice) {
+            choices.push(choice.to_owned());
+        }
+    }
+    if choices.len() >= 2 {
+        choices
+    } else {
+        Vec::new()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HelpPosition {
     Flags,
     Subcommands,
     BareSubcommands,
+    Values(usize),
 }
 
 struct HelpTarget {
@@ -577,7 +719,7 @@ fn completed_scope<'a>(
             index += 1;
             if entry.takes_value && !attached_value {
                 if index >= before.len() {
-                    return CompletedScope::Blocked;
+                    return CompletedScope::None;
                 }
                 index += 1;
             }
@@ -613,11 +755,12 @@ fn help_position_for_arguments(
             continue;
         }
         if word.starts_with('-') && word != "-" {
-            let (entry, attached_value) = help_flag_usage(help, word)?;
+            let (entry_index, attached_value) = help_flag_usage_index(help, word)?;
+            let entry = &help.flags[entry_index];
             index += 1;
             if entry.takes_value && !attached_value {
                 if index >= before.len() {
-                    return None;
+                    return Some(HelpPosition::Values(entry_index));
                 }
                 index += 1;
             }
@@ -627,11 +770,10 @@ fn help_position_for_arguments(
     }
 
     if current_prefix.starts_with('-')
-        && let Some((entry, attached_value)) = help_flag_usage(help, current_prefix)
-        && entry.takes_value
+        && let Some((entry_index, attached_value)) = help_flag_usage_index(help, current_prefix)
         && attached_value
     {
-        return None;
+        return Some(HelpPosition::Values(entry_index));
     }
     if current_prefix.starts_with('-') && !current_prefix.contains('=') {
         Some(HelpPosition::Flags)
@@ -643,10 +785,12 @@ fn help_position_for_arguments(
 }
 
 fn toolchain_selector(command: &str, word: &str) -> bool {
-    matches!(command_basename(command), "cargo" | "rustup")
-        && word
-            .strip_prefix('+')
-            .is_some_and(|selector| !selector.is_empty() && !selector.contains('/'))
+    matches!(
+        command_basename(command),
+        "cargo" | "rustc" | "rustdoc" | "rustup"
+    ) && word
+        .strip_prefix('+')
+        .is_some_and(|selector| !selector.is_empty() && !selector.contains('/'))
 }
 
 fn bare_command_position(context: &CompletionContext, command: &str) -> bool {
@@ -664,14 +808,26 @@ pub(crate) fn dynamic_help_owns_position(
     };
     match lookup_help_scope(context, cache, command, None, false) {
         HelpLookup::Ready(target) => match target.position {
-            HelpPosition::Flags => true,
+            HelpPosition::Flags | HelpPosition::Values(_) => true,
             HelpPosition::Subcommands | HelpPosition::BareSubcommands => {
                 target.help.has_subcommands()
+                    && (!hybrid_subcommand_path_command(command, &target.scope)
+                        || context.parsed.current_prefix.is_empty()
+                        || target.help.subcommands.iter().any(|entry| {
+                            entry
+                                .name
+                                .to_ascii_lowercase()
+                                .starts_with(&context.parsed.current_prefix.to_ascii_lowercase())
+                        }))
             }
         },
         HelpLookup::Pending => true,
         HelpLookup::None => false,
     }
+}
+
+fn hybrid_subcommand_path_command(command: &str, scope: &[String]) -> bool {
+    scope.is_empty() && command_basename(command) == "swift"
 }
 
 fn supports_scoped_help(command: &str) -> bool {
@@ -687,6 +843,7 @@ fn supports_scoped_help(command: &str) -> bool {
                 | "claude"
                 | "codex"
                 | "composer"
+                | "conan"
                 | "consul"
                 | "diskutil"
                 | "dnf"
@@ -708,6 +865,7 @@ fn supports_scoped_help(command: &str) -> bool {
                 | "kubectl"
                 | "launchctl"
                 | "mise"
+                | "meson"
                 | "nerdctl"
                 | "nix"
                 | "nomad"
@@ -726,12 +884,14 @@ fn supports_scoped_help(command: &str) -> bool {
                 | "security"
                 | "snap"
                 | "svn"
+                | "swift"
                 | "systemctl"
                 | "terraform"
                 | "tofu"
                 | "uv"
                 | "vagrant"
                 | "vault"
+                | "vcpkg"
                 | "vercel"
                 | "wrangler"
                 | "npm"
@@ -742,21 +902,33 @@ fn supports_scoped_help(command: &str) -> bool {
 }
 
 fn help_flag_usage<'a>(help: &'a CommandHelp, word: &str) -> Option<(&'a HelpEntry, bool)> {
-    if let Some(entry) = help.flags.iter().find(|entry| entry.name == word) {
-        return Some((entry, false));
+    let (index, attached) = help_flag_usage_index(help, word)?;
+    Some((&help.flags[index], attached))
+}
+
+fn help_flag_usage_index(help: &CommandHelp, word: &str) -> Option<(usize, bool)> {
+    if let Some((index, _)) = help
+        .flags
+        .iter()
+        .enumerate()
+        .find(|(_, entry)| entry.name == word)
+    {
+        return Some((index, false));
     }
     if let Some((name, _)) = word.split_once('=') {
         return help
             .flags
             .iter()
-            .find(|entry| entry.name == name)
-            .map(|entry| (entry, true));
+            .enumerate()
+            .find(|(_, entry)| entry.name == name)
+            .map(|(index, _)| (index, true));
     }
     help.flags
         .iter()
-        .filter(|entry| entry.takes_value && entry.name.len() == 2)
-        .find(|entry| word.len() > entry.name.len() && word.starts_with(&entry.name))
-        .map(|entry| (entry, true))
+        .enumerate()
+        .filter(|(_, entry)| entry.takes_value && entry.name.len() == 2)
+        .find(|(_, entry)| word.len() > entry.name.len() && word.starts_with(&entry.name))
+        .map(|(index, _)| (index, true))
 }
 
 /// Validate the top-level argument portion of a recorded invocation against
@@ -856,6 +1028,9 @@ pub(crate) fn scoped_history_arguments_are_plausible(
                     continue;
                 }
                 if !cache.scope_is_pending(command, &scope) {
+                    if !help_probe_allowed(command, executable.as_deref()) {
+                        return Some(true);
+                    }
                     cache.request_scope(command, executable.clone(), scope.clone());
                 }
                 return None;
@@ -1002,6 +1177,15 @@ fn command_basename(command: &str) -> &str {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(command)
+}
+
+fn help_probe_allowed(command: &str, executable: Option<&Path>) -> bool {
+    executable.is_some()
+        && !command.contains('/')
+        // Wrapper scripts can download runtimes and execute project-owned
+        // bootstrap logic even for `--help`. Their static completion surfaces
+        // are handled without launching the wrapper.
+        && !matches!(command_basename(command), "gradlew" | "mvnw")
 }
 
 fn fetch_man_page(command: &str) -> CommandHelp {
@@ -1190,6 +1374,9 @@ fn help_probe_arguments(command: &str, scope: &[String]) -> Vec<Vec<String>> {
             vec![prefixed_help()]
         }
         "brew" | "gem" | "svn" if !scope.is_empty() => vec![prefixed_help()],
+        "swift" | "vcpkg" if !scope.is_empty() => {
+            vec![prefixed_help(), suffixed("--help")]
+        }
         "pnpm" if scope.is_empty() => {
             vec![vec!["help".to_owned(), "-a".to_owned()], suffixed("--help")]
         }
@@ -1343,7 +1530,7 @@ pub(crate) fn parse_help_output_for_scope(
             }
             continue;
         }
-        if !scope.is_empty()
+        if (in_commands || !scope.is_empty())
             && line.starts_with(char::is_whitespace)
             && let Some((name, description)) = help_invocation_subcommand(command, scope, line)
         {
@@ -2003,7 +2190,14 @@ fn flag_takes_separate_value(rest: &str) -> bool {
         return true;
     }
     if trimmed.starts_with('[') {
-        return false;
+        let token = trimmed.split_whitespace().next().unwrap_or_default();
+        if token.starts_with("[<") && token.ends_with(">]") {
+            return true;
+        }
+        return token
+            .strip_prefix('[')
+            .and_then(|token| token.strip_suffix(']'))
+            .is_some_and(is_placeholder);
     }
     let Some(first_end) = trimmed.find(char::is_whitespace) else {
         return is_placeholder(trimmed.trim_end_matches([',', ';', ':']));
@@ -2681,6 +2875,31 @@ work on the current change
             help_probe_arguments("pnpm", &["store".to_owned()]),
             [vec!["store".to_owned(), "--help".to_owned()]]
         );
+        assert_eq!(
+            help_probe_arguments("swift", &["package".to_owned()]),
+            [
+                vec!["help".to_owned(), "package".to_owned()],
+                vec!["package".to_owned(), "--help".to_owned()],
+            ]
+        );
+    }
+
+    #[test]
+    fn bracketed_flag_arguments_and_documented_values_are_recognized() {
+        assert!(flag_takes_separate_value("[<SPEC>]  Select a package"));
+        assert!(flag_takes_separate_value("[DIRECTORY]  Change directory"));
+        assert!(!flag_takes_separate_value(
+            "[=<WHEN>]  Optional attached value"
+        ));
+        assert_eq!(
+            documented_value_choices("Coloring [possible values: auto, always, never]"),
+            ["auto", "always", "never"]
+        );
+        assert_eq!(
+            documented_value_choices("Build mode (values: debug, release; default: debug)"),
+            ["debug", "release"]
+        );
+        assert!(documented_value_choices("Set an arbitrary string value").is_empty());
     }
 
     #[test]
@@ -3198,6 +3417,11 @@ work on the current change
                         description: "Read configuration from a file.".into(),
                         takes_value: true,
                     },
+                    HelpEntry {
+                        name: "--color".into(),
+                        description: "Coloring [possible values: auto, always, never]".into(),
+                        takes_value: true,
+                    },
                 ],
                 subcommands: vec![
                     HelpEntry {
@@ -3293,6 +3517,30 @@ work on the current change
                 .is_empty(),
             "a required flag value must not be treated as a subcommand"
         );
+        let separated = engine.complete(&context("git --color a", 28));
+        assert_eq!(separated.candidates.len(), 2);
+        assert_eq!(
+            separated.candidates[0]
+                .edit
+                .as_ref()
+                .expect("separated enum edit")
+                .replacement,
+            "auto"
+        );
+        let attached = engine.complete(&context("git --color=a", 29));
+        assert!(attached.candidates.iter().any(|candidate| {
+            candidate
+                .edit
+                .as_ref()
+                .is_some_and(|edit| edit.replacement == "--color=auto")
+        }));
+        assert!(
+            engine
+                .complete(&context("git --color auto", 30))
+                .candidates
+                .is_empty(),
+            "an exact documented value must stay quiet"
+        );
         assert!(
             engine
                 .complete(&context("git checkout", 23))
@@ -3350,6 +3598,40 @@ work on the current change
             .map(|candidate| candidate.display.primary)
             .collect();
         assert_eq!(rows, ["codex exec"]);
+    }
+
+    #[test]
+    fn swift_repl_command_waits_for_space_then_exposes_subcommands() {
+        let directory = tempfile::tempdir().expect("command directory");
+        let path = directory.path().join("swift");
+        fs::write(&path, b"#!/bin/sh\n").expect("fake command");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).expect("command mode");
+        let commands = Arc::new(CommandPathCache::from_path(Some(&OsString::from(
+            directory.path(),
+        ))));
+        let cache = Arc::new(CommandHelpCache::default());
+        cache.seed(
+            "swift",
+            parse_help_output(
+                "swift",
+                "Subcommands:\n  swift build   Build packages\n  swift run     Run a product\n",
+            ),
+        );
+        let mut engine = CompletionEngine::new(100, 20);
+        engine.register(CommandHelpProvider::new(
+            Arc::new(SpecRegistry::load(None)),
+            commands,
+            cache,
+        ));
+
+        assert!(engine.complete(&context("swift", 31)).candidates.is_empty());
+        let rows: Vec<_> = engine
+            .complete(&context("swift ", 32))
+            .candidates
+            .into_iter()
+            .map(|candidate| candidate.display.primary)
+            .collect();
+        assert_eq!(rows, ["swift build", "swift run"]);
     }
 
     #[test]
@@ -3452,6 +3734,51 @@ work on the current change
             .map(|candidate| candidate.display.primary)
             .collect();
         assert_eq!(rows, ["./demotool deploy"]);
+    }
+
+    #[test]
+    fn cold_help_probe_never_executes_project_paths_or_build_wrappers() {
+        let directory = tempfile::tempdir().expect("command directory");
+        let bin = directory.path().join("bin");
+        fs::create_dir(&bin).expect("bin");
+        for name in ["gradlew", "mvnw"] {
+            let path = bin.join(name);
+            fs::write(&path, b"#!/bin/sh\nexit 99\n").expect("wrapper");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).expect("wrapper mode");
+        }
+        let local = directory.path().join("demotool");
+        fs::write(&local, b"#!/bin/sh\nexit 99\n").expect("local executable");
+        fs::set_permissions(&local, fs::Permissions::from_mode(0o700)).expect("local mode");
+        let commands = Arc::new(CommandPathCache::from_path(Some(&OsString::from(&bin))));
+        let cache = Arc::new(CommandHelpCache::default());
+        let provider = CommandHelpProvider::new(
+            Arc::new(SpecRegistry::load(None)),
+            commands,
+            Arc::clone(&cache),
+        );
+
+        for text in ["gradlew ", "mvnw ", "./demotool "] {
+            let mut current = context(text, 46);
+            current.cwd = Arc::new(directory.path().to_owned());
+            assert!(!provider.applies(&current), "{text:?} must stay cache-only");
+        }
+        assert_eq!(cache.fetch_count(), 0);
+    }
+
+    #[test]
+    fn rustc_toolchain_selector_does_not_block_documented_flags() {
+        let help = CommandHelp {
+            flags: vec![HelpEntry {
+                name: "--edition".into(),
+                description: String::new(),
+                takes_value: true,
+            }],
+            ..CommandHelp::default()
+        };
+        assert_eq!(
+            help_position_for_arguments("rustc", true, &help, &["+nightly"], "--ed"),
+            Some(HelpPosition::Flags)
+        );
     }
 
     #[test]

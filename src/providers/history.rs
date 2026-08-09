@@ -355,6 +355,12 @@ impl HistoryProvider {
             return plausible;
         }
 
+        if let Some(plausible) =
+            maven_history_arguments_are_plausible(command_word, arguments, known_non_failure)
+        {
+            return plausible;
+        }
+
         if let Some(manager) = super::MANAGERS
             .iter()
             .find(|manager| manager.name == super::executable_basename(command_word))
@@ -502,6 +508,82 @@ impl HistoryProvider {
             | crate::completion::SlotKind::Value => true,
         }
     }
+}
+
+fn maven_history_arguments_are_plausible(
+    command: &str,
+    arguments: &[&str],
+    known_non_failure: bool,
+) -> Option<bool> {
+    if !matches!(
+        super::executable_basename(command),
+        "mvn" | "mvnw" | "mvnDebug"
+    ) {
+        return None;
+    }
+    if known_non_failure {
+        return Some(true);
+    }
+    let mut index = 0;
+    while let Some(word) = arguments.get(index).copied() {
+        if word == "--" {
+            index += 1;
+            continue;
+        }
+        if word.starts_with("-D")
+            || word.starts_with("-P")
+            || word.starts_with("-pl") && word.len() > 3
+            || word.starts_with("-T") && word.len() > 2
+        {
+            index += 1;
+            continue;
+        }
+        if matches!(
+            word,
+            "-f" | "--file"
+                | "-s"
+                | "--settings"
+                | "-gs"
+                | "--global-settings"
+                | "-t"
+                | "--toolchains"
+                | "-pl"
+                | "--projects"
+                | "-rf"
+                | "--resume-from"
+                | "-T"
+                | "--threads"
+        ) {
+            if index + 1 >= arguments.len() {
+                return Some(false);
+            }
+            index += 2;
+            continue;
+        }
+        if word.starts_with('-') {
+            index += 1;
+            continue;
+        }
+        if word.contains([':', '$', '`', '*', '?', '[', '{']) {
+            index += 1;
+            continue;
+        }
+        if super::toolchain::MAVEN_PHASES
+            .iter()
+            .any(|(phase, _)| *phase == word)
+        {
+            index += 1;
+            continue;
+        }
+        if super::toolchain::MAVEN_PHASES
+            .iter()
+            .any(|(phase, _)| one_edit_or_adjacent_transposition(word, phase))
+        {
+            return Some(false);
+        }
+        index += 1;
+    }
+    Some(true)
 }
 
 fn manager_command_arguments<'a>(manager: &str, arguments: &'a [&'a str]) -> Option<&'a [&'a str]> {
@@ -1047,6 +1129,45 @@ mod tests {
             rows("codex --c"),
             ["codex --config value resume"],
             "a one-edit top-level flag typo must not survive history"
+        );
+    }
+
+    #[test]
+    fn maven_lifecycle_typos_are_filtered_without_running_the_build() {
+        assert_eq!(
+            maven_history_arguments_are_plausible("mvn", &["install"], false),
+            Some(true)
+        );
+        assert_eq!(
+            maven_history_arguments_are_plausible("./mvnw", &["instal"], false),
+            Some(false)
+        );
+        assert_eq!(
+            maven_history_arguments_are_plausible("mvn", &["-q", "pakage"], false),
+            Some(false)
+        );
+        assert_eq!(
+            maven_history_arguments_are_plausible("mvn", &["dependency:tree"], false),
+            Some(true)
+        );
+        assert_eq!(
+            maven_history_arguments_are_plausible("mvn", &["clean", "pakage"], false),
+            Some(false),
+            "every lifecycle phase must be checked, not only the first"
+        );
+        assert_eq!(
+            maven_history_arguments_are_plausible("mvn", &["dependency:tree", "pakage"], false,),
+            Some(false),
+            "an extension goal must not hide a later lifecycle typo"
+        );
+        assert_eq!(
+            maven_history_arguments_are_plausible("mvn", &["process-test-resources"], false),
+            Some(true)
+        );
+        assert_eq!(
+            maven_history_arguments_are_plausible("mvn", &["instal"], true),
+            Some(true),
+            "a recorded successful extension command must be preserved"
         );
     }
 

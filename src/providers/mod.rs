@@ -11,6 +11,7 @@ mod process;
 mod project;
 mod python_module;
 mod ssh;
+mod toolchain;
 
 pub use ai_action::{AiActionProvider, ai_error_candidate, ai_result_candidates};
 pub use alias::AliasProvider;
@@ -25,6 +26,7 @@ pub use process::ProcessProvider;
 pub use project::ProjectProvider;
 pub use python_module::PythonModuleProvider;
 pub use ssh::SshHostProvider;
+pub use toolchain::ToolchainProvider;
 
 use crate::{completion::CompletionContext, parser::TokenKind};
 
@@ -516,6 +518,9 @@ fn executable_argument_slot(context: &CompletionContext) -> bool {
     if find_exec_command_position(context) {
         return true;
     }
+    if rustup_run_executable_position(context) {
+        return true;
+    }
     if delegated_executable_slot(context).is_some() {
         return true;
     }
@@ -549,6 +554,38 @@ fn executable_argument_slot(context: &CompletionContext) -> bool {
         }
         _ => false,
     }
+}
+
+fn rustup_run_executable_position(context: &CompletionContext) -> bool {
+    if context
+        .command()
+        .is_none_or(|command| executable_basename(command) != "rustup")
+    {
+        return false;
+    }
+    let Some((words, position)) = argument_progress(context) else {
+        return false;
+    };
+    let before = words.get(1..=position).unwrap_or_default();
+    let mut index = 0;
+    while let Some(word) = before.get(index).copied() {
+        if word.starts_with('+') || matches!(word, "-v" | "--verbose" | "-q" | "--quiet") {
+            index += 1;
+            continue;
+        }
+        break;
+    }
+    if before.get(index).copied() != Some("run") {
+        return false;
+    }
+    index += 1;
+    if before.get(index).copied() == Some("--install") {
+        index += 1;
+    }
+    before
+        .get(index)
+        .is_some_and(|toolchain| !toolchain.starts_with('-'))
+        && index + 1 == before.len()
 }
 
 /// The executable word inside a `find -exec`, `-execdir`, `-ok`, or `-okdir`
@@ -1251,7 +1288,19 @@ pub(crate) fn resolved_executable_path(
 pub(crate) fn known_standalone_command(command: &str) -> bool {
     matches!(
         executable_basename(command),
-        "claude" | "codex" | "deno" | "systemctl" | "tmux" | "vercel" | "yarn"
+        "claude"
+            | "codex"
+            | "cpp"
+            | "deno"
+            | "gradle"
+            | "gradlew"
+            | "kotlinc"
+            | "kotlinc-jvm"
+            | "swift"
+            | "systemctl"
+            | "tmux"
+            | "vercel"
+            | "yarn"
     )
 }
 
@@ -1268,6 +1317,7 @@ pub(crate) fn known_subcommand_command(command: &str) -> bool {
                 | "brew"
                 | "cargo"
                 | "composer"
+                | "conan"
                 | "consul"
                 | "defaults"
                 | "diskutil"
@@ -1284,13 +1334,16 @@ pub(crate) fn known_subcommand_command(command: &str) -> bool {
                 | "glab"
                 | "go"
                 | "gradle"
+                | "gradlew"
                 | "helm"
                 | "heroku"
                 | "istioctl"
                 | "kubectl"
                 | "launchctl"
                 | "mise"
+                | "meson"
                 | "mvn"
+                | "mvnw"
                 | "nerdctl"
                 | "nix"
                 | "nomad"
@@ -1309,40 +1362,48 @@ pub(crate) fn known_subcommand_command(command: &str) -> bool {
                 | "snap"
                 | "supabase"
                 | "svn"
+                | "swift"
+                | "swift-format"
                 | "terraform"
                 | "tofu"
                 | "uv"
                 | "vagrant"
                 | "vault"
+                | "vcpkg"
                 | "wrangler"
                 | "git"
         )
 }
 
 pub(crate) fn known_required_argument_command(command: &str) -> bool {
+    let command = executable_basename(command);
+    if let Some(driver) = c_family_compiler_driver(command) {
+        return driver != "cpp";
+    }
     matches!(
-        executable_basename(command),
+        command,
         "awk"
             | "basename"
-            | "cc"
             | "chgrp"
             | "chmod"
             | "chown"
-            | "clang"
-            | "clang++"
+            | "clang-tidy"
             | "cmp"
             | "comm"
+            | "cmake"
             | "cp"
             | "curl"
             | "cut"
             | "diff"
             | "dirname"
-            | "g++"
-            | "gcc"
             | "grep"
             | "java"
             | "javac"
             | "join"
+            | "kotlin"
+            | "kotlinc-js"
+            | "kotlinc-native"
+            | "konanc"
             | "ln"
             | "man"
             | "mkdir"
@@ -1354,11 +1415,13 @@ pub(crate) fn known_required_argument_command(command: &str) -> bool {
             | "rmdir"
             | "rsync"
             | "rustc"
+            | "rustdoc"
             | "scp"
             | "sed"
             | "sftp"
             | "ssh"
             | "stat"
+            | "swiftc"
             | "touch"
             | "tr"
             | "unlink"
@@ -1373,6 +1436,33 @@ pub(crate) fn executable_basename(command: &str) -> &str {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(command)
+}
+
+pub(crate) fn is_c_family_compiler(command: &str) -> bool {
+    c_family_compiler_driver(command).is_some()
+}
+
+fn c_family_compiler_driver(command: &str) -> Option<&'static str> {
+    const COMPILERS: &[&str] = &[
+        "clang-cl", "clang++", "clang", "g++", "gcc", "c++", "cc", "cpp",
+    ];
+    let without_version = command.rsplit_once('-').map_or(command, |(stem, suffix)| {
+        if suffix.chars().any(|character| character.is_ascii_digit())
+            && suffix
+                .chars()
+                .all(|character| character.is_ascii_digit() || character == '.')
+        {
+            stem
+        } else {
+            command
+        }
+    });
+    COMPILERS.iter().copied().find(|compiler| {
+        without_version == *compiler
+            || without_version
+                .strip_suffix(compiler)
+                .is_some_and(|prefix| prefix.ends_with('-'))
+    })
 }
 
 pub(crate) fn is_pip_command(command: &str) -> bool {
@@ -2473,23 +2563,48 @@ mod tests {
 
     #[test]
     fn standalone_command_hints_apply_to_explicit_paths() {
-        for command in ["codex", "./bin/codex", "claude", "/opt/bin/claude"] {
+        for command in [
+            "codex",
+            "./bin/codex",
+            "claude",
+            "/opt/bin/claude",
+            "swift",
+            "cpp",
+            "gradle",
+            "gradlew",
+            "kotlinc",
+            "kotlinc-jvm",
+        ] {
             assert!(known_standalone_command(command));
         }
         for command in ["git", "./bin/git", "brew", "/opt/bin/openssl"] {
             assert!(!known_standalone_command(command));
         }
-        for command in ["ssh", "./bin/curl", "/usr/bin/cp", "grep"] {
+        for command in [
+            "ssh",
+            "./bin/curl",
+            "/usr/bin/cp",
+            "grep",
+            "rustdoc",
+            "kotlinc-native",
+            "cmake",
+            "clang-tidy",
+            "gcc-14",
+            "aarch64-linux-gnu-clang++-18",
+        ] {
             assert!(known_required_argument_command(command));
         }
         for command in ["pip", "pip3", "pip3.14", "/opt/bin/pip3.13"] {
             assert!(is_pip_command(command));
             assert!(known_subcommand_command(command));
         }
+        for command in ["swift", "swift-format", "meson", "conan", "vcpkg"] {
+            assert!(known_subcommand_command(command));
+        }
         for command in ["pipeline", "pipx", "pip3.", "pip3x"] {
             assert!(!is_pip_command(command));
         }
-        for command in ["cat", "python", "./bin/codex"] {
+        for command in ["cat", "python", "./bin/codex", "cpp", "kotlinc"] {
             assert!(!known_required_argument_command(command));
         }
     }

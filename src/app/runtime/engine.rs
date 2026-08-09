@@ -18,7 +18,7 @@ use crate::{
     providers::{
         AiActionProvider, CommandHelpCache, CommandHelpProvider, CommandSpecProvider,
         FilesystemProvider, HistoryProvider, NetworkInterfaceProvider, PathCommandProvider,
-        ProcessProvider, ProjectProvider, PythonModuleProvider,
+        ProcessProvider, ProjectProvider, PythonModuleProvider, ToolchainProvider,
     },
     shell::{AliasCache, ShellKind},
     specs::SpecRegistry,
@@ -150,6 +150,7 @@ pub(super) fn build_engine(
         ProjectProvider::new(projects, Arc::clone(&commands), Arc::clone(&history))
             .with_help(Arc::clone(&help)),
     );
+    engine.register(ToolchainProvider::new(Arc::clone(&commands)));
     engine.register(crate::providers::GitProvider::new(
         git_status,
         Arc::new(crate::project::GitRefsCache::default()),

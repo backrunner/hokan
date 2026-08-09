@@ -175,7 +175,7 @@ fn bare_executable_holds_suggestions_until_space() {
 }
 
 #[test]
-fn exact_executable_prefetches_dynamic_help_before_the_space() {
+fn exact_path_command_prefetches_help_but_project_paths_stay_cold() {
     use std::os::unix::fs::PermissionsExt;
 
     let directory = tempfile::tempdir().expect("directory");
@@ -227,7 +227,11 @@ fn exact_executable_prefetches_dynamic_help_before_the_space() {
     )
     .expect("context");
     super::state::prefetch_command_help(&explicit, &commands, &specs, &explicit_help);
-    assert_eq!(explicit_help.fetch_count(), 1);
+    assert_eq!(
+        explicit_help.fetch_count(),
+        0,
+        "project-local executables must not be launched just to discover help"
+    );
 }
 
 #[test]

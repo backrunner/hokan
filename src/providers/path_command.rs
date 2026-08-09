@@ -222,6 +222,7 @@ mod tests {
             "poetry",
             "pipenv",
             "bundle",
+            "rustup",
             "find",
             "xargs",
             "setsid",
@@ -305,6 +306,8 @@ mod tests {
             "poetry -C app run l",
             "pipenv run l",
             "bundle exec l",
+            "rustup run stable l",
+            "rustup run --install nightly l",
         ] {
             assert!(provider.applies(&context(buffer)), "{buffer:?} must fire");
         }
@@ -346,6 +349,8 @@ mod tests {
             "bundle exec ls ",
             "pipenv run -v l",
             "bundle exec -v l",
+            "rustup run stable ls ",
+            "rustup run --install nightly ls ",
         ] {
             assert!(
                 !provider.applies(&context(buffer)),
