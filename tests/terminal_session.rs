@@ -737,7 +737,8 @@ fn man_derived_help_rows_appear_and_file_rows_follow_help_suppression() {
     // `cp ` (no dash; the cp man page documents no subcommands): file
     // completion still works.
     terminal.write(b"\x03");
-    terminal.wait_for_screen("HK> ");
+    terminal.wait_for_bare_row("HK>");
+    terminal.settle(Duration::from_millis(100));
     terminal.write(b"cp ");
     terminal.wait_for_screen(TAG_FILE);
     let text = terminal.screen_text();
