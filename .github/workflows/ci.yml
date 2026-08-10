@@ -19,7 +19,7 @@ jobs:
   quality-linux:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install shell matrix
         run: sudo apt-get update && sudo apt-get install -y fish tmux zsh
       - uses: dtolnay/rust-toolchain@1.96.0
@@ -37,7 +37,7 @@ jobs:
   integration-macos:
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install shell matrix
         run: brew install fish tmux
       - uses: dtolnay/rust-toolchain@1.96.0
@@ -48,7 +48,7 @@ jobs:
   current-stable:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --locked --all-targets
@@ -57,7 +57,7 @@ jobs:
   supply-chain:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.96.0
       - uses: taiki-e/install-action@cargo-audit
       - run: cargo audit --deny warnings
