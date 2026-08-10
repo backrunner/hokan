@@ -1369,12 +1369,17 @@ fn consume_opaque(bytes: &[u8], mut index: usize) -> usize {
     let mut depth = 1_u32;
     while index < bytes.len() && depth > 0 {
         match bytes[index] {
-            b'(' => depth += 1,
-            b')' => depth -= 1,
-            b'\\' => index = (index + 1).min(bytes.len()),
-            _ => {}
+            b'(' => {
+                depth += 1;
+                index += 1;
+            }
+            b')' => {
+                depth -= 1;
+                index += 1;
+            }
+            b'\\' => index = (index + 2).min(bytes.len()),
+            _ => index += 1,
         }
-        index += 1;
     }
     index
 }
@@ -1441,6 +1446,14 @@ mod tests {
                 .iter()
                 .any(|token| token.quote == QuoteContext::Opaque)
         );
+    }
+
+    #[test]
+    fn incomplete_opaque_substitution_with_trailing_escape_stays_in_bounds() {
+        let text = "$(\\";
+        let parsed = parse_line(text, text.len()).expect("incomplete substitution should parse");
+        assert_eq!(parsed.tokens[0].range, 0..text.len());
+        assert_eq!(parsed.tokens[0].quote, QuoteContext::Opaque);
     }
 
     #[test]
