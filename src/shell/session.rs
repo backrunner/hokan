@@ -169,6 +169,9 @@ impl ShellSession {
             "if [[ ! -o login ]]; then\n  export ZDOTDIR=\"$__hokan_user_zdotdir\"\nfi\n",
         );
         write_private(&zdotdir.join(".zshrc"), zshrc.as_bytes())?;
+        if !source_user_config {
+            command.arg("-d");
+        }
         if login {
             write_private(
                 &zdotdir.join(".zprofile"),
@@ -571,5 +574,15 @@ mod tests {
 
         let login = zsh_startup_loader(".zlogin", wrapper, true, true);
         assert!(login.ends_with("export ZDOTDIR=\"$__hokan_user_zdotdir\"\n"));
+    }
+
+    #[test]
+    fn isolated_zsh_disables_global_startup_files() {
+        let session = ShellSession::new(ShellKind::Zsh).expect("session should initialize");
+        let command = session
+            .command_builder_isolated(false)
+            .expect("isolated command should build");
+
+        assert!(command.get_argv().iter().any(|argument| argument == "-d"));
     }
 }

@@ -116,6 +116,7 @@ if [[ -n ${HOKAN_ACTIVE:-} && -n ${HOKAN_CONTROL_FIFO:-} && -z ${__HOKAN_ZSH_LOA
   }
 
   autoload -Uz add-zsh-hook add-zle-hook-widget
+  zmodload zsh/zle
   add-zsh-hook precmd __hokan_precmd
   add-zsh-hook preexec __hokan_preexec
   add-zle-hook-widget line-pre-redraw __hokan_line_pre_redraw
@@ -283,6 +284,7 @@ mod tests {
         assert!(init_script(ShellKind::Zsh).contains("__hokan_refresh_prompt"));
         assert!(init_script(ShellKind::Zsh).contains("__hokan_apply_accept"));
         assert!(init_script(ShellKind::Zsh).contains("zle accept-line"));
+        assert!(init_script(ShellKind::Zsh).contains("zmodload zsh/zle"));
         assert!(init_script(ShellKind::Zsh).contains("bindkey '\\e[98~'"));
         assert!(init_script(ShellKind::Bash).contains("READLINE_LINE="));
         assert!(init_script(ShellKind::Fish).contains("commandline --replace"));
