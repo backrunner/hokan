@@ -80,7 +80,7 @@ impl TerminalSession {
         fs::create_dir(&user_zdotdir).expect("custom ZDOTDIR");
         fs::write(
             home.path().join(".zshenv"),
-            "export ZDOTDIR=\"$HOME/custom-zdotdir\"\n",
+            "unsetopt GLOBAL_RCS\nexport ZDOTDIR=\"$HOME/custom-zdotdir\"\n",
         )
         .expect("zshenv fixture");
         fs::write(
@@ -1985,6 +1985,7 @@ fn fixture_directories() -> (TempDir, TempDir) {
 fn empty_fixture_directories() -> (TempDir, TempDir) {
     let home = tempfile::tempdir().expect("temporary HOME");
     let work = tempfile::tempdir().expect("temporary CWD");
+    fs::write(home.path().join(".zshenv"), "unsetopt GLOBAL_RCS\n").expect("fixture zshenv");
     fs::create_dir_all(home.path().join(".config/hokan")).expect("config directory");
     fs::create_dir_all(home.path().join(".local/state/hokan")).expect("state directory");
     fs::create_dir_all(home.path().join(".cache/hokan")).expect("cache directory");
