@@ -241,7 +241,10 @@ mod tests {
         let bin = root.join("bin");
         fs::create_dir_all(&bin).expect("bin dir");
         let current_exe = bin.join("hokan");
-        write_stub_binary(&current_exe, "#!/bin/sh\necho hokan 0.1.0\n");
+        write_stub_binary(
+            &current_exe,
+            &format!("#!/bin/sh\necho hokan {}\n", env!("CARGO_PKG_VERSION")),
+        );
         UpgradePaths {
             current_exe,
             state_dir: root.join("state"),
@@ -324,7 +327,10 @@ mod tests {
         let (result, output, _) = run_scripted("", false, &paths, &upgrade_paths, &args);
         result.expect("check run");
         assert!(
-            output.contains("当前 v0.1.0 → 最新 v9.9.9 [stable]"),
+            output.contains(&format!(
+                "当前 v{} → 最新 v9.9.9 [stable]",
+                env!("CARGO_PKG_VERSION")
+            )),
             "{output}"
         );
         assert!(output.contains("可升级"), "{output}");
@@ -350,7 +356,10 @@ mod tests {
         assert!(output.contains("确认升级？[Y/n]"), "{output}");
         assert!(output.contains("SHA256 校验与冒烟测试通过"), "{output}");
         assert!(
-            output.contains("升级完成：v0.1.0 → v9.9.9，下次启动生效"),
+            output.contains(&format!(
+                "升级完成：v{} → v9.9.9，下次启动生效",
+                env!("CARGO_PKG_VERSION")
+            )),
             "{output}"
         );
         join.join().expect("server thread");
@@ -358,7 +367,7 @@ mod tests {
         assert!(new_exe.contains("9.9.9"), "{new_exe}");
         // 单份备份保留旧版本。
         let backup = fs::read_to_string(root.path().join("bin/hokan.bak")).expect("backup");
-        assert!(backup.contains("0.1.0"), "{backup}");
+        assert!(backup.contains(env!("CARGO_PKG_VERSION")), "{backup}");
     }
 
     #[test]

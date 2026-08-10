@@ -18,18 +18,32 @@ use super::api;
 
 pub(crate) struct MockReply {
     status: &'static str,
+    headers: Vec<(&'static str, String)>,
     body: Vec<u8>,
 }
 
 pub(crate) fn json_reply(status: &'static str, body: serde_json::Value) -> MockReply {
     MockReply {
         status,
+        headers: Vec::new(),
         body: serde_json::to_vec(&body).expect("reply JSON"),
     }
 }
 
 pub(crate) fn raw_reply(status: &'static str, body: Vec<u8>) -> MockReply {
-    MockReply { status, body }
+    MockReply {
+        status,
+        headers: Vec::new(),
+        body,
+    }
+}
+
+pub(crate) fn redirect_reply(location: &str) -> MockReply {
+    MockReply {
+        status: "302 Found",
+        headers: vec![("Location", location.to_owned())],
+        body: Vec::new(),
+    }
 }
 
 /// Serves exactly `requests` connections, routing each request path through
@@ -51,13 +65,22 @@ pub(crate) fn spawn_server(
             let path = read_request_path(&mut stream);
             let reply = handler(&path);
             let body = replace_base(&reply.body, &thread_base);
+            let headers: Vec<_> = reply
+                .headers
+                .iter()
+                .map(|(name, value)| (*name, value.replace("{BASE}", &thread_base)))
+                .collect();
             write!(
                 stream,
-                "HTTP/1.1 {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 {}\r\nContent-Length: {}\r\nConnection: close\r\n",
                 reply.status,
                 body.len()
             )
             .expect("write headers");
+            for (name, value) in headers {
+                write!(stream, "{name}: {value}\r\n").expect("write response header");
+            }
+            write!(stream, "\r\n").expect("finish response headers");
             stream.write_all(&body).expect("write body");
             stream.flush().expect("flush response");
         }

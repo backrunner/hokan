@@ -18,19 +18,21 @@ command recipes, files, project scripts, Git state, aliases, functions, man
 pages, and explicitly requested AI suggestions without replacing your prompt
 or launching a GUI.
 
-Hokan is currently a `0.1.0` beta candidate. The core terminal recovery path is
-covered by real PTY tests, while several terminal, SSH, tmux, fish, and
+Hokan `0.1.0-beta.1` is the first public beta. The core terminal recovery path
+is covered by real PTY tests, while several terminal, SSH, tmux, fish, and
 cross-platform combinations still require release certification. See the
 [compatibility matrix](docs/compatibility.md) for the exact status.
 
 ## Quick start
 
-Install the latest prebuilt release on macOS or Linux. The installer detects
-the OS, CPU architecture, and current shell; verifies the release against
-`SHA256SUMS`; installs into your home directory; and runs `hokan install`.
+Install the first beta on macOS or Linux. The installer detects the OS, CPU
+architecture, and current shell; verifies the release against `SHA256SUMS`;
+installs into your home directory; and runs `hokan install`.
 
 ```bash
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/backrunner/hokan/releases/latest/download/hokan-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/backrunner/hokan/releases/download/v0.1.0-beta.1/hokan-installer.sh \
+  | HOKAN_VERSION=0.1.0-beta.1 sh
 ```
 
 Open a new terminal, or restart the current shell:
@@ -42,8 +44,11 @@ exec "$SHELL" -l
 Then verify the environment:
 
 ```bash
+hokan --version
 hokan doctor
 ```
+
+`hokan --version` and its short form `hokan -V` print the installed version.
 
 The default installation uses `~/.local/bin/hokan` and
 `~/.local/share/man/man1/hokan.1`. It does not require `sudo`.
@@ -52,8 +57,8 @@ Prefer an on-demand `hk` command instead of automatic startup:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/backrunner/hokan/releases/latest/download/hokan-installer.sh \
-  | HOKAN_ON_DEMAND=1 sh
+  https://github.com/backrunner/hokan/releases/download/v0.1.0-beta.1/hokan-installer.sh \
+  | HOKAN_VERSION=0.1.0-beta.1 HOKAN_ON_DEMAND=1 sh
 ```
 
 ## Why Hokan
@@ -162,7 +167,7 @@ The release installer supports these optional environment variables:
 
 | Variable | Purpose |
 | --- | --- |
-| `HOKAN_VERSION` | Install an exact release such as `0.1.0` |
+| `HOKAN_VERSION` | Install an exact release such as `0.1.0-beta.1` |
 | `HOKAN_INSTALL_DIR` | Override the binary directory |
 | `HOKAN_MAN_DIR` | Override the man-page directory |
 | `HOKAN_SHELL` | Select `zsh`, `bash`, or `fish` |

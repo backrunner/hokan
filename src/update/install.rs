@@ -43,7 +43,7 @@ pub(crate) fn download_and_install(
     // remove_file on a missing path is ignored anyway.
     let temp = TempFiles(vec![archive_tmp.clone(), staged.clone()]);
 
-    let client = api::http_client()?;
+    let client = api::download_client()?;
     let archive = api::block_on(api::download(
         &client,
         &release.archive_url,

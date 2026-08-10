@@ -1,6 +1,6 @@
 # Hokan 兼容矩阵
 
-更新日期：2026-08-08。
+更新日期：2026-08-11。
 
 本页区分实现能力、自动化验证和真实环境认证。只有标记为“实测通过”的组合才代表当前
 机器完成了端到端验证；“待认证”不能被发布说明改写为已支持。
@@ -35,9 +35,10 @@ v1 面向 macOS 和 Linux 上支持 UTF-8 与常见 ANSI/VT 控制序列的 POSI
 
 ## 终端应用
 
-Terminal.app、iTerm2、Ghostty、Kitty、WezTerm 和 Alacritty 均在发布阻断矩阵内，但
+Terminal.app、iTerm2、Ghostty、Kitty、WezTerm 和 Alacritty 均在发布认证矩阵内，但
 本轮尚未逐一完成 120 FPS 录制、overlay rect blank-frame 检测和人工 cursor/prompt
-检查。因此当前版本应称为 beta candidate，而不是已经认证的 beta。
+检查。因此首个 GitHub prerelease 用于公开 beta 验证，不表示这些组合已完成认证；
+兼容性承诺仍以本表状态为准。
 
 ## Shell 能力
 

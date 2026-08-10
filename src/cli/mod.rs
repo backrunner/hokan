@@ -285,6 +285,18 @@ mod tests {
     }
 
     #[test]
+    fn version_flags_report_the_package_version() {
+        for flag in ["--version", "-V"] {
+            let error = Cli::try_parse_from(["hokan", flag]).expect_err("version exits early");
+            assert_eq!(error.kind(), clap::error::ErrorKind::DisplayVersion);
+            assert_eq!(
+                error.to_string(),
+                format!("hokan {}\n", env!("CARGO_PKG_VERSION"))
+            );
+        }
+    }
+
+    #[test]
     fn init_outputs_versioned_shell_code() {
         let cli = Cli::try_parse_from(["hokan", "init", "zsh"]).expect("CLI should parse");
         let mut output = Vec::new();

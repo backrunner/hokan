@@ -15,6 +15,7 @@ use super::{Channel, UpdateError};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const ASSET_REDIRECT_LIMIT: usize = 5;
 /// Cap on release-metadata bodies; real replies are a few KiB of JSON.
 const RESPONSE_BODY_MAX_BYTES: usize = 1024 * 1024;
 
@@ -40,9 +41,9 @@ where
         .block_on(future))
 }
 
-/// Shared client for API calls and archive downloads: fixed timeouts, no
-/// redirects, and a `User-Agent` identifying hokan (GitHub requires one).
-pub(crate) fn http_client() -> Result<Client, UpdateError> {
+/// GitHub API client: metadata requests never need redirects, so keep them
+/// disabled and fail closed if an unexpected redirect is returned.
+pub(crate) fn api_client() -> Result<Client, UpdateError> {
     Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(REQUEST_TIMEOUT)
@@ -52,11 +53,36 @@ pub(crate) fn http_client() -> Result<Client, UpdateError> {
         .map_err(|_| UpdateError::Network)
 }
 
+/// Release assets normally redirect from GitHub to its asset storage. Follow
+/// a small number of redirects, but never allow a scheme change (including an
+/// HTTPS downgrade). Asset requests carry no credentials.
+pub(crate) fn download_client() -> Result<Client, UpdateError> {
+    Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
+        .user_agent(concat!("hokan/", env!("CARGO_PKG_VERSION")))
+        .redirect(Policy::custom(|attempt| {
+            if attempt.previous().len() >= ASSET_REDIRECT_LIMIT {
+                attempt.error("too many release asset redirects")
+            } else if attempt
+                .previous()
+                .last()
+                .is_some_and(|previous| previous.scheme() != attempt.url().scheme())
+            {
+                attempt.error("release asset redirect changed URL scheme")
+            } else {
+                attempt.follow()
+            }
+        }))
+        .build()
+        .map_err(|_| UpdateError::Network)
+}
+
 /// Resolves the newest release for `channel`. Beta takes the highest semver
 /// across recent releases (prereleases included) and the latest stable, so
 /// beta users never fall behind a newer stable release.
 pub fn fetch_latest(channel: Channel, base: &str, repo: &str) -> Result<ReleaseInfo, UpdateError> {
-    let client = http_client()?;
+    let client = api_client()?;
     let base = base.trim_end_matches('/');
     block_on(async {
         match channel {
@@ -209,7 +235,24 @@ struct Asset {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::update::test_support::{archive_asset, json_reply, release_json, spawn_server};
+    use crate::update::test_support::{
+        archive_asset, json_reply, raw_reply, redirect_reply, release_json, spawn_server,
+    };
+
+    #[test]
+    fn release_asset_download_follows_same_scheme_redirects() {
+        let (base, join) = spawn_server(2, move |path| match path {
+            "/asset" => redirect_reply("{BASE}/download/asset"),
+            "/download/asset" => raw_reply("200 OK", b"release asset".to_vec()),
+            _ => raw_reply("404 Not Found", Vec::new()),
+        });
+        let client = download_client().expect("download client");
+        let body = block_on(download(&client, &format!("{base}/asset"), 1024))
+            .expect("runtime")
+            .expect("redirected download");
+        assert_eq!(body, b"release asset");
+        join.join().expect("server thread");
+    }
 
     #[test]
     fn stable_channel_parses_latest_release() {

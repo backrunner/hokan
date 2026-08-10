@@ -1,13 +1,13 @@
 # Hokan v0.1 实现与验收状态
 
-更新日期：2026-08-02。
+更新日期：2026-08-11。
 
 ## 结论
 
 原始五类功能已从 provider、排序、列表交互接通到真实 shell buffer；PTY wrapper、唯一
-stdout writer、无闪烁 compositor、异常恢复和维护 CLI 也已实现。当前代码状态是 beta
-candidate，不是已认证 beta：Fish、SSH、tmux 3.7+、Linux 实机和六个指定终端应用仍需
-按发布矩阵完成录制与人工检查。
+stdout writer、无闪烁 compositor、异常恢复和维护 CLI 也已实现。当前代码状态是首个
+公开 beta（`0.1.0-beta.1`），不是完成全矩阵认证的稳定版：Fish、SSH、tmux 3.7+、
+Linux 实机和六个指定终端应用仍需按发布矩阵完成录制与人工检查。
 
 2026-08-02 的发布前复核又完成了以下加固：output actor 在 I/O/compositor 错误或 panic
 后会封闭 mailbox 并释放同步等待者；PTY child 的异常路径会关闭 writer、终止并回收子
@@ -52,8 +52,9 @@ zsh setup 块固定在 `.zshrc` 顶部，外层在用户配置加载前进入 Ho
 ## 安全与数据边界
 
 - AI 普通输入不联网；只有激活 action 才创建请求，取消 token 与 query id 阻止迟到覆盖。
-- client 禁止 redirect，限制 header/body timeout 和 128 KiB body；响应命令拒绝多行、NUL、
-  C0/C1 和 ANSI。
+- AI client 禁止 redirect，限制 header/body timeout 和 128 KiB body；响应命令拒绝多行、
+  NUL、C0/C1 和 ANSI。release updater 的元数据请求同样禁止 redirect；无凭据的资产下载
+  只允许同协议的有限次 redirect，并继续以发布的 SHA256SUMS 为信任边界。
 - 风险分类覆盖递归/强制删除、`find -delete/-exec`、递归 chmod/chown、download-to-shell、
   `dd`/redirect 写设备、mkfs、shred/truncate、signal、shell `-c`、命令替换和进程替换；
   不能证明安全的嵌套执行语法统一为 `Unknown`。
@@ -102,7 +103,8 @@ zsh setup 块固定在 `.zshrc` 顶部，外层在用户配置加载前进入 Ho
 
 ## 尚未完成的外部认证
 
-以下事项不能在当前单台 macOS arm64 主机上伪造为完成，也是 beta 发布前的剩余阻断项：
+以下事项不能在当前单台 macOS arm64 主机上伪造为完成，也是稳定版和完整兼容承诺前的
+剩余认证项：
 
 - Fish 3.6+ 真实 buffer 回填与默认键位；
 - tmux 3.7+ 的真实 DECRQM/mode 2026 路径；
@@ -112,4 +114,5 @@ zsh setup 块固定在 `.zshrc` 顶部，外层在用户配置加载前进入 Ho
   frame 检测和 cursor/prompt 人工检查。
 
 精确执行模板和状态表见 `docs/release-checklist.md` 与 `docs/compatibility.md`。这些外部项
-通过前可以交付源码和 beta candidate artifact，但不能发布为已经满足完整兼容承诺的 beta。
+通过前可以发布明确标注范围的 prerelease beta 以收集真实环境反馈，但不能把待认证项
+宣传为已支持，也不能发布稳定版或声称满足完整兼容承诺。

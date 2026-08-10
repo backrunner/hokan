@@ -288,7 +288,7 @@ mod tests {
         assert_eq!(
             outcome,
             UpgradeOutcome::Checked {
-                current: Version::parse("0.1.0").expect("current"),
+                current: Version::parse(env!("CARGO_PKG_VERSION")).expect("current"),
                 latest: Version::parse("9.9.9").expect("latest"),
             }
         );
@@ -314,7 +314,7 @@ mod tests {
         assert_eq!(
             outcome,
             UpgradeOutcome::AlreadyCurrent {
-                version: Version::parse("0.1.0").expect("current"),
+                version: Version::parse(env!("CARGO_PKG_VERSION")).expect("current"),
             }
         );
         join.join().expect("server thread");

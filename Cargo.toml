@@ -1,11 +1,12 @@
 [package]
 name = "hokan"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 edition = "2024"
 rust-version = "1.96"
 description = "A shell-aware terminal completion overlay"
 license = "BSD-3-Clause"
 readme = "README.md"
+repository = "https://github.com/backrunner/hokan"
 documentation = "https://docs.rs/hokan"
 keywords = ["completion", "pty", "shell", "terminal", "tui"]
 categories = ["command-line-utilities", "development-tools"]

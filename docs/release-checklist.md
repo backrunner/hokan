@@ -9,6 +9,9 @@
   只有 `channel = "beta"` 的用户看到；beta 渠道取 prerelease 与 stable 的较新者。
 - 两种 tag 都必须与 `Cargo.toml` 的 `version` 完全一致（含 `-beta.N` 后缀），
   workflow 会拒绝版本不一致。
+- 首个 prerelease beta 用于公开真实环境验证；待认证组合必须继续明确标记，不能写成
+  “已支持”。任何已知且可复现的 P0/P1 故障仍会阻止 beta；稳定版和完整兼容承诺必须先
+  完成下方真实环境认证矩阵。
 
 ## 自动化门槛
 
@@ -31,7 +34,7 @@ cargo package --locked
 - AI mock 必须覆盖成功、HTTP 错误、timeout、取消、body limit、恶意控制字符和 secret 扫描。
 - 四个 target 的归档必须附带 SHA256 和 SPDX JSON SBOM。
 
-## 真实环境阻断矩阵
+## 真实环境认证矩阵
 
 每个组合执行固定按键脚本和至少 120 FPS 录制，检测 overlay rect 的 blank/half frame，
 再人工检查 cursor、prompt、scrollback 和 termios。精确记录写入 `docs/compatibility.md`。
@@ -62,7 +65,7 @@ overlay、跨 control sequence 写入、AI 隐式联网或 secret 泄漏都会�
 2. 在干净机器校验 `SHA256SUMS`，解压对应 target 归档。
 3. 运行 `bin/hokan --version`、`doctor --json`、`spec validate`。
 4. 用临时 rc 文件验证 `install` 幂等、备份、`setup` 兼容别名和 `uninstall`。
-5. 检查归档包含 README、双许可证和 `share/man/man1/hokan.1`。
+5. 检查归档包含 README、BSD-3-Clause 许可证和 `share/man/man1/hokan.1`。
 6. 检查每个 target 对应的 `.spdx.json` 可解析且与同一构建产物关联。
 
 ## Release profile
