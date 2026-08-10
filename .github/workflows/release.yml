@@ -58,7 +58,7 @@ jobs:
       - name: Generate SPDX SBOM
         uses: anchore/sbom-action@v0
         with:
-          path: target/${{ matrix.target }}/release/hokan
+          file: target/${{ matrix.target }}/release/hokan
           format: spdx-json
           output-file: dist/hokan-${{ github.ref_name }}-${{ matrix.target }}.spdx.json
           upload-artifact: false
