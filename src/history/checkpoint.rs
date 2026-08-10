@@ -331,7 +331,8 @@ mod tests {
         let truncated = ImportSourceState::inspect(&source).expect("inspect truncate");
         assert_eq!(checkpoints.start_offset(ShellKind::Bash, &truncated), 0);
 
-        fs::remove_file(&source).expect("remove old source");
+        let rotated_source = directory.path().join("history.old");
+        fs::rename(&source, rotated_source).expect("rotate old source");
         fs::write(&source, b"rotated\n").expect("rotated source");
         let rotated = ImportSourceState::inspect(&source).expect("inspect rotation");
         assert_eq!(checkpoints.start_offset(ShellKind::Bash, &rotated), 0);

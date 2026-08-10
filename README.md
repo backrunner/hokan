@@ -336,7 +336,7 @@ Additional documentation:
 
 ## Acknowledgments
 
-Inspired by iris.
+Inspired by [IRIS](https://github.com/versenilvis/IRIS).
 
 ## License
 
