@@ -62,6 +62,7 @@ jobs:
           format: spdx-json
           output-file: dist/hokan-${{ github.ref_name }}-${{ matrix.target }}.spdx.json
           upload-artifact: false
+          upload-release-assets: false
       - uses: actions/upload-artifact@v4
         with:
           name: hokan-${{ matrix.target }}
