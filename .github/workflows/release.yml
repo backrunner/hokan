@@ -74,7 +74,7 @@ jobs:
           output-file: dist/hokan-${{ inputs.tag || github.ref_name }}-${{ matrix.target }}.spdx.json
           upload-artifact: false
           upload-release-assets: false
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: hokan-${{ matrix.target }}
           path: dist/*
@@ -89,7 +89,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.tag || github.ref_name }}
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
