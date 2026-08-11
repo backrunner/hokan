@@ -4,12 +4,21 @@ on:
   push:
     tags:
       - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to build
+        required: true
+        type: string
+
+run-name: Release ${{ inputs.tag || github.ref_name }}
 
 permissions:
   contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   build:
@@ -32,6 +41,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
       - uses: dtolnay/rust-toolchain@1.96.0
         with:
           targets: ${{ matrix.target }}
@@ -44,7 +55,7 @@ jobs:
         shell: bash
         run: |
           package_version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
-          tag_version=${GITHUB_REF_NAME#v}
+          tag_version=${RELEASE_TAG#v}
           test "$package_version" = "$tag_version"
       - name: Build with Cargo
         if: matrix.builder == 'cargo'
@@ -54,13 +65,13 @@ jobs:
         run: cross build --locked --release --target ${{ matrix.target }}
       - name: Package
         shell: bash
-        run: scripts/package-release.sh "${{ matrix.target }}" "${GITHUB_REF_NAME#v}"
+        run: scripts/package-release.sh "${{ matrix.target }}" "${RELEASE_TAG#v}"
       - name: Generate SPDX SBOM
         uses: anchore/sbom-action@v0
         with:
           file: target/${{ matrix.target }}/release/hokan
           format: spdx-json
-          output-file: dist/hokan-${{ github.ref_name }}-${{ matrix.target }}.spdx.json
+          output-file: dist/hokan-${{ inputs.tag || github.ref_name }}-${{ matrix.target }}.spdx.json
           upload-artifact: false
           upload-release-assets: false
       - uses: actions/upload-artifact@v4
@@ -76,6 +87,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -87,7 +100,8 @@ jobs:
         run: sha256sum *.tar.gz *.spdx.json hokan-installer.sh > SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
           generate_release_notes: true
           # Beta channels ship as pre-releases (tags like v0.2.0-beta.1).
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          prerelease: ${{ contains(inputs.tag || github.ref_name, '-') }}
           files: dist/*
