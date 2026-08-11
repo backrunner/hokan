@@ -127,7 +127,7 @@ struct ResponsesContentItem {
 
 #[cfg(test)]
 mod tests {
-    use std::{thread, time::Duration};
+    use std::{sync::mpsc, time::Duration};
 
     use super::*;
     use crate::{
@@ -292,23 +292,20 @@ mod tests {
         let credential_path = directory.path().join("credentials.toml");
         write_oauth_credential(&credential_path, "openai-oauth", "codex-access", FAR_FUTURE);
 
-        let (base, _requests, join) = spawn_mock_server(1, |_| {
-            thread::sleep(Duration::from_millis(150));
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let (base, _requests, join) = spawn_mock_server(1, move |_| {
+            trigger.cancel();
+            release_receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("cancelled request must return before response");
             json_reply("200 OK", two_part_reply())
         });
         let client = codex_client(&base, &credential_path, 2_000);
-        let cancel = CancellationToken::new();
-        let trigger = cancel.clone();
-        let started = std::time::Instant::now();
-        let error = runtime().block_on(async {
-            tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-                trigger.cancel();
-            });
-            client.request(&context(), &cancel).await
-        });
+        let error = runtime().block_on(client.request(&context(), &cancel));
+        release_sender.send(()).expect("release server");
         assert_eq!(error.expect_err("cancel request"), AiClientError::Cancelled);
-        assert!(started.elapsed() < Duration::from_millis(120));
         join.join().expect("server");
     }
 }

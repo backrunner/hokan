@@ -4,7 +4,7 @@ use std::{
     path::PathBuf,
     sync::mpsc,
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use super::*;
@@ -270,23 +270,20 @@ fn enforces_body_limit_and_json_shape() {
 
 #[test]
 fn cancellation_interrupts_slow_headers() {
-    let (endpoint, _, join) = spawn_server(|stream| {
-        thread::sleep(Duration::from_millis(150));
+    let cancel = CancellationToken::new();
+    let trigger = cancel.clone();
+    let (release_sender, release_receiver) = mpsc::channel();
+    let (endpoint, _, join) = spawn_server(move |stream| {
+        trigger.cancel();
+        release_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("cancelled request must return before response");
         let _ = write_response_after_cancel(stream);
     });
     let test = test_client(&endpoint, Duration::from_secs(2));
-    let cancel = CancellationToken::new();
-    let trigger = cancel.clone();
-    let started = Instant::now();
-    let error = runtime().block_on(async {
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            trigger.cancel();
-        });
-        test.client.request(&context(), &cancel).await
-    });
+    let error = runtime().block_on(test.client.request(&context(), &cancel));
+    release_sender.send(()).expect("release server");
     assert_eq!(error.expect_err("cancel request"), AiClientError::Cancelled);
-    assert!(started.elapsed() < Duration::from_millis(120));
     join.join().expect("server");
 }
 
