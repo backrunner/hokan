@@ -115,6 +115,20 @@ To bypass automatic startup for one shell process:
 HOKAN_AUTO_START=0 zsh -l
 ```
 
+When Hokan is already active, leave it and continue in the underlying,
+unwrapped shell with:
+
+```bash
+hokan-leave
+```
+
+This is a session-scoped shell function available only inside Hokan. With an
+automatic installation it returns to the shell that started Hokan; in
+on-demand mode it returns to the shell that called `hk`. Plain `exit` and
+`Ctrl-D` keep their normal meaning and close the current shell session.
+After upgrading an existing Hokan installation, rerun `hokan install` once so
+the managed startup block preserves the underlying shell for this command.
+
 You can also skip rc-file changes and launch Hokan directly:
 
 ```bash

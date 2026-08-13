@@ -32,7 +32,6 @@ type EngineParts = (
     Arc<SpecRegistry>,
     Arc<CommandPathCache>,
     Arc<CommandHelpCache>,
-    Arc<AliasCache>,
 );
 
 pub(super) fn load_history(
@@ -159,6 +158,7 @@ pub(super) fn build_engine(
     engine.register(crate::providers::SshHostProvider::new(Arc::clone(
         &commands,
     )));
+    engine.register(crate::providers::SessionCommandProvider);
     engine.register(PathCommandProvider::new(Arc::clone(&commands)));
     engine.register(PythonModuleProvider::new(
         Arc::clone(&commands),
@@ -201,5 +201,5 @@ pub(super) fn build_engine(
         Arc::clone(&specs),
         Arc::clone(&aliases),
     ));
-    (Arc::new(engine), specs, commands, help, aliases)
+    (Arc::new(engine), specs, commands, help)
 }

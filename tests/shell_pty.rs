@@ -30,6 +30,45 @@ fn bash_32_mirrored_replacement_works_in_a_real_pty() {
     exercise_shell(ShellKind::Bash, false);
 }
 
+#[test]
+fn bash_hokan_leave_marks_the_session_and_exits() {
+    if !command_exists("bash") {
+        return;
+    }
+    let session = ShellSession::new(ShellKind::Bash).expect("shell session");
+    let mut command = session
+        .command_builder_isolated(false)
+        .expect("isolated bash command");
+    command.env("HOKAN_BIN", env!("CARGO_BIN_EXE_hokan"));
+    command.env("TERM", "xterm-256color");
+    command.env("PS1", "HK> ");
+    let (sender, receiver) = crossbeam_channel::unbounded();
+    let control = session
+        .start_control_reader(sender)
+        .expect("control reader");
+    let size = TerminalSize::new(24, 80).expect("terminal size");
+    let mut child = PtyChild::spawn(command, size).expect("spawn bash");
+    child.enable_nonblocking_reads().expect("nonblocking PTY");
+    let mut reader = child.take_reader().expect("PTY reader");
+
+    wait_for_prompt(&receiver, &mut *reader);
+    let _ = read_until(&mut *reader, b"HK> ", Duration::from_secs(1));
+    child.write_all(b"hokan-leave\r").expect("leave command");
+
+    let deadline = Instant::now() + TIMEOUT;
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait().expect("child status") {
+            assert_eq!(status.exit_code(), 0);
+            assert!(session.leave_requested().expect("leave marker"));
+            drop(control);
+            return;
+        }
+        let _ = read_until(&mut *reader, b"\r\n", Duration::from_millis(20));
+    }
+    child.kill().expect("kill timed out bash");
+    panic!("bash did not exit after hokan-leave");
+}
+
 fn exercise_shell(shell: ShellKind, expect_exact_snapshot: bool) {
     let session = ShellSession::new(shell).expect("shell session");
     let cwd_fixture = tempfile::tempdir().expect("working directory fixture");

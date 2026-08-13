@@ -115,6 +115,15 @@ if [[ -n ${HOKAN_ACTIVE:-} && -n ${HOKAN_CONTROL_FIFO:-} && -z ${__HOKAN_ZSH_LOA
     zle accept-line
   }
 
+  function hokan-leave() {
+    if (( $# )); then
+      print -u2 -- 'usage: hokan-leave'
+      return 2
+    fi
+    "${HOKAN_BIN:-hokan}" ipc leave --session "$HOKAN_SESSION_TOKEN" || return
+    builtin exit 0
+  }
+
   autoload -Uz add-zsh-hook add-zle-hook-widget
   zmodload zsh/zle
   add-zsh-hook precmd __hokan_precmd
@@ -189,6 +198,15 @@ if [[ -n ${HOKAN_ACTIVE:-} && -n ${HOKAN_CONTROL_FIFO:-} && -z ${__HOKAN_BASH_LO
     READLINE_POINT=$next_cursor
   }
 
+  hokan-leave() {
+    if (( $# )); then
+      printf '%s\n' 'usage: hokan-leave' >&2
+      return 2
+    fi
+    "${HOKAN_BIN:-hokan}" ipc leave --session "$HOKAN_SESSION_TOKEN" || return
+    builtin exit 0
+  }
+
   bind -x '"\C-x\C-]":__hokan_apply'
   __hokan_original_prompt_command=${PROMPT_COMMAND:-}
   PROMPT_COMMAND='__hokan_last_status=$?; __hokan_restore_status;'
@@ -248,6 +266,15 @@ if test -n "$HOKAN_ACTIVE"; and test -n "$HOKAN_CONTROL_FIFO"; \
     commandline -f repaint
   end
 
+  function hokan-leave --description 'Leave Hokan and return to the underlying shell'
+    if test (count $argv) -ne 0
+      echo 'usage: hokan-leave' >&2
+      return 2
+    end
+    command "$HOKAN_BIN" ipc leave --session "$HOKAN_SESSION_TOKEN"; or return
+    builtin exit 0
+  end
+
   functions -c fish_prompt __hokan_original_fish_prompt
   function fish_prompt
     set -g __hokan_prompt_id (math $__hokan_prompt_id + 1)
@@ -277,6 +304,8 @@ mod tests {
             assert!(script.contains("HKP2\\tPATH\\t%s\\0"));
             assert!(script.contains("HOKAN_ACTIVE"));
             assert!(script.contains("ipc take"));
+            assert!(script.contains("hokan-leave"));
+            assert!(script.contains("ipc leave"));
             assert!(script.contains("HKP2"));
             assert!(script.contains("6973;hokan;1"));
         }

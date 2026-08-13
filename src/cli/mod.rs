@@ -184,6 +184,10 @@ enum IpcCommand {
         #[arg(long)]
         session: String,
     },
+    Leave {
+        #[arg(long)]
+        session: String,
+    },
 }
 
 pub fn run<W: Write>(cli: Cli, output: &mut W) -> crate::Result<Option<SessionOptions>> {
@@ -264,6 +268,10 @@ pub fn run<W: Write>(cli: Cli, output: &mut W) -> crate::Result<Option<SessionOp
             output.write_all(
                 crate::shell::ShellSession::take_edit_from_environment(&session)?.as_bytes(),
             )?;
+            Ok(None)
+        }
+        Some(Command::Ipc(IpcCommand::Leave { session })) => {
+            crate::shell::ShellSession::request_leave_from_environment(&session)?;
             Ok(None)
         }
     }

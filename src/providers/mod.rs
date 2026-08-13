@@ -10,6 +10,7 @@ mod path_command;
 mod process;
 mod project;
 mod python_module;
+mod session_command;
 mod ssh;
 mod toolchain;
 
@@ -25,6 +26,7 @@ pub use path_command::PathCommandProvider;
 pub use process::ProcessProvider;
 pub use project::ProjectProvider;
 pub use python_module::PythonModuleProvider;
+pub use session_command::SessionCommandProvider;
 pub use ssh::SshHostProvider;
 pub use toolchain::ToolchainProvider;
 
@@ -1285,152 +1287,6 @@ pub(crate) fn resolved_executable_path(
     crate::platform::is_executable(&path).then_some(path)
 }
 
-pub(crate) fn known_standalone_command(command: &str) -> bool {
-    matches!(
-        executable_basename(command),
-        "claude"
-            | "codex"
-            | "cpp"
-            | "deno"
-            | "gradle"
-            | "gradlew"
-            | "kotlinc"
-            | "kotlinc-jvm"
-            | "swift"
-            | "systemctl"
-            | "tmux"
-            | "vercel"
-            | "yarn"
-    )
-}
-
-pub(crate) fn known_subcommand_command(command: &str) -> bool {
-    let command = executable_basename(command);
-    is_pip_command(command)
-        || matches!(
-            command,
-            "adb"
-                | "ansible"
-                | "apt"
-                | "aws"
-                | "az"
-                | "brew"
-                | "cargo"
-                | "composer"
-                | "conan"
-                | "consul"
-                | "defaults"
-                | "diskutil"
-                | "dnf"
-                | "docker"
-                | "docker-compose"
-                | "dotnet"
-                | "eksctl"
-                | "firebase"
-                | "flyctl"
-                | "gcloud"
-                | "gem"
-                | "gh"
-                | "glab"
-                | "go"
-                | "gradle"
-                | "gradlew"
-                | "helm"
-                | "heroku"
-                | "istioctl"
-                | "kubectl"
-                | "launchctl"
-                | "mise"
-                | "meson"
-                | "mvn"
-                | "mvnw"
-                | "nerdctl"
-                | "nix"
-                | "nomad"
-                | "oc"
-                | "ollama"
-                | "openssl"
-                | "pacman"
-                | "pip"
-                | "pip3"
-                | "pipx"
-                | "podman"
-                | "poetry"
-                | "railway"
-                | "rustup"
-                | "security"
-                | "snap"
-                | "supabase"
-                | "svn"
-                | "swift"
-                | "swift-format"
-                | "terraform"
-                | "tofu"
-                | "uv"
-                | "vagrant"
-                | "vault"
-                | "vcpkg"
-                | "wrangler"
-                | "git"
-        )
-}
-
-pub(crate) fn known_required_argument_command(command: &str) -> bool {
-    let command = executable_basename(command);
-    if let Some(driver) = c_family_compiler_driver(command) {
-        return driver != "cpp";
-    }
-    matches!(
-        command,
-        "awk"
-            | "basename"
-            | "chgrp"
-            | "chmod"
-            | "chown"
-            | "clang-tidy"
-            | "cmp"
-            | "comm"
-            | "cmake"
-            | "cp"
-            | "curl"
-            | "cut"
-            | "diff"
-            | "dirname"
-            | "grep"
-            | "java"
-            | "javac"
-            | "join"
-            | "kotlin"
-            | "kotlinc-js"
-            | "kotlinc-native"
-            | "konanc"
-            | "ln"
-            | "man"
-            | "mkdir"
-            | "mosh"
-            | "mv"
-            | "open"
-            | "readlink"
-            | "rm"
-            | "rmdir"
-            | "rsync"
-            | "rustc"
-            | "rustdoc"
-            | "scp"
-            | "sed"
-            | "sftp"
-            | "ssh"
-            | "stat"
-            | "swiftc"
-            | "touch"
-            | "tr"
-            | "unlink"
-            | "wget"
-            | "which"
-            | "xdg-open"
-    )
-}
-
 pub(crate) fn executable_basename(command: &str) -> &str {
     std::path::Path::new(command)
         .file_name()
@@ -2562,50 +2418,12 @@ mod tests {
     }
 
     #[test]
-    fn standalone_command_hints_apply_to_explicit_paths() {
-        for command in [
-            "codex",
-            "./bin/codex",
-            "claude",
-            "/opt/bin/claude",
-            "swift",
-            "cpp",
-            "gradle",
-            "gradlew",
-            "kotlinc",
-            "kotlinc-jvm",
-        ] {
-            assert!(known_standalone_command(command));
-        }
-        for command in ["git", "./bin/git", "brew", "/opt/bin/openssl"] {
-            assert!(!known_standalone_command(command));
-        }
-        for command in [
-            "ssh",
-            "./bin/curl",
-            "/usr/bin/cp",
-            "grep",
-            "rustdoc",
-            "kotlinc-native",
-            "cmake",
-            "clang-tidy",
-            "gcc-14",
-            "aarch64-linux-gnu-clang++-18",
-        ] {
-            assert!(known_required_argument_command(command));
-        }
+    fn pip_detection_supports_versioned_and_explicit_names() {
         for command in ["pip", "pip3", "pip3.14", "/opt/bin/pip3.13"] {
             assert!(is_pip_command(command));
-            assert!(known_subcommand_command(command));
-        }
-        for command in ["swift", "swift-format", "meson", "conan", "vcpkg"] {
-            assert!(known_subcommand_command(command));
         }
         for command in ["pipeline", "pipx", "pip3.", "pip3x"] {
             assert!(!is_pip_command(command));
-        }
-        for command in ["cat", "python", "./bin/codex", "cpp", "kotlinc"] {
-            assert!(!known_required_argument_command(command));
         }
     }
 

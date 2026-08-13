@@ -220,7 +220,24 @@ fn integration_block(
                  and isatty stdout\n\
                  and test \"$__hokan_term\" != dumb\n\
                  and test -x \"$__hokan_bin\"\n\
-                 exec \"$__hokan_bin\" --shell fish\n\
+                 set -l __hokan_tmp_dir /tmp\n\
+                 if set -q TMPDIR; and test -n \"$TMPDIR\"\n\
+                   set __hokan_tmp_dir \"$TMPDIR\"\n\
+                 end\n\
+                 set -l __hokan_integration_dir (command mktemp -d \"$__hokan_tmp_dir/hokan-integration.XXXXXXXX\")\n\
+                 if test $status -ne 0; or test -z \"$__hokan_integration_dir\"\n\
+                   builtin exit 1\n\
+                 end\n\
+                 set -lx HOKAN_INTEGRATION_DIR \"$__hokan_integration_dir\"\n\
+                 command \"$__hokan_bin\" --shell fish\n\
+                 set -l __hokan_status $status\n\
+                 set -l __hokan_leave 0\n\
+                 test -f \"$__hokan_integration_dir/leave\"; and set __hokan_leave 1\n\
+                 command rm -f -- \"$__hokan_integration_dir/leave\"\n\
+                 command rmdir -- \"$__hokan_integration_dir\" 2>/dev/null\n\
+                 if test $__hokan_leave -ne 1\n\
+                   builtin exit $__hokan_status\n\
+                 end\n\
                end\n\
              end"
         ),
@@ -237,9 +254,25 @@ fn integration_block(
                    && -t 1\n\
                    && ${{TERM:-dumb}} != dumb\n\
                    && -x \"$__hokan_bin\" ]]; then\n\
-               exec \"$__hokan_bin\" --shell zsh\n\
+               __hokan_integration_dir=$(command mktemp -d \"${{TMPDIR:-/tmp}}/hokan-integration.XXXXXXXX\") \
+                 || builtin exit 1\n\
+               if HOKAN_INTEGRATION_DIR=\"$__hokan_integration_dir\" command \"$__hokan_bin\" --shell zsh; then\n\
+                 __hokan_status=0\n\
+               else\n\
+                 __hokan_status=$?\n\
+               fi\n\
+               if [[ -f \"$__hokan_integration_dir/leave\" ]]; then\n\
+                 __hokan_leave=1\n\
+               else\n\
+                 __hokan_leave=0\n\
+               fi\n\
+               command rm -f -- \"$__hokan_integration_dir/leave\"\n\
+               command rmdir -- \"$__hokan_integration_dir\" 2>/dev/null\n\
+               if (( ! __hokan_leave )); then\n\
+                 builtin exit $__hokan_status\n\
+               fi\n\
              fi\n\
-             unset __hokan_bin __hokan_setup_dir __hokan_setup_bin"
+             unset __hokan_leave __hokan_status __hokan_integration_dir __hokan_bin __hokan_setup_dir __hokan_setup_bin"
         ),
         ShellKind::Bash => format!(
             "__hokan_setup_bin={executable}\n\
@@ -258,10 +291,25 @@ fn integration_block(
                    && -t 1\n\
                    && ${{TERM:-dumb}} != dumb\n\
                    && -x \"$__hokan_bin\" ]]; then\n\
-               export HOKAN_BASH_STARTUP_FILE=\"$__hokan_setup_rc\"\n\
-               exec \"$__hokan_bin\" --shell bash\n\
+               __hokan_integration_dir=$(command mktemp -d \"${{TMPDIR:-/tmp}}/hokan-integration.XXXXXXXX\") \
+                 || builtin exit 1\n\
+               if HOKAN_BASH_STARTUP_FILE=\"$__hokan_setup_rc\" HOKAN_INTEGRATION_DIR=\"$__hokan_integration_dir\" command \"$__hokan_bin\" --shell bash; then\n\
+                 __hokan_status=0\n\
+               else\n\
+                 __hokan_status=$?\n\
+               fi\n\
+               if [[ -f \"$__hokan_integration_dir/leave\" ]]; then\n\
+                 __hokan_leave=1\n\
+               else\n\
+                 __hokan_leave=0\n\
+               fi\n\
+               command rm -f -- \"$__hokan_integration_dir/leave\"\n\
+               command rmdir -- \"$__hokan_integration_dir\" 2>/dev/null\n\
+               if (( ! __hokan_leave )); then\n\
+                 builtin exit \"$__hokan_status\"\n\
+               fi\n\
              fi\n\
-             unset __hokan_bin __hokan_setup_dir __hokan_setup_rc __hokan_setup_bin"
+             unset __hokan_leave __hokan_status __hokan_integration_dir __hokan_bin __hokan_setup_dir __hokan_setup_rc __hokan_setup_bin"
         ),
     };
     format!(
@@ -491,7 +539,10 @@ mod tests {
         assert!(once.contains("__hokan_setup_bin='"));
         assert!(!once.contains("init zsh"));
         assert!(once.contains("HOKAN_AUTO_START"));
-        assert!(once.contains(r#"exec "$__hokan_bin" --shell zsh"#));
+        assert!(once.contains(
+            r#"HOKAN_INTEGRATION_DIR="$__hokan_integration_dir" command "$__hokan_bin" --shell zsh"#
+        ));
+        assert!(once.contains("$__hokan_integration_dir/leave"));
         install(&mut output, Some(ShellKind::Zsh), Some(&path), false).expect("idempotent install");
         assert_eq!(fs::read_to_string(&path).expect("same file"), once);
         uninstall(&mut output, Some(ShellKind::Zsh), Some(&path)).expect("uninstall");
@@ -645,29 +696,30 @@ mod tests {
     }
 
     #[test]
-    fn install_switches_between_auto_exec_and_on_demand_modes() {
+    fn install_switches_between_auto_start_and_on_demand_modes() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = directory.path().join(".zshrc");
         fs::write(&path, "export USER_VALUE=1\n").expect("fixture");
         let mut output = Vec::new();
 
-        install(&mut output, Some(ShellKind::Zsh), Some(&path), false).expect("auto-exec install");
-        let auto_exec = fs::read_to_string(&path).expect("auto-exec file");
-        assert!(auto_exec.contains(r#"exec "$__hokan_bin" --shell zsh"#));
-        assert!(!auto_exec.contains("hk() {"));
+        install(&mut output, Some(ShellKind::Zsh), Some(&path), false).expect("auto-start install");
+        let auto_start = fs::read_to_string(&path).expect("auto-start file");
+        assert!(auto_start.contains("HOKAN_INTEGRATION_DIR="));
+        assert!(!auto_start.contains(r#"exec "$__hokan_bin""#));
+        assert!(!auto_start.contains("hk() {"));
 
         // Downgrade to on-demand: the managed block is replaced, user content kept.
         install(&mut output, Some(ShellKind::Zsh), Some(&path), true).expect("on-demand install");
         let on_demand = fs::read_to_string(&path).expect("on-demand file");
         assert!(on_demand.contains("hk() {"));
-        assert!(!on_demand.contains("exec \"$__hokan_bin\""));
+        assert!(!on_demand.contains("HOKAN_INTEGRATION_DIR"));
         assert!(on_demand.ends_with("export USER_VALUE=1\n"));
 
-        // Upgrade back to auto-exec.
-        install(&mut output, Some(ShellKind::Zsh), Some(&path), false).expect("auto-exec again");
+        // Upgrade back to auto-start.
+        install(&mut output, Some(ShellKind::Zsh), Some(&path), false).expect("auto-start again");
         assert_eq!(
-            fs::read_to_string(&path).expect("auto-exec restored"),
-            auto_exec
+            fs::read_to_string(&path).expect("auto-start restored"),
+            auto_start
         );
     }
 
@@ -709,6 +761,8 @@ mod tests {
             assert!(installed.starts_with(START));
             assert!(installed.contains(expected));
             assert!(installed.contains("HOKAN_ACTIVE"));
+            assert!(installed.contains("HOKAN_INTEGRATION_DIR"));
+            assert!(installed.contains("hokan-integration."));
             if shell == ShellKind::Bash {
                 assert!(installed.contains("HOKAN_BASH_STARTUP_FILE="));
                 assert!(

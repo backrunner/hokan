@@ -637,16 +637,13 @@ fn lookup_help_scope(
         return HelpLookup::None;
     };
     let Some((words, position)) = argument_progress(context) else {
-        return (help.has_subcommands()
-            && !crate::providers::known_standalone_command(command)
-            && (!help.accepts_positionals || crate::providers::known_subcommand_command(command))
-            && bare_command_position(context, command))
-        .then_some(HelpTarget {
-            help,
-            position: HelpPosition::BareSubcommands,
-            scope: Vec::new(),
-        })
-        .map_or(HelpLookup::None, HelpLookup::Ready);
+        return (help.has_subcommands() && bare_command_position(context, command))
+            .then_some(HelpTarget {
+                help,
+                position: HelpPosition::BareSubcommands,
+                scope: Vec::new(),
+            })
+            .map_or(HelpLookup::None, HelpLookup::Ready);
     };
     let before = words.get(1..=position).unwrap_or_default();
     let mut scope = Vec::new();
@@ -3570,7 +3567,7 @@ work on the current change
     }
 
     #[test]
-    fn standalone_prompt_clis_wait_for_a_space_before_help_rows() {
+    fn standalone_prompt_clis_offer_help_rows_without_a_space() {
         let directory = tempfile::tempdir().expect("command directory");
         let path = directory.path().join("codex");
         fs::write(&path, b"#!/bin/sh\n").expect("fake command");
@@ -3590,7 +3587,13 @@ work on the current change
             cache,
         ));
 
-        assert!(engine.complete(&context("codex", 27)).candidates.is_empty());
+        let bare_rows: Vec<_> = engine
+            .complete(&context("codex", 27))
+            .candidates
+            .into_iter()
+            .map(|candidate| candidate.display.primary)
+            .collect();
+        assert_eq!(bare_rows, ["codex exec"]);
         let rows: Vec<_> = engine
             .complete(&context("codex ", 28))
             .candidates
@@ -3601,7 +3604,7 @@ work on the current change
     }
 
     #[test]
-    fn swift_repl_command_waits_for_space_then_exposes_subcommands() {
+    fn swift_repl_command_offers_subcommands_without_a_space() {
         let directory = tempfile::tempdir().expect("command directory");
         let path = directory.path().join("swift");
         fs::write(&path, b"#!/bin/sh\n").expect("fake command");
@@ -3624,7 +3627,13 @@ work on the current change
             cache,
         ));
 
-        assert!(engine.complete(&context("swift", 31)).candidates.is_empty());
+        let bare_rows: Vec<_> = engine
+            .complete(&context("swift", 31))
+            .candidates
+            .into_iter()
+            .map(|candidate| candidate.display.primary)
+            .collect();
+        assert_eq!(bare_rows, ["swift run", "swift build"]);
         let rows: Vec<_> = engine
             .complete(&context("swift ", 32))
             .candidates

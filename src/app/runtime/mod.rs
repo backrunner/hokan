@@ -138,7 +138,7 @@ pub fn run_session(options: SessionOptions) -> crate::Result<u8> {
 
     let (history_store, history_index, history_policy, history_cursor) =
         load_history(&paths, &config, shell)?;
-    let (engine, specs, commands, help, aliases) =
+    let (engine, specs, commands, help) =
         build_engine(&paths, &config, Arc::clone(&history_index), None);
     let worker = ProviderWorker::start(engine, debug_log.clone())?;
     let (ai_sender, ai_receiver) = unbounded();
@@ -153,7 +153,6 @@ pub fn run_session(options: SessionOptions) -> crate::Result<u8> {
         new_history_session_id()?,
         debug_log,
         commands,
-        aliases,
         specs,
         help,
     );
@@ -306,10 +305,14 @@ pub fn run_session(options: SessionOptions) -> crate::Result<u8> {
     drop(control_reader);
     drop(worker);
     let exit_code = exit_status.map_or(1, |status| status.exit_code().min(255) as u8);
+    let leave_requested = shell_session.leave_requested()?;
+    if leave_requested {
+        shell_session.record_integration_leave()?;
+    }
     if let Some(log) = &state.debug_log {
         log.session_finished(exit_code);
     }
-    Ok(exit_code)
+    Ok(if leave_requested { 0 } else { exit_code })
 }
 
 /// Whether session start should spawn the detached `upgrade --auto` child:

@@ -8,7 +8,10 @@ use super::{
         DirectoryPolicy, inspect_ai, inspect_ai_details, inspect_control_channel,
         inspect_debug_logging, inspect_directory,
     },
-    zsh::{detect_setup_mode, inspect_zsh_theme, scan_plugin_conflicts, theme_for_contents},
+    zsh::{
+        detect_setup_mode, inspect_zsh_theme, scan_plugin_conflicts, setup_mode_check,
+        theme_for_contents,
+    },
 };
 
 #[cfg(unix)]
@@ -260,6 +263,15 @@ export EDITOR=vim
 
 #[test]
 fn detect_setup_mode_classifies_managed_blocks() {
+    let auto_returnable = format!(
+        "{}\n# protocol 2\nHOKAN_INTEGRATION_DIR=\"$dir\" command \"$__hokan_bin\" --shell zsh\n{}\n",
+        crate::cli::integration::START,
+        crate::cli::integration::END
+    );
+    assert_eq!(
+        detect_setup_mode(&auto_returnable),
+        Some("auto-start (returnable)")
+    );
     let auto_exec = format!(
         "{}\n# protocol 2\nexec \"$__hokan_bin\" --shell zsh\n{}\n",
         crate::cli::integration::START,
@@ -285,6 +297,24 @@ fn detect_setup_mode_classifies_managed_blocks() {
         Some("on-demand (`hk` command)")
     );
     assert_eq!(detect_setup_mode("export EDITOR=vim\n"), None);
+}
+
+#[test]
+fn legacy_auto_exec_setup_warns_with_the_upgrade_command() {
+    let contents = format!(
+        "{}\n# protocol 2\nexec \"$__hokan_bin\" --shell zsh\n{}\n",
+        crate::cli::integration::START,
+        crate::cli::integration::END
+    );
+    let setup = setup_mode_check(PathBuf::from("/home/user/.zshrc").as_path(), &contents)
+        .expect("setup check");
+    assert_eq!(setup.level, CheckLevel::Warn);
+    assert!(
+        setup.detail.contains("hokan install --shell zsh"),
+        "{}",
+        setup.detail
+    );
+    assert!(setup.detail.contains("hokan-leave"), "{}", setup.detail);
 }
 
 #[test]

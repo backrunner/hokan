@@ -164,7 +164,7 @@ pub(super) fn handle_config_reload(
             );
             let (live, restart_required) = merge_live_config(config, *loaded);
             let live = Arc::new(live);
-            let (engine, specs, _, help, aliases) = build_engine(
+            let (engine, specs, _, help) = build_engine(
                 paths,
                 &live,
                 Arc::clone(history),
@@ -172,7 +172,6 @@ pub(super) fn handle_config_reload(
             );
             worker.replace_engine(engine)?;
             state.specs = specs;
-            state.aliases = aliases;
             state.help_revision = help.revision();
             state.help = help;
             state.cancel_ai();

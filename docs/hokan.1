@@ -55,8 +55,10 @@ to select an explicit file, or
 to install an
 .B hk
 command instead of automatic startup. New interactive zsh, bash, and fish
-sessions automatically exec Hokan; the completion hook is loaded only in the
-managed child shell.
+sessions automatically start Hokan; the completion hook is loaded only in the
+managed child shell. The automatic wrapper preserves the underlying shell so
+.B hokan-leave
+can return to it.
 .TP
 .B setup
 Compatibility alias for
@@ -118,6 +120,17 @@ and never modifies the shell's own history.
 .TP
 .BI "spec " list|show|validate
 Inspect the effective built-in and user command specifications.
+.SH SHELL COMMANDS
+.TP
+.B hokan-leave
+Leave the active Hokan session and continue in the underlying, unwrapped shell.
+The command exists only inside a Hokan-managed child shell. In automatic mode
+it resumes the shell that started Hokan; in on-demand mode it returns to the
+shell that called
+.BR hk .
+Plain
+.B exit
+and Ctrl-D retain their normal shell semantics and close the current session.
 .SH DEFAULT KEYS
 .TP
 .B Up, Down
@@ -171,7 +184,7 @@ Default API credential environment variable. The configured name may differ.
 Disable color when ui.color is auto.
 .TP
 .B HOKAN_AUTO_START
-Set to 0 to bypass managed zsh auto-start for the new shell process.
+Set to 0 to bypass managed shell auto-start for the new shell process.
 .TP
 .B HOKAN_BIN
 Override the Hokan executable used by a managed integration block or active
@@ -199,7 +212,10 @@ history, working-directory paths, HTTP bodies, and environment values.
 .I ~/.local/bin/.hokan-install.toml
 Private release-installer receipt used to remove only installer-owned files.
 .SH EXIT STATUS
-Interactive mode returns the child shell exit status, capped at 255. CLI
+Interactive mode returns the child shell exit status, capped at 255. A
+.B hokan-leave
+request returns zero when Hokan was launched directly or on demand; managed
+auto-start consumes its private handoff marker and resumes the underlying shell. CLI
 commands return zero on success and nonzero on configuration, I/O, validation,
 or runtime failure.
 .SH RECOVERY

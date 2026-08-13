@@ -43,6 +43,9 @@ Hokan 最难的部分是保持终端和 shell 行编辑器一致，而不是生�
 4. 启动 shell。用户 shell 配置再次执行 `hokan init <shell>` 时，因 `HOKAN_ACTIVE` 已存在，只安装内层 hook，不递归 `exec hokan`。
 5. 收到 control prompt event、对应 PTY render marker 并建立 anchor 后，进入 `Editing`；单独的 control event 不能证明 prompt 已经呈现在 terminal，在此之前所有 I/O 透明转发。
 6. 安装终端恢复守卫和 signal handler 后才启用 overlay。
+7. 自动启动的集成块保留调用它的外层 shell；`hokan-leave` 在私有 session 目录写入已认证
+   请求并退出 child，Hokan 恢复终端后在外层创建的 `0700` handoff 目录写入结果。普通 child
+   exit 仍使外层退出，不能只用可碰撞的 child status 判定 leave。
 
 推荐安装入口：
 
@@ -360,7 +363,8 @@ $XDG_RUNTIME_DIR/hokan/<session>/        # socket；无 XDG_RUNTIME_DIR 时用 0
 - provider panic/error：隔离为该来源失败，保留其他候选。
 - compositor 失去锚点：只清除能可靠定位的专用区域、推进 epoch、隐藏 UI，等待新 prompt boundary/CPR；禁止猜测坐标。
 - shell control channel 断开：进入透明 passthrough，提示一次 `doctor` 信息，不终止 shell。
-- child shell 退出：恢复终端，以 child exit status 退出 Hokan。
+- child shell 普通退出：恢复终端，以 child exit status 退出 Hokan；若同时存在私有
+  `hokan-leave` 请求，则自动启动模式恢复到底层 shell，直接/按需模式正常返回调用者。
 - storage 锁竞争：命令事件先进入进程内队列，在后续 prompt 重试；不得阻塞提交命令。
 - 配置/规格损坏：保留 last-known-good，输出路径和错误位置。
 - panic：panic hook 只写最小脱敏日志；恢复动作必须在 panic hook 之外也由 guard 执行。

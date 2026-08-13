@@ -94,6 +94,7 @@ Hokan 在用户输入命令时，以低延迟内联列表提供可解释、可�
 - **FR-TTY-009**：通过 `hokan init <shell>` 输出适配代码；递归启动必须由 session 环境标志阻止。
 - **FR-TTY-010**：child output、overlay、terminal probe 和 restore 必须由唯一 stdout writer 排序；不得在未结束的 UTF-8/CSI/OSC/DCS/control string 中插入 Hokan bytes。
 - **FR-TTY-011**：control FD 的 prompt/buffer event 不得直接视为 terminal 已完成 redisplay。frame 必须等待同一 revision 的 PTY render marker 或经过验证的 terminal-model convergence；超时只能隐藏，不能强制绘制。
+- **FR-TTY-012**：Hokan 管理的子 shell 必须提供 `hokan-leave`，用于恢复终端并回到未包装的底层 shell；普通 `exit`/`Ctrl-D` 语义不得改变，退出请求不得仅凭可碰撞的 child exit code 判定。
 
 ### 4.2 History
 
@@ -169,7 +170,7 @@ Hokan 在用户输入命令时，以低延迟内联列表提供可解释、可�
 - **FR-UI-001**：候选列表绘制在当前提示符下方，不进入 alternate screen，不永久污染 scrollback。
 - **FR-UI-002**：每行至少包含候选主体、来源或类型、简短释义；风险和“仍需参数”状态必须可见。
 - **FR-UI-003**：默认键位为：上下键导航、`Tab` 回填候选、`Enter` 执行（无选中=当前输入，有选中=选中候选）、`Esc` 关闭、`Ctrl-R` history 专注视图、`Shift-Tab` 切换列表显示。
-- **FR-UI-004**：列表不默认选中；`Up`/`Down` 显式进入列表且不改变 buffer。无选中时 `Enter` 把用户亲手输入的 buffer 原样提交给 shell；有选中时 `Enter` 执行选中候选的完整命令文本，High/Unknown 风险先经二次确认（`Enter` 确认、`Esc` 取消）。亲手输入的命令永不触发确认；`Tab` 只做候选回填，永不执行。
+- **FR-UI-004**：列表不默认选中；`Up`/`Down` 显式进入列表且不改变 buffer。输入完整 executable 名称后仍立即展示后续候选，无需先输入空格，且列表保持未选中。无选中时 `Enter` 把用户亲手输入的 buffer 原样提交给 shell；有选中时 `Enter` 执行选中候选的完整命令文本，High/Unknown 风险先经二次确认（`Enter` 确认、`Esc` 取消）。亲手输入的命令永不触发确认；`Tab` 只做候选回填，永不执行。
 - **FR-UI-005**：列表关闭时，除 Hokan 明确拥有的全局键位外，按键必须原样交给 shell；键位均可配置或禁用。
 - **FR-UI-006**：宽度适配 40 至 240 列；Unicode 宽度按 grapheme/cell 计算；过长文本截断而不换行破坏提示符。
 - **FR-UI-007**：颜色不可作为唯一状态信息；命令图标是可选 Nerd Font 皮肤（`ui.nerd_fonts` 默认开启），关闭后退回纯文本标签。

@@ -40,6 +40,7 @@ pub struct ShellSession {
     fifo_path: PathBuf,
     init_path: PathBuf,
     edit_path: PathBuf,
+    leave_path: PathBuf,
     token: SessionToken,
     shell: ShellKind,
 }
@@ -59,6 +60,7 @@ impl ShellSession {
         let token = SessionToken::generate()?;
         Ok(Self {
             edit_path: directory.path().join("edit.next"),
+            leave_path: directory.path().join("leave.requested"),
             directory,
             fifo_path,
             init_path,
@@ -93,6 +95,7 @@ impl ShellSession {
     ) -> crate::Result<CommandBuilder> {
         let executable = configured_executable(self.shell);
         let mut command = CommandBuilder::new(executable);
+        command.env_remove("HOKAN_INTEGRATION_DIR");
         command.env("HOKAN_ACTIVE", "1");
         command.env("HOKAN_HOOK_OWNER_PID", "");
         command.env(
@@ -102,6 +105,7 @@ impl ShellSession {
         command.env("HOKAN_SESSION_TOKEN", self.token.as_str());
         command.env("HOKAN_SESSION_DIR", self.directory.path());
         command.env("HOKAN_CONTROL_FIFO", &self.fifo_path);
+        command.env("HOKAN_LEAVE_FILE", &self.leave_path);
         command.env(
             "HOKAN_PROMPT_CRC",
             format!("{:08x}", marker_checksum(&self.token, "prompt")),
@@ -147,6 +151,50 @@ impl ShellSession {
         ControlReader::start(self.fifo_path.clone(), self.shell, sender)
     }
 
+    pub fn leave_requested(&self) -> crate::Result<bool> {
+        let metadata = match fs::symlink_metadata(&self.leave_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        if !metadata.file_type().is_file() || metadata.uid() != nix::unistd::geteuid().as_raw() {
+            return Err(crate::Error::Shell(
+                "leave request must be a regular file owned by the current user".into(),
+            ));
+        }
+        Ok(true)
+    }
+
+    pub fn record_integration_leave(&self) -> crate::Result<()> {
+        let directory = env::var_os("HOKAN_INTEGRATION_DIR").map(PathBuf::from);
+        record_integration_leave_in(directory.as_deref())
+    }
+}
+
+fn record_integration_leave_in(directory: Option<&Path>) -> crate::Result<()> {
+    let Some(directory) = directory else {
+        return Ok(());
+    };
+    let metadata = fs::symlink_metadata(directory)?;
+    let canonical = fs::canonicalize(directory)?;
+    let expected_parent = fs::canonicalize(env::temp_dir())?;
+    if !metadata.file_type().is_dir()
+        || metadata.uid() != nix::unistd::geteuid().as_raw()
+        || metadata.permissions().mode() & 0o077 != 0
+        || canonical.parent() != Some(expected_parent.as_path())
+        || !canonical
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("hokan-integration."))
+    {
+        return Err(crate::Error::Shell(
+            "managed integration handoff directory is unsafe".into(),
+        ));
+    }
+    write_private(&canonical.join("leave"), b"leave\n").map_err(Into::into)
+}
+
+impl ShellSession {
     fn configure_zsh(
         &self,
         command: &mut CommandBuilder,
@@ -231,31 +279,26 @@ impl ShellSession {
     }
 
     pub fn take_edit_from_environment(session: &str) -> crate::Result<String> {
-        let expected = env::var("HOKAN_SESSION_TOKEN").map_err(|_| {
-            crate::Error::Shell("IPC is only available inside a Hokan session".into())
-        })?;
-        if session != expected {
-            return Err(crate::Error::Shell(
-                "IPC session token does not match".into(),
-            ));
-        }
-        let directory = env::var_os("HOKAN_SESSION_DIR")
-            .map(PathBuf::from)
-            .ok_or_else(|| crate::Error::Shell("IPC session directory is missing".into()))?;
-        let metadata = fs::symlink_metadata(&directory)?;
-        if !metadata.file_type().is_dir()
-            || metadata.uid() != nix::unistd::geteuid().as_raw()
-            || metadata.permissions().mode() & 0o077 != 0
-        {
-            return Err(crate::Error::Shell(
-                "IPC session directory has unsafe ownership or permissions".into(),
-            ));
-        }
+        let directory = private_session_directory(session)?;
         let path = directory.join("edit.next");
         let bytes = read_edit_file(&path)?;
         fs::remove_file(path)?;
         String::from_utf8(bytes)
             .map_err(|_| crate::Error::Shell("IPC replacement is not valid UTF-8".into()))
+    }
+
+    pub fn request_leave_from_environment(session: &str) -> crate::Result<()> {
+        let directory = private_session_directory(session)?;
+        let expected = env::var_os("HOKAN_LEAVE_FILE")
+            .map(PathBuf::from)
+            .ok_or_else(|| crate::Error::Shell("IPC leave path is missing".into()))?;
+        let path = directory.join("leave.requested");
+        if expected != path {
+            return Err(crate::Error::Shell(
+                "IPC leave path does not match the active session".into(),
+            ));
+        }
+        write_private(&path, b"leave\n").map_err(Into::into)
     }
 }
 
@@ -375,6 +418,29 @@ fn configured_executable(shell: ShellKind) -> PathBuf {
                 .is_some_and(|name| name.trim_start_matches('-') == shell.name())
         })
         .unwrap_or_else(|| PathBuf::from(shell.name()))
+}
+
+fn private_session_directory(session: &str) -> crate::Result<PathBuf> {
+    let expected = env::var("HOKAN_SESSION_TOKEN")
+        .map_err(|_| crate::Error::Shell("IPC is only available inside a Hokan session".into()))?;
+    if session != expected {
+        return Err(crate::Error::Shell(
+            "IPC session token does not match".into(),
+        ));
+    }
+    let directory = env::var_os("HOKAN_SESSION_DIR")
+        .map(PathBuf::from)
+        .ok_or_else(|| crate::Error::Shell("IPC session directory is missing".into()))?;
+    let metadata = fs::symlink_metadata(&directory)?;
+    if !metadata.file_type().is_dir()
+        || metadata.uid() != nix::unistd::geteuid().as_raw()
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err(crate::Error::Shell(
+            "IPC session directory has unsafe ownership or permissions".into(),
+        ));
+    }
+    Ok(directory)
 }
 
 fn home_directory() -> Option<PathBuf> {
@@ -501,8 +567,36 @@ mod tests {
                 command.get_env("HOKAN_SESSION_TOKEN"),
                 Some(session.token.as_str().as_ref())
             );
+            assert_eq!(
+                command.get_env("HOKAN_LEAVE_FILE"),
+                Some(session.leave_path.as_os_str())
+            );
+            assert_eq!(command.get_env("HOKAN_INTEGRATION_DIR"), None);
             assert!(command.get_argv().len() >= 2);
         }
+    }
+
+    #[test]
+    fn leave_is_reported_only_after_the_private_marker_exists() {
+        let session = ShellSession::new(ShellKind::Zsh).expect("session should initialize");
+        assert!(!session.leave_requested().expect("no leave request"));
+        write_private(&session.leave_path, b"leave\n").expect("leave marker");
+        assert!(session.leave_requested().expect("leave request"));
+    }
+
+    #[test]
+    fn integration_leave_marker_requires_a_private_handoff_directory() {
+        let directory = tempfile::Builder::new()
+            .prefix("hokan-integration.")
+            .tempdir_in(env::temp_dir())
+            .expect("handoff directory");
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+            .expect("private handoff mode");
+        record_integration_leave_in(Some(directory.path())).expect("record integration leave");
+        assert_eq!(
+            fs::read(directory.path().join("leave")).expect("handoff marker"),
+            b"leave\n"
+        );
     }
 
     #[test]

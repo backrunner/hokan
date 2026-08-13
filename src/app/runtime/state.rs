@@ -12,7 +12,7 @@ use crate::{
     history::{HistoryCursor, HistoryEventV1},
     platform::CommandPathCache,
     providers::CommandHelpCache,
-    shell::{AliasCache, ShellKind},
+    shell::ShellKind,
     specs::SpecRegistry,
     terminal::{
         BufferRevision, FrameRequest, FrameRevision, LatestFrameScheduler, QueryId, TerminalSize,
@@ -49,7 +49,6 @@ pub(super) struct RuntimeState {
     pub(super) previous_command: Option<String>,
     pub(super) workspace_probe: crate::project::WorkspaceProbe,
     pub(super) commands: Arc<CommandPathCache>,
-    pub(super) aliases: Arc<AliasCache>,
     pub(super) specs: Arc<SpecRegistry>,
     pub(super) help: Arc<CommandHelpCache>,
     pub(super) help_revision: u64,
@@ -94,7 +93,6 @@ impl RuntimeState {
         history_session_id: String,
         debug_log: Option<DebugLog>,
         commands: Arc<CommandPathCache>,
-        aliases: Arc<AliasCache>,
         specs: Arc<SpecRegistry>,
         help: Arc<CommandHelpCache>,
     ) -> Self {
@@ -127,7 +125,6 @@ impl RuntimeState {
             previous_command: None,
             workspace_probe: crate::project::WorkspaceProbe::default(),
             commands,
-            aliases,
             specs,
             help,
             help_revision,
@@ -220,23 +217,6 @@ impl RuntimeState {
         if !self.history_only {
             prefetch_command_help(&context, &self.commands, &self.specs, &self.help);
         }
-        // A bare runnable command word with the cursor still on it (`kimi`, no
-        // trailing space) is already complete, whether it resolves through
-        // PATH, a shell builtin/standard function, or a user alias/function.
-        // Hold suggestions until the user commits to arguments with a space
-        // instead of flashing rows that all just complete the same command
-        // name. Specs and dynamic help become eligible after that space;
-        // commands marked as requiring arguments remain open immediately.
-        if !self.history_only
-            && executable_awaiting_arguments(&context, &self.commands, &self.aliases, &self.specs)
-        {
-            self.context = None;
-            self.candidates.clear();
-            self.selected = None;
-            self.overlay_visible = false;
-            self.provider_pending = false;
-            return Ok(());
-        }
         self.context = Some(Arc::clone(&context));
         self.provider_pending = true;
         worker.schedule(context)
@@ -313,50 +293,6 @@ pub(super) fn visible_page_size(max_overlay_height: u16, terminal_size: Terminal
     usize::from(height.saturating_sub(2).max(1))
 }
 
-/// True while the cursor is still on the command token (no trailing
-/// whitespace) and the typed word resolves to a standalone PATH executable,
-/// shell builtin/standard function, alias, or user function — a bare `kimi`.
-/// The line is already runnable, so suggestions wait for the space that
-/// commits the user to typing arguments. An exact runnable name is final even
-/// when longer commands share its prefix or a static spec has recipes; those
-/// rows become relevant only after a trailing space. Commands that do nothing
-/// useful without arguments (`git` and other subcommand-style CLIs, specs with
-/// `requires_arguments`) remain open immediately.
-pub(super) fn executable_awaiting_arguments(
-    context: &CompletionContext,
-    commands: &CommandPathCache,
-    aliases: &AliasCache,
-    specs: &SpecRegistry,
-) -> bool {
-    (crate::providers::command_position_open(context)
-        || crate::providers::explicit_executable_path_position(context))
-        && context.command().is_some_and(|command| {
-            let resolution = crate::providers::command_resolution_kind(context);
-            let shell_aliases = (resolution == crate::parser::EffectiveCommandKind::Shell)
-                .then(|| aliases.load(context.shell));
-            let runnable = match resolution {
-                crate::parser::EffectiveCommandKind::Shell => {
-                    crate::providers::resolved_executable_path(context, commands).is_some()
-                        || crate::providers::is_shell_callable(context.shell, command)
-                        || shell_aliases
-                            .as_ref()
-                            .is_some_and(|aliases| aliases.contains(command))
-                }
-                crate::parser::EffectiveCommandKind::External => {
-                    crate::providers::resolved_executable_path(context, commands).is_some()
-                }
-                crate::parser::EffectiveCommandKind::ExternalOrBuiltin => {
-                    crate::providers::resolved_executable_path(context, commands).is_some()
-                        || crate::providers::is_shell_builtin(context.shell, command)
-                }
-                crate::parser::EffectiveCommandKind::Builtin => {
-                    crate::providers::is_shell_builtin(context.shell, command)
-                }
-            };
-            runnable && !requires_arguments(command, specs)
-        })
-}
-
 pub(super) fn prefetch_command_help(
     context: &CompletionContext,
     commands: &CommandPathCache,
@@ -377,28 +313,6 @@ pub(super) fn prefetch_command_help(
         return;
     };
     help.request(command, Some(executable));
-}
-
-/// Commands that cannot run standalone. The PATH cache cannot express this,
-/// so combine the package-manager registry, a built-in list of other
-/// subcommand-style CLIs, and the spec registry's `requires_arguments` flag.
-fn requires_arguments(command: &str, specs: &SpecRegistry) -> bool {
-    if crate::providers::known_standalone_command(command) {
-        return false;
-    }
-    if crate::providers::is_package_manager(command) {
-        return true;
-    }
-    if crate::providers::known_subcommand_command(command) {
-        return true;
-    }
-    if crate::providers::known_required_argument_command(command) {
-        return true;
-    }
-    if let Some(spec) = specs.get(command) {
-        return spec.requires_arguments;
-    }
-    false
 }
 
 /// A navigation the user made against the overlay, kept across query changes.

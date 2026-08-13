@@ -50,9 +50,9 @@ pub(super) fn inspect_zsh_rc_files(login_shell: bool) -> (Check, Vec<Check>, Che
         };
         saw_file = true;
         if name == ".zshrc"
-            && let Some(mode) = detect_setup_mode(&contents)
+            && let Some(check) = setup_mode_check(&path, &contents)
         {
-            setup_mode = Check::new(CheckLevel::Ok, format!("{mode} in {}", path.display()));
+            setup_mode = check;
         }
         conflicts.extend(scan_plugin_conflicts(&path, &contents));
     }
@@ -135,11 +135,29 @@ pub(super) fn detect_setup_mode(contents: &str) -> Option<&'static str> {
     let block = &contents[start..end];
     if block.contains("alias hk=") || block.contains("hk() {") {
         Some("on-demand (`hk` command)")
+    } else if block.contains("HOKAN_INTEGRATION_DIR") {
+        Some("auto-start (returnable)")
     } else if block.contains("exec \"$__hokan_bin\"") {
         Some("auto-start (exec)")
     } else {
         None
     }
+}
+
+pub(super) fn setup_mode_check(path: &Path, contents: &str) -> Option<Check> {
+    let mode = detect_setup_mode(contents)?;
+    let (level, detail) = if mode == "auto-start (exec)" {
+        (
+            CheckLevel::Warn,
+            format!(
+                "{mode} in {}; rerun `hokan install --shell zsh` to upgrade the block so `hokan-leave` can return to the underlying shell",
+                path.display()
+            ),
+        )
+    } else {
+        (CheckLevel::Ok, format!("{mode} in {}", path.display()))
+    };
+    Some(Check::new(level, detail))
 }
 
 /// Scan rc file contents for plugin integrations known to conflict with

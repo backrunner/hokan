@@ -31,147 +31,53 @@ fn runtime_state(directory: &Path) -> RuntimeState {
         "0123456789abcdef01234567".into(),
         None,
         Arc::new(CommandPathCache::default()),
-        Arc::new(crate::shell::AliasCache::default()),
         Arc::new(crate::specs::SpecRegistry::default()),
         Arc::new(crate::providers::CommandHelpCache::default()),
     )
 }
 
 #[test]
-fn bare_executable_holds_suggestions_until_space() {
+fn complete_executable_still_schedules_a_provider_query() {
     use std::os::unix::fs::PermissionsExt;
 
     let directory = tempfile::tempdir().expect("directory");
     let bin = directory.path().join("bin");
     std::fs::create_dir(&bin).expect("bin directory");
-    for name in [
-        "cat",
-        "kimi",
-        "code",
-        "codex",
-        "cp",
-        "curl",
-        "deno",
-        "git",
-        "grep",
-        "ls",
-        "ollama",
-        "openssl",
-        "pip3.14",
-        "pnpm",
-        "ssh",
-        "systemctl",
-        "tar",
-        "tmux",
-        "uv",
-        "vercel",
-        "yarn",
-    ] {
-        let executable = bin.join(name);
-        std::fs::write(&executable, b"#!/bin/sh\n").expect("write executable");
-        let mut permissions = std::fs::metadata(&executable)
-            .expect("metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&executable, permissions).expect("set mode");
-    }
-    let path = std::ffi::OsString::from(&bin);
-    let commands = CommandPathCache::from_path(Some(&path));
-    // The embedded spec set covers `ls` (requires_arguments = false) and
-    // `tar` (requires_arguments = true); `kimi`, `code`, and `git` have no spec.
-    let specs = crate::specs::SpecRegistry::load(None);
-    let aliases = crate::shell::AliasCache::default();
-    let awaiting = |text: &str| {
-        let snapshot = BufferSnapshot::new(
-            Arc::<str>::from(text),
-            text.len(),
-            BufferRevision::ZERO,
-            SyncQuality::Exact,
-        )
-        .expect("snapshot");
-        let context = CompletionContext::new(
-            QueryId::new(1),
-            ShellKind::Zsh,
-            directory.path().to_owned(),
-            snapshot,
-        )
-        .expect("context");
-        executable_awaiting_arguments(&context, &commands, &aliases, &specs)
-    };
+    let executable = bin.join("ls");
+    std::fs::write(&executable, b"#!/bin/sh\n").expect("write executable");
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))
+        .expect("executable mode");
 
-    // Bare executable word, cursor on it: hold suggestions.
-    assert!(awaiting("kimi"));
-    // Exact runnable names are final even when a longer executable shares the
-    // prefix (`code` and `codex`). Prefix completion remains available at
-    // `cod`, before either exact name has been entered.
-    assert!(awaiting("code"));
-    assert!(awaiting("codex"));
-    assert!(
-        awaiting("deno"),
-        "Deno starts its REPL without a subcommand"
-    );
-    for command in ["systemctl", "tmux", "vercel", "yarn"] {
-        assert!(
-            awaiting(command),
-            "{command} has useful no-argument behavior"
-        );
-    }
-    // A trailing space commits to arguments: suggestions resume.
-    assert!(!awaiting("kimi "));
-    // Unknown prefix keeps path completion alive.
-    assert!(!awaiting("kim"));
-    // With wrapper peeling, `sudo kimi` IS the bare effective command `kimi`:
-    // the same hold-back applies as for a plain `kimi`.
-    assert!(awaiting("sudo kimi"));
-    assert!(awaiting("sudo -u root kimi"));
-    assert!(awaiting("./bin/codex"));
-    assert!(awaiting("sudo ./bin/codex"));
-    assert!(!awaiting("./bin/git"));
-    assert!(!awaiting("sudo ./bin/git"));
-    assert!(!awaiting("./bin/pnpm"));
-    assert!(!awaiting("sudo ./bin/pnpm"));
-    // A redirect target is an argument/path slot, even though
-    // `argument_progress` intentionally hides it from argv semantics.
-    assert!(!awaiting("kimi > lo"));
-    // A subcommand-style CLI cannot run standalone: no holding back.
-    assert!(!awaiting("git"));
-    assert!(!awaiting("pip3.14"));
-    for command in ["ollama", "openssl", "uv"] {
-        assert!(
-            !awaiting(command),
-            "{command} requires a command or argument"
-        );
-    }
-    for command in ["cp", "curl", "grep", "ssh"] {
-        assert!(
-            !awaiting(command),
-            "{command} requires a positional argument"
-        );
-    }
-    assert!(awaiting("cat"), "cat can read stdin without arguments");
-    // Static recipes also wait for the argument-opening space when the command
-    // itself is runnable; specs marked requires_arguments remain open.
-    assert!(awaiting("ls"));
-    assert!(!awaiting("tar"));
-
-    // Same executable with the cursor mid-word: still the runnable token.
-    let mut mid_word = CompletionContext::new(
-        QueryId::new(1),
-        ShellKind::Zsh,
-        directory.path().to_owned(),
-        BufferSnapshot::new(
-            Arc::<str>::from("kimi"),
-            2,
-            BufferRevision::ZERO,
-            SyncQuality::Exact,
-        )
-        .expect("snapshot"),
-    )
-    .expect("context");
-    mid_word.parsed = crate::parser::parse_line("kimi", 2).expect("parse");
-    assert!(executable_awaiting_arguments(
-        &mid_word, &commands, &aliases, &specs
+    let mut state = runtime_state(directory.path());
+    state.commands.refresh_from_path(Some(bin.as_os_str()));
+    state.buffer.set_exact("ls".into(), 2).expect("buffer");
+    let mut engine = crate::completion::CompletionEngine::new(20, 12);
+    engine.register(crate::providers::CommandSpecProvider::new(
+        Arc::new(crate::specs::SpecRegistry::load(None)),
+        Arc::clone(&state.commands),
     ));
+    let worker = ProviderWorker::start(Arc::new(engine), None).expect("provider worker");
+
+    state.schedule_query(&worker).expect("schedule query");
+    assert!(
+        state.context.is_some(),
+        "a complete executable must not suppress the query"
+    );
+    assert!(state.provider_pending);
+
+    // Results do not implicitly enter the list. The first navigation action
+    // is what creates the selection (covered by move_selection tests below).
+    let result = worker
+        .results()
+        .recv_timeout(Duration::from_secs(2))
+        .expect("provider result");
+    let (output, join) = test_output();
+    handle_provider_result(result, &mut state, &output).expect("provider result handling");
+    assert!(!state.candidates.is_empty());
+    assert_eq!(state.selected, None);
+    output.restore_and_exit().expect("shutdown");
+    join.join().expect("actor joins").expect("actor exits");
+    drop(worker);
 }
 
 #[test]
@@ -232,80 +138,6 @@ fn exact_path_command_prefetches_help_but_project_paths_stay_cold() {
         0,
         "project-local executables must not be launched just to discover help"
     );
-}
-
-#[test]
-fn bare_alias_or_function_holds_until_space_even_with_a_longer_name() {
-    let directory = tempfile::tempdir().expect("directory");
-    let commands = CommandPathCache::default();
-    let specs = crate::specs::SpecRegistry::default();
-    let mut definitions = crate::shell::ShellAliases::default();
-    crate::shell::parse_rc_text(
-        ShellKind::Zsh,
-        "alias ship='git push'\nalias co='git checkout'\ncommit() { git commit \"$@\"; }\n",
-        &mut definitions,
-    );
-    let aliases = crate::shell::AliasCache::new_fixed(definitions);
-    let awaiting = |text: &str| {
-        let context = CompletionContext::new(
-            QueryId::new(1),
-            ShellKind::Zsh,
-            directory.path().to_owned(),
-            BufferSnapshot::new(
-                Arc::<str>::from(text),
-                text.len(),
-                BufferRevision::ZERO,
-                SyncQuality::Exact,
-            )
-            .expect("snapshot"),
-        )
-        .expect("context");
-        executable_awaiting_arguments(&context, &commands, &aliases, &specs)
-    };
-
-    assert!(awaiting("ship"));
-    assert!(awaiting("time ship"));
-    assert!(!awaiting("ship "));
-    assert!(awaiting("co"), "an exact alias is final despite `commit`");
-    assert!(
-        !awaiting("sudo ship"),
-        "external wrappers do not expand aliases"
-    );
-    assert!(!awaiting("command ship"), "`command` bypasses aliases");
-}
-
-#[test]
-fn bare_shell_symbols_hold_only_in_their_valid_resolution_domain() {
-    let directory = tempfile::tempdir().expect("directory");
-    let commands = CommandPathCache::default();
-    let aliases = crate::shell::AliasCache::default();
-    let specs = crate::specs::SpecRegistry::default();
-    let awaiting = |text: &str| {
-        let context = CompletionContext::new(
-            QueryId::new(1),
-            ShellKind::Zsh,
-            directory.path().to_owned(),
-            BufferSnapshot::new(
-                Arc::<str>::from(text),
-                text.len(),
-                BufferRevision::ZERO,
-                SyncQuality::Exact,
-            )
-            .expect("snapshot"),
-        )
-        .expect("context");
-        executable_awaiting_arguments(&context, &commands, &aliases, &specs)
-    };
-
-    assert!(awaiting("pwd"));
-    assert!(awaiting("command pwd"));
-    assert!(awaiting("builtin pwd"));
-    assert!(!awaiting("sudo pwd"));
-    assert!(!awaiting("if"), "reserved words need more shell syntax");
-
-    assert!(awaiting("compdef"), "standard zsh functions are callable");
-    assert!(!awaiting("command compdef"), "`command` bypasses functions");
-    assert!(!awaiting("builtin compdef"), "functions are not builtins");
 }
 
 #[test]

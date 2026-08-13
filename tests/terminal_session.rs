@@ -993,6 +993,64 @@ fn zsh_install_auto_starts_hokan_and_restores_the_terminal() {
 }
 
 #[test]
+fn hokan_leave_restores_the_unwrapped_auto_start_shell() {
+    if !command_exists("zsh") {
+        return;
+    }
+    let mut terminal = TerminalSession::spawn_via_zsh_install();
+    terminal.wait_for_screen("HK1> ");
+    let leave_start = terminal.transcript.len();
+    terminal.write(b"hokan-leave\r");
+    terminal.wait_for_bytes_since(leave_start, RESTORE_PRESENTATION);
+    terminal.settle(Duration::from_millis(200));
+
+    let start = terminal.transcript.len();
+    terminal.write(b"printf 'HK_UNWRAPPED:%s\\n' \"${HOKAN_ACTIVE:-no}\"\r");
+    terminal.wait_for_bytes_since(start, b"HK_UNWRAPPED:no");
+    assert!(
+        terminal.transcript[leave_start..start]
+            .windows(RESTORE_PRESENTATION.len())
+            .any(|window| window == RESTORE_PRESENTATION),
+        "Hokan did not restore terminal presentation before the outer shell resumed"
+    );
+
+    terminal.exit_shell();
+    terminal.wait_until_exit();
+}
+
+#[test]
+fn hokan_leave_exits_a_direct_session_successfully() {
+    if !command_exists("zsh") {
+        return;
+    }
+    let mut terminal = TerminalSession::spawn();
+    terminal.wait_for_screen("HK> ");
+    terminal.write(b"hokan-leave\r");
+    terminal.wait_until_exit();
+    assert_eq!(
+        terminal.try_wait().map(|status| status.exit_code()),
+        Some(0)
+    );
+    assert!(terminal.transcript.ends_with(RESTORE_PRESENTATION));
+}
+
+#[test]
+fn matching_child_exit_code_does_not_trigger_hokan_leave() {
+    if !command_exists("zsh") {
+        return;
+    }
+    let mut terminal = TerminalSession::spawn_via_zsh_install();
+    terminal.wait_for_screen("HK1> ");
+    terminal.write(b"exit 85\r");
+    terminal.wait_until_exit();
+    assert_eq!(
+        terminal.try_wait().map(|status| status.exit_code()),
+        Some(85)
+    );
+    assert!(terminal.transcript.ends_with(RESTORE_PRESENTATION));
+}
+
+#[test]
 fn real_session_restores_canonical_and_echo_termios() {
     if !command_exists("zsh") || !command_exists("stty") {
         return;
@@ -1524,42 +1582,38 @@ fn fresh_prompt_shows_no_overlay() {
 }
 
 #[test]
-fn bare_executable_waits_for_space_before_suggesting() {
+fn complete_executable_shows_recommendations_without_implicit_selection() {
     if !command_exists("zsh") {
         return;
     }
     let mut terminal = TerminalSession::spawn();
-    fs::write(
-        terminal._work.path().join("HKWHOAMI_MARKER.txt"),
-        b"marker\n",
-    )
-    .expect("marker file");
     terminal.wait_for_screen("HK> ");
     terminal.settle(Duration::from_millis(300));
 
-    // A bare executable word with no spec coverage is already runnable:
-    // suggestions hold off until the user commits to typing arguments with a
-    // space.
-    terminal.write(b"whoami");
-    terminal.settle(Duration::from_millis(500));
-    assert_no_overlay_rows(&terminal);
+    // A complete executable still opens the recommendation list immediately.
+    terminal.write(b"ls");
+    terminal.wait_for_screen(TAG_SPEC);
+    terminal.settle(Duration::from_millis(200));
+    let text = terminal.screen_text();
+    assert!(
+        text.contains(TAG_SPEC),
+        "complete executable did not produce recommendation rows:\n{text}"
+    );
+    assert!(
+        !text.contains('▶'),
+        "recommendations must start unselected:\n{text}"
+    );
 
-    // A generic empty argument slot stays quiet: scanning the cwd here would
-    // produce unrelated file noise for a command that does not take paths.
-    terminal.write(b" ");
-    terminal.settle(Duration::from_millis(300));
-    assert_no_overlay_rows(&terminal);
-
-    // Explicit path syntax is an unambiguous request for filesystem rows.
-    terminal.write(b"./HKWHOAMI_");
-    terminal.wait_for_screen("HKWHOAMI_MARKER.txt");
+    // Navigation is the explicit action that enters the list and selects one.
+    terminal.write(b"\x1b[B");
+    terminal.wait_for_screen("▶");
 
     terminal.exit_shell();
     terminal.wait_until_exit();
 }
 
 #[test]
-fn exact_executable_waits_for_space_then_uses_dynamic_help() {
+fn exact_executable_shows_dynamic_help_without_waiting_for_space() {
     if !command_exists("zsh") {
         return;
     }
@@ -1593,21 +1647,23 @@ fn exact_executable_waits_for_space_then_uses_dynamic_help() {
     let mut terminal = TerminalSession::spawn_hokan(home, work, 2);
     terminal.wait_for_screen("HK> ");
 
-    // The exact runnable executable is final even though a longer executable
-    // shares its prefix. No PATH, history, or help rows remain visible.
+    // The exact runnable executable is still eligible for recommendations even
+    // though a longer executable shares its prefix.
     terminal.write(b"codex-fixture");
-    terminal.settle(Duration::from_millis(500));
-    assert_no_overlay_rows(&terminal);
-
-    // A space opens the argument grammar. The cold dynamic-help fetch runs in
-    // the background and then refreshes the same buffer with subcommands.
-    terminal.write(b" ");
     terminal.wait_for_screen("codex-fixture resume");
     let text = terminal.screen_text();
     assert!(
         text.contains("Resume a session"),
         "dynamic help row missing:\n{text}"
     );
+    assert!(
+        !text.contains('▶'),
+        "dynamic-help rows must start unselected:\n{text}"
+    );
+
+    // Only navigation selects a row; it does not alter the typed buffer.
+    terminal.write(b"\x1b[B");
+    terminal.wait_for_screen("▶");
 
     terminal.write(b"\x15");
     terminal.settle(Duration::from_millis(200));

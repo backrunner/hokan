@@ -17,8 +17,19 @@ control FIFO。
 ## zsh 自动启动与临时旁路
 
 执行 `hokan install --shell zsh` 后，当前已经运行的 shell 不会被替换；重新打开一个真实
-终端窗口后，交互式 zsh 会自动 `exec` 安装时记录的 Hokan 二进制。外层 zsh 不加载
-hook，hook 只在 Hokan 管理的内层 zsh 中加载，因此不会形成递归 session。
+终端窗口后，交互式 zsh 会自动启动安装时记录的 Hokan 二进制。外层 zsh 不加载 hook，
+hook 只在 Hokan 管理的内层 zsh 中加载，因此不会形成递归 session。
+
+已经在 Hokan 中并希望临时回到底层、未包装的 shell 时运行：
+
+```bash
+hokan-leave
+```
+
+自动启动模式会恢复终端状态并继续运行外层 shell，本次不会再次自动进入 Hokan；按需模式
+则返回调用 `hk` 的 shell。普通 `exit` 和 `Ctrl-D` 仍按 shell 原有语义关闭当前会话。
+从旧版本升级后需要重新运行一次 `hokan install`，让受管启动块从原来的 `exec` 形式升级为
+可返回形式；`hokan doctor` 会对尚未升级的 zsh 启动块给出警告和修复命令。
 
 需要临时进入普通 zsh 排查 rc 文件时运行：
 
