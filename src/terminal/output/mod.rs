@@ -390,6 +390,12 @@ impl OutputMailbox {
     fn take(&self, deadline: Option<Instant>) -> Result<ActorCommand, OutputError> {
         let mut queues = self.lock()?;
         loop {
+            // A render-gate deadline is a hard boundary. Once elapsed it must
+            // beat queued child/control/shutdown work, otherwise a busy or
+            // briefly descheduled actor can indefinitely postpone expiry.
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Ok(ActorCommand::Tick);
+            }
             if queues.restore_and_exit {
                 queues.restore_and_exit = false;
                 return Ok(ActorCommand::RestoreAndExit);
@@ -423,9 +429,6 @@ impl OutputMailbox {
             }
             if let Some(deadline) = deadline {
                 let now = Instant::now();
-                if now >= deadline {
-                    return Ok(ActorCommand::Tick);
-                }
                 let (next_queues, timeout) = self
                     .wake
                     .wait_timeout(queues, deadline.saturating_duration_since(now))

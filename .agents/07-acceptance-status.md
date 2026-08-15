@@ -91,7 +91,7 @@ loopback 的 CPR、Unicode、resize、Ctrl-C 和 `~.`。
   修复取代，不能作为当前源码的 release artifact；正式发布必须由 release workflow 重建。
 - 当前源码通过 `cargo package --locked` 的隔离重编译。本机开发二进制安装在
   `~/.cargo/bin/hokan`，SHA-256 为
-  `f546b2f2fb96257ed804760b23efad61bf09c491b34b00e3a871ec5e91d9f924`，当前 `PATH`
+  `cbb269e2f341517e7b241f0ceec4340ee7e6458b7802607146542c8cd16719f5`，当前 `PATH`
   解析到该路径。
 - 安装后二进制通过完整 `terminal_session` 49/49 和正式 setup 自动启动用例；实际 `.zshrc`
   语法有效，受管块二次 setup 保持幂等，`-c`/非 TTY 旁路与 `HOKAN_AUTO_START=0` 均验证。
