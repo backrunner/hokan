@@ -733,6 +733,91 @@ fn navigation_intent_is_reapplied_when_queued_buffer_events_move_the_query() {
 }
 
 #[test]
+fn tab_intent_waits_for_candidates_after_a_queued_buffer_event() {
+    let directory = tempfile::tempdir().expect("directory");
+    let mut state = runtime_state(directory.path());
+    let (output, join) = crate::terminal::spawn_with_writer(
+        Vec::new(),
+        session_token(),
+        TerminalSize::new(24, 80).expect("terminal size"),
+        3,
+    )
+    .expect("output actor");
+
+    // The visible list belongs to `tar`, and Tab selects its first row.
+    state.buffer.set_exact("tar".into(), 3).expect("buffer");
+    refresh_context(&mut state, QueryId::new(1));
+    state.candidates_context = state.context.as_ref().cloned();
+    state.candidates = vec![Candidate::new(
+        QueryId::new(1),
+        "tar -czf",
+        "create archive",
+        Some(TextEdit {
+            range: 0..3,
+            replacement: "tar -czf".into(),
+            cursor_after: CursorPlacement::End,
+        }),
+        CandidateAction::Insert,
+        CandidateSource::CommandSpec,
+        CandidateKind::Recipe,
+        Completeness::NeedsInput {
+            slot: crate::completion::SlotKind::NewFile,
+        },
+        RiskLevel::Low,
+        "queued-tab-old",
+    )];
+    move_selection(&mut state, 1);
+
+    // The shell's exact buffer event for the already-typed trailing space
+    // arrives before the Tab can activate the old row. The one-shot Tab
+    // intent must survive until this query's replacement row arrives.
+    state
+        .buffer
+        .set_exact("tar ".into(), 4)
+        .expect("newer buffer");
+    refresh_context(&mut state, QueryId::new(2));
+    state.selected = None;
+    state.pending_accept = true;
+    let result = provider_result(
+        &state,
+        vec![Candidate::new(
+            QueryId::new(2),
+            "tar -czf",
+            "create archive",
+            Some(TextEdit {
+                range: 0..4,
+                replacement: "tar -czf".into(),
+                cursor_after: CursorPlacement::End,
+            }),
+            CandidateAction::Insert,
+            CandidateSource::CommandSpec,
+            CandidateKind::Recipe,
+            Completeness::NeedsInput {
+                slot: crate::completion::SlotKind::NewFile,
+            },
+            RiskLevel::Low,
+            "queued-tab-fresh",
+        )],
+    );
+    handle_provider_result(result, &mut state, &output).expect("provider result");
+
+    assert!(state.pending_accept, "fresh results must not drop the Tab");
+    assert!(
+        state.selected.is_some(),
+        "fresh top row should be reselected"
+    );
+    assert!(matches!(
+        resolve_selected_activation(&state).expect("fresh activation"),
+        SelectedActivation::Ready {
+            activation: Activation::ReplaceBuffer { ref text, cursor: 8 },
+            ..
+        } if text == "tar -czf"
+    ));
+    output.restore_and_exit().expect("shutdown");
+    join.join().expect("actor joins").expect("actor exits");
+}
+
+#[test]
 fn navigation_intent_falls_back_to_the_delta_when_the_row_vanishes() {
     let directory = tempfile::tempdir().expect("directory");
     let mut state = runtime_state(directory.path());

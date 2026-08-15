@@ -152,6 +152,7 @@ pub(super) fn start_ai_request(
     state.candidates.clear();
     state.candidates_context = None;
     state.selected = None;
+    state.pending_accept = false;
     state.status = Some("HK-AI-WAIT requesting commands; Esc cancels".into());
     render_current(state, output)
 }

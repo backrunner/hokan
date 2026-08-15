@@ -444,6 +444,30 @@ impl TerminalSession {
         }
     }
 
+    fn wait_for_sync_replies(&mut self, count: usize) {
+        let deadline = Instant::now() + TIMEOUT;
+        while Instant::now() < deadline && self.sync_replies < count {
+            self.receive_once(READ_POLL);
+        }
+        assert!(
+            self.sync_replies >= count,
+            "DECRQM probe was not answered; transcript tail={:?}",
+            tail(&self.transcript, 2_048)
+        );
+    }
+
+    fn wait_for_cpr_replies(&mut self, count: usize) {
+        let deadline = Instant::now() + TIMEOUT;
+        while Instant::now() < deadline && self.cpr_replies < count {
+            self.receive_once(READ_POLL);
+        }
+        assert!(
+            self.cpr_replies >= count,
+            "CPR probe was not answered; transcript tail={:?}",
+            tail(&self.transcript, 2_048)
+        );
+    }
+
     /// Waits until the edit line is present AND every border glyph on screen
     /// belongs to exactly one rectangular overlay box. Retries ride out
     /// mid-paint transients; a persistent smear never satisfies this.
@@ -621,8 +645,8 @@ fn real_session_keeps_overlay_and_terminal_lifecycle_stable() {
     }
     let mut terminal = TerminalSession::spawn();
     terminal.wait_for_screen("HK> ");
+    terminal.wait_for_sync_replies(1);
     terminal.settle(Duration::from_millis(300));
-    assert!(terminal.sync_replies >= 1, "DECRQM probe was not answered");
     let initial_disable = terminal
         .transcript
         .windows(DISABLE_BRACKETED_PASTE.len())
@@ -672,7 +696,7 @@ fn real_session_keeps_overlay_and_terminal_lifecycle_stable() {
     signal::kill(Pid::from_raw(pid), Signal::SIGCONT).expect("continue hokan");
     terminal.wait_for_bytes_since(continue_start, ENABLE_BRACKETED_PASTE);
     terminal.wait_for_screen("HK> ls");
-    assert!(terminal.cpr_replies >= 1, "CPR anchor was not probed");
+    terminal.wait_for_cpr_replies(1);
 
     terminal.write(b"\x03");
     terminal.settle(Duration::from_millis(100));
@@ -729,6 +753,7 @@ fn real_session_uses_non_destructive_fallback_when_mode_2026_is_unavailable() {
     }
     let mut terminal = TerminalSession::spawn_with_sync_status(0);
     terminal.wait_for_screen("HK> ");
+    terminal.wait_for_sync_replies(1);
     terminal.settle(Duration::from_millis(300));
     assert_eq!(terminal.sync_replies, 1);
 

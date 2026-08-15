@@ -23,6 +23,12 @@ use crate::{
 };
 use crossbeam_channel::Sender;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActivationAttempt {
+    Finished,
+    Rejected,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn route_terminal_input(
     bytes: &[u8],
@@ -123,6 +129,10 @@ pub(super) fn handle_input_event(
 ) -> crate::Result<()> {
     let child_bytes =
         input_bytes_for_shell(&event, session.supports_bracketed_paste(), state.editing);
+    // A deferred Tab belongs only to the latest user input event. Shell
+    // control messages may still catch up for bytes typed before it, but any
+    // subsequent keypress cancels the one-shot activation intent.
+    state.pending_accept = false;
     if !state.editing {
         // Input can already be queued in the outer PTY while the first prompt
         // event is still crossing the control FIFO.  Mark an Enter-triggered
@@ -197,7 +207,17 @@ pub(super) fn handle_input_event(
                 }
                 move_selection(state, 1);
             }
-            return activate_selected(state, pty, session, output, worker, config, ai_sender);
+            if matches!(
+                activate_selected(state, pty, session, output, worker, config, ai_sender)?,
+                ActivationAttempt::Rejected
+            ) {
+                // Exact-sync shells can deliver the authoritative event for
+                // the final typed byte just before this Tab is routed. Keep
+                // the one-shot fill intent and apply it when that query's
+                // candidates arrive unless a later keypress cancels it.
+                state.pending_accept = true;
+            }
+            return Ok(());
         }
         if config.keys.dismiss.matches(&event.kind) {
             state.overlay_visible = false;
@@ -350,9 +370,9 @@ fn activate_selected(
     worker: &ProviderWorker,
     config: &Arc<Config>,
     ai_sender: &Sender<AiResult>,
-) -> crate::Result<()> {
+) -> crate::Result<ActivationAttempt> {
     let (activation, context) = match resolve_selected_activation(state)? {
-        SelectedActivation::None => return Ok(()),
+        SelectedActivation::None => return Ok(ActivationAttempt::Finished),
         SelectedActivation::Ready {
             activation,
             context,
@@ -360,7 +380,8 @@ fn activate_selected(
         SelectedActivation::Rejected => {
             state.schedule_query(worker)?;
             state.status = Some("HK-CMP-STALE selection expired; candidates refreshed".into());
-            return render_current(state, output);
+            render_current(state, output)?;
+            return Ok(ActivationAttempt::Rejected);
         }
     };
     match activation {
@@ -402,6 +423,39 @@ fn activate_selected(
         }
         Activation::None => {}
     }
+    Ok(ActivationAttempt::Finished)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn retry_pending_accept(
+    state: &mut RuntimeState,
+    pty: &mut PtyChild,
+    session: &ShellSession,
+    output: &OutputHandle,
+    worker: &ProviderWorker,
+    config: &Arc<Config>,
+    ai_sender: &Sender<AiResult>,
+) -> crate::Result<()> {
+    if !state.pending_accept {
+        return Ok(());
+    }
+    state.pending_accept = false;
+    if state.candidates.is_empty() {
+        if state.provider_pending {
+            state.pending_accept = true;
+        }
+        return Ok(());
+    }
+    if selected_candidate(state).is_none() {
+        state.selected = None;
+        move_selection(state, 1);
+    }
+    if matches!(
+        activate_selected(state, pty, session, output, worker, config, ai_sender)?,
+        ActivationAttempt::Rejected
+    ) {
+        state.pending_accept = true;
+    }
     Ok(())
 }
 
@@ -429,7 +483,7 @@ fn enter_with_selection(
     };
     match resolve_enter(&candidate, &activation) {
         EnterResolution::Fill => {
-            activate_selected(state, pty, session, output, worker, config, ai_sender)
+            activate_selected(state, pty, session, output, worker, config, ai_sender).map(|_| ())
         }
         EnterResolution::Execute(text) => execute_text(state, pty, session, output, text),
         EnterResolution::Confirm {

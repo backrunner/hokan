@@ -72,6 +72,7 @@ pub(super) fn handle_control_message(
             state.candidates.clear();
             state.selected = None;
             state.selection_intent = None;
+            state.pending_accept = false;
             state.provider_pending = false;
             state.overlay_visible = false;
             state.pending_confirm = None;
@@ -104,6 +105,7 @@ pub(super) fn handle_control_message(
             state.overlay_visible = false;
             state.pending_confirm = None;
             state.selection_intent = None;
+            state.pending_accept = false;
             state.foreground_process = true;
             output.hide_overlay().map_err(output_error)?;
             output.set_foreground(true).map_err(output_error)?;
@@ -127,6 +129,7 @@ pub(super) fn handle_control_message(
             state.overlay_visible = false;
             state.pending_confirm = None;
             state.selection_intent = None;
+            state.pending_accept = false;
             output.hide_overlay().map_err(output_error)?;
         }
     }

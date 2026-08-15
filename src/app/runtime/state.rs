@@ -34,6 +34,10 @@ pub(super) struct RuntimeState {
     pub(super) candidates: Vec<Candidate>,
     pub(super) selected: Option<crate::completion::CandidateId>,
     pub(super) selection_intent: Option<SelectionIntent>,
+    /// One-shot Tab fill deferred until candidates for the latest
+    /// authoritative shell buffer arrive. Every subsequent input event clears
+    /// it; shell buffer events for bytes typed before Tab do not.
+    pub(super) pending_accept: bool,
     pub(super) history_only: bool,
     pub(super) provider_pending: bool,
     pub(super) overlay_visible: bool,
@@ -116,6 +120,7 @@ impl RuntimeState {
             candidates: Vec::new(),
             selected: None,
             selection_intent: None,
+            pending_accept: false,
             history_only: false,
             provider_pending: false,
             overlay_visible: false,
@@ -190,6 +195,7 @@ impl RuntimeState {
             self.candidates_context = None;
             self.candidates.clear();
             self.selected = None;
+            self.pending_accept = false;
             self.overlay_visible = false;
             self.provider_pending = false;
             return Ok(());

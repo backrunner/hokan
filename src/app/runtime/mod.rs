@@ -224,6 +224,15 @@ pub fn run_session(options: SessionOptions) -> crate::Result<u8> {
             recv(worker.results()) -> message => {
                 if let Ok(result) = message {
                     handle_provider_result(result, &mut state, output.handle())?;
+                    retry_pending_accept(
+                        &mut state,
+                        &mut pty,
+                        &shell_session,
+                        output.handle(),
+                        &worker,
+                        &config,
+                        &ai_sender,
+                    )?;
                 }
             }
             recv(ai_receiver) -> message => {
