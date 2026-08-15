@@ -3,15 +3,20 @@
 use std::{
     fs,
     io::{Read, Write},
+    net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::mpsc::{self, Receiver},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
 use nix::{
-    sys::{signal, signal::Signal},
+    sys::{
+        signal,
+        signal::Signal,
+        wait::{WaitPidFlag, WaitStatus, waitpid},
+    },
     unistd::Pid,
 };
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -24,7 +29,11 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 const READ_POLL: Duration = Duration::from_millis(5);
 const SYNC_QUERY: &[u8] = b"\x1b[?2026$p";
 const CPR_QUERY: &[u8] = b"\x1b[6n";
-const RESTORE_PRESENTATION: &[u8] = b"\x18\x1b[0m\x1b[?25h";
+const PASTE_START: &[u8] = b"\x1b[200~";
+const PASTE_END: &[u8] = b"\x1b[201~";
+const ENABLE_BRACKETED_PASTE: &[u8] = b"\x1b[?2004h";
+const DISABLE_BRACKETED_PASTE: &[u8] = b"\x1b[?2004l";
+const RESTORE_PRESENTATION: &[u8] = b"\x1b[?2004l\x1b[0m\x1b[?25h";
 
 /// Source tag glyphs as rendered with the default `nerd_fonts = true`.
 const TAG_SPEC: &str = "\u{f02d}";
@@ -208,6 +217,17 @@ impl TerminalSession {
         command.arg("zsh");
         configure_command(&mut command, &home, &work);
         Self::spawn_command(home, work, command, sync_status)
+    }
+
+    fn spawn_bash() -> Self {
+        let (home, work) = empty_fixture_directories();
+        fs::write(home.path().join(".bashrc"), "PS1='BASH> '\n").expect("fixture bashrc");
+        let mut command = CommandBuilder::new(hokan_test_bin());
+        command.arg("--shell");
+        command.arg("bash");
+        configure_command(&mut command, &home, &work);
+        command.env("SHELL", "/bin/bash");
+        Self::spawn_command(home, work, command, 2)
     }
 
     fn spawn_termios_wrapper() -> Self {
@@ -603,6 +623,20 @@ fn real_session_keeps_overlay_and_terminal_lifecycle_stable() {
     terminal.wait_for_screen("HK> ");
     terminal.settle(Duration::from_millis(300));
     assert!(terminal.sync_replies >= 1, "DECRQM probe was not answered");
+    let initial_disable = terminal
+        .transcript
+        .windows(DISABLE_BRACKETED_PASTE.len())
+        .position(|window| window == DISABLE_BRACKETED_PASTE)
+        .expect("Hokan should normalize inherited bracketed-paste mode");
+    let child_enable = terminal
+        .transcript
+        .windows(ENABLE_BRACKETED_PASTE.len())
+        .position(|window| window == ENABLE_BRACKETED_PASTE)
+        .expect("zsh should enable bracketed paste for its line editor");
+    assert!(
+        initial_disable < child_enable,
+        "inherited mode must be cleared before child output is forwarded"
+    );
 
     terminal.write(b"ls ");
     // Wait for the hint footer (the bottom edge of the box) rather than the
@@ -630,9 +664,13 @@ fn real_session_keeps_overlay_and_terminal_lifecycle_stable() {
     terminal.wait_for_screen(TAG_SPEC);
 
     let pid = terminal.pid();
+    let suspend_start = terminal.transcript.len();
     signal::kill(Pid::from_raw(pid), Signal::SIGTSTP).expect("suspend hokan");
-    thread::sleep(Duration::from_millis(100));
+    terminal.wait_for_bytes_since(suspend_start, DISABLE_BRACKETED_PASTE);
+    wait_until_stopped(pid);
+    let continue_start = terminal.transcript.len();
     signal::kill(Pid::from_raw(pid), Signal::SIGCONT).expect("continue hokan");
+    terminal.wait_for_bytes_since(continue_start, ENABLE_BRACKETED_PASTE);
     terminal.wait_for_screen("HK> ls");
     assert!(terminal.cpr_replies >= 1, "CPR anchor was not probed");
 
@@ -1071,6 +1109,142 @@ fn real_session_restores_canonical_and_echo_termios() {
 }
 
 #[test]
+fn unicode_bracketed_paste_reaches_zsh_without_visible_delimiters() {
+    if !command_exists("zsh") {
+        return;
+    }
+    let mut terminal = TerminalSession::spawn();
+    terminal.wait_for_screen("HK> ");
+    terminal.settle(Duration::from_millis(300));
+
+    let pasted_text = "粘贴中文🙂e\u{301}👩‍💻";
+    let command = format!(
+        "printf '%s' '{pasted_text}' > unicode-paste.txt && echo hk_paste_done | tr a-z A-Z"
+    );
+    let start = terminal.transcript.len();
+    terminal.write(PASTE_START);
+    terminal.write(command.as_bytes());
+    terminal.write(PASTE_END);
+    terminal.write(b"\r");
+    terminal.wait_for_bytes_since(start, b"HK_PASTE_DONE");
+    assert_eq!(
+        fs::read_to_string(terminal._work.path().join("unicode-paste.txt"))
+            .expect("pasted Unicode fixture should exist"),
+        pasted_text
+    );
+    let output = &terminal.transcript[start..];
+    assert!(
+        !output
+            .windows(PASTE_START.len())
+            .any(|window| window == PASTE_START),
+        "paste start delimiter leaked into child output"
+    );
+    assert!(
+        !output
+            .windows(PASTE_END.len())
+            .any(|window| window == PASTE_END),
+        "paste end delimiter leaked into child output"
+    );
+
+    terminal.exit_shell();
+    terminal.wait_until_exit();
+}
+
+#[test]
+fn bash_unicode_bracketed_paste_reaches_readline_without_visible_delimiters() {
+    if !command_exists("bash") {
+        return;
+    }
+    let mut terminal = TerminalSession::spawn_bash();
+    terminal.wait_for_screen("BASH> ");
+    terminal.settle(Duration::from_millis(300));
+
+    let pasted_text = "粘贴中文🙂e\u{301}👩‍💻";
+    let command = format!(
+        "printf '%s' '{pasted_text}' > bash-unicode-paste.txt && echo hk_bash_paste_done | tr a-z A-Z"
+    );
+    let start = terminal.transcript.len();
+    terminal.write(PASTE_START);
+    terminal.write(command.as_bytes());
+    terminal.write(PASTE_END);
+    terminal.write(b"\r");
+    terminal.wait_for_bytes_since(start, b"HK_BASH_PASTE_DONE");
+    assert_eq!(
+        fs::read_to_string(terminal._work.path().join("bash-unicode-paste.txt"))
+            .expect("Bash pasted Unicode fixture should exist"),
+        pasted_text
+    );
+    let output = &terminal.transcript[start..];
+    assert!(
+        !output
+            .windows(PASTE_START.len())
+            .any(|window| window == PASTE_START),
+        "Bash paste start delimiter leaked into child output"
+    );
+    assert!(
+        !output
+            .windows(PASTE_END.len())
+            .any(|window| window == PASTE_END),
+        "Bash paste end delimiter leaked into child output"
+    );
+
+    terminal.exit_shell();
+    terminal.wait_until_exit();
+}
+
+#[test]
+fn common_zsh_editing_keys_remain_native() {
+    if !command_exists("zsh") {
+        return;
+    }
+    let mut terminal = TerminalSession::spawn();
+    terminal.wait_for_screen("HK> ");
+    terminal.settle(Duration::from_millis(300));
+
+    terminal.write(b"discard this");
+    terminal.write(b"\x15"); // Ctrl-U
+    terminal.write(b"Xecho hk_native_edit | tr a-z A-ZY");
+    terminal.write(b"\x1b[H\x1b[3~"); // Home, Delete
+    terminal.write(b"\x1b[F\x7f"); // End, Backspace
+    terminal.write(b"\x01\x0b"); // Ctrl-A, Ctrl-K
+    terminal.write(b"echo hk_native_edit | tr a-z A-Z extra");
+    terminal.write(b"\x17"); // Ctrl-W
+    terminal.write(b"\x01\x1b[C\x1b[D\x05"); // Ctrl-A, Right, Left, Ctrl-E
+    let start = terminal.transcript.len();
+    terminal.write(b"\r");
+    terminal.wait_for_bytes_since(start, b"HK_NATIVE_EDIT");
+
+    terminal.exit_shell();
+    terminal.wait_until_exit();
+}
+
+#[test]
+fn common_bash_editing_keys_remain_native() {
+    if !command_exists("bash") {
+        return;
+    }
+    let mut terminal = TerminalSession::spawn_bash();
+    terminal.wait_for_screen("BASH> ");
+    terminal.settle(Duration::from_millis(300));
+
+    terminal.write(b"discard this");
+    terminal.write(b"\x15"); // Ctrl-U
+    terminal.write(b"Xecho hk_bash_native_edit | tr a-z A-ZY");
+    terminal.write(b"\x1b[H\x1b[3~"); // Home, Delete
+    terminal.write(b"\x1b[F\x7f"); // End, Backspace
+    terminal.write(b"\x01\x0b"); // Ctrl-A, Ctrl-K
+    terminal.write(b"echo hk_bash_native_edit | tr a-z A-Z extra");
+    terminal.write(b"\x17"); // Ctrl-W
+    terminal.write(b"\x01\x1b[C\x1b[D\x05"); // Ctrl-A, Right, Left, Ctrl-E
+    let start = terminal.transcript.len();
+    terminal.write(b"\r");
+    terminal.wait_for_bytes_since(start, b"HK_BASH_NATIVE_EDIT");
+
+    terminal.exit_shell();
+    terminal.wait_until_exit();
+}
+
+#[test]
 fn termination_signals_restore_the_terminal_after_an_active_overlay() {
     if !command_exists("zsh") {
         return;
@@ -1192,50 +1366,6 @@ fn pnpm_offers_package_json_scripts() {
 }
 
 #[test]
-fn tui_recovery_debug_scratch() {
-    if !command_exists("zsh") {
-        return;
-    }
-    let (home, work) = fixture_directories();
-    fs::write(
-        home.path().join(".config/hokan/config.toml"),
-        "[logging]\nenabled = true\n",
-    )
-    .expect("debug config");
-    let log_path = home.path().join(".local/state/hokan/debug.log");
-    let fixture = work.path().join("tui.sh");
-    fs::write(
-        &fixture,
-        "#!/bin/sh\nprintf '\\033[?1049h\\033[?2026hTUI_DBG\\r\\n'\nIFS= read -r key\nprintf '\\033[?2026l\\033[?1049l'\n",
-    )
-    .expect("tui fixture");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = fs::metadata(&fixture).expect("metadata").permissions();
-        permissions.set_mode(0o700);
-        fs::set_permissions(&fixture, permissions).expect("chmod");
-    }
-    let mut terminal = TerminalSession::spawn_hokan(home, work, 2);
-    terminal.wait_for_screen("HK> ");
-    terminal.settle(Duration::from_millis(300));
-    terminal.write(b"sh ./tui.sh\r");
-    terminal.wait_for_screen("TUI_DBG");
-    terminal.write(b"x\r");
-    terminal.wait_for_screen("HK> ");
-    terminal.settle(Duration::from_millis(300));
-    terminal.write(b"ls ");
-    terminal.settle(Duration::from_millis(1500));
-    eprintln!("=== SCREEN ===\n{}", terminal.screen_text());
-    eprintln!(
-        "=== DEBUG LOG ===\n{}",
-        fs::read_to_string(&log_path).unwrap_or_else(|e| format!("<{e}>"))
-    );
-    terminal.exit_shell();
-    terminal.wait_until_exit();
-}
-
-#[test]
 fn overlay_recovers_after_fullscreen_apps_exit() {
     if !command_exists("zsh") {
         return;
@@ -1286,6 +1416,353 @@ fn overlay_recovers_after_fullscreen_apps_exit() {
         terminal.exit_shell();
         terminal.wait_until_exit();
     }
+}
+
+#[test]
+fn kimi_style_tui_queries_input_and_crash_recovery_are_byte_exact() {
+    if !command_exists("zsh") || !command_exists("python3") {
+        return;
+    }
+    let (home, work) = fixture_directories();
+    let fixture = work.path().join("tui.py");
+    fs::write(
+        &fixture,
+        r#"import os
+import select
+import sys
+import termios
+import time
+import tty
+
+fd = sys.stdin.fileno()
+expected = int(sys.argv[1])
+saved = termios.tcgetattr(fd)
+tty.setraw(fd)
+try:
+    os.write(1, b"\x1b[?2026h\x1b[?25l\x1b[?2004h\x1b[>7u\x1b[?u\x1b[c")
+    os.write(1, b"\x1b[?1003h\x1b[?1004h\x1b[?1006h\x1b[?2031h")
+    os.write(1, b"\x1b[>4;2m\x1b]11;?\x07\x1b[?996n\x1b[6n")
+    reply = bytearray()
+    deadline = time.monotonic() + 5
+    while not reply.endswith(b"R"):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not select.select([fd], [], [], remaining)[0]:
+            raise RuntimeError("CPR timeout")
+        reply.extend(os.read(fd, 1))
+    if not (reply.startswith(b"\x1b[") and b";" in reply):
+        raise RuntimeError("invalid CPR")
+    os.write(1, b"\r\nTUI_CPR_OK\r\nTUI_INPUT_READY\r\n")
+    payload = bytearray()
+    while len(payload) < expected:
+        payload.extend(os.read(fd, expected - len(payload)))
+    os.write(1, b"\r\nTUI_INPUT=" + payload.hex().encode() + b"\r\n")
+finally:
+    termios.tcsetattr(fd, termios.TCSANOW, saved)
+"#,
+    )
+    .expect("Kimi-style TUI fixture");
+
+    let input = [
+        b"\x1b[I".as_slice(),
+        b"\x1b[<0;10;5M".as_slice(),
+        b"\x1b[97;3u".as_slice(),
+        "\x1b[200~粘贴中文🙂e\u{301}👩‍💻\x1b[201~".as_bytes(),
+    ]
+    .concat();
+    let expected_hex = input
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    // Queue the command before the first prompt event is consumed. This
+    // exercises the startup handoff path used by a fast paste-and-Enter.
+    let mut terminal = TerminalSession::spawn_hokan(home, work, 2);
+    let command_start = terminal.transcript.len();
+    terminal.write(format!("python3 ./tui.py {}\r", input.len()).as_bytes());
+    terminal.wait_for_bytes_since(command_start, b"TUI_CPR_OK");
+    terminal.wait_for_bytes_since(command_start, b"TUI_INPUT_READY");
+    terminal.write(&input);
+    terminal.wait_for_bytes_since(
+        command_start,
+        format!("TUI_INPUT={expected_hex}").as_bytes(),
+    );
+    terminal.wait_for_bytes_since(command_start, b"HK> ");
+    terminal.wait_for_screen("HK> ");
+    terminal.settle(Duration::from_millis(300));
+
+    for reset in [
+        b"\x1b[?1003l".as_slice(),
+        b"\x1b[?1004l".as_slice(),
+        b"\x1b[?1006l".as_slice(),
+        b"\x1b[?2031l".as_slice(),
+        b"\x1b[>4;0m".as_slice(),
+        b"\x1b[<u".as_slice(),
+        b"\x1b[?2026l".as_slice(),
+    ] {
+        assert!(
+            terminal.transcript[command_start..]
+                .windows(reset.len())
+                .any(|window| window == reset),
+            "missing terminal recovery sequence {reset:?}; tail={:?}",
+            tail(&terminal.transcript, 1024)
+        );
+    }
+
+    terminal.write("printf '终端恢复🙂e\u{301}👩‍💻\\n'\r".as_bytes());
+    terminal.wait_for_screen("终端恢复🙂e\u{301}👩‍💻");
+    terminal.exit_shell();
+    terminal.wait_until_exit();
+}
+
+#[test]
+fn foreground_tui_receives_unicode_multiline_paste_incrementally() {
+    if !command_exists("zsh") || !command_exists("python3") {
+        return;
+    }
+    let (home, work) = fixture_directories();
+    let fixture = work.path().join("incremental-paste-tui.py");
+    fs::write(
+        &fixture,
+        r#"import os
+import sys
+import termios
+import tty
+
+fd = sys.stdin.fileno()
+payload_size = int(sys.argv[1])
+saved = termios.tcgetattr(fd)
+
+def read_exact(size):
+    data = bytearray()
+    while len(data) < size:
+        chunk = os.read(fd, size - len(data))
+        if not chunk:
+            raise RuntimeError("unexpected EOF")
+        data.extend(chunk)
+    return bytes(data)
+
+tty.setraw(fd)
+try:
+    os.write(1, b"\x1b[?2004h\r\nTUI_PASTE_READY\r\n")
+    start = read_exact(6)
+    if start != b"\x1b[200~":
+        raise RuntimeError("invalid paste start: " + start.hex())
+    os.write(1, b"TUI_PASTE_STARTED\r\n")
+
+    payload = read_exact(payload_size)
+    os.write(1, b"TUI_PASTE_PAYLOAD=" + payload.hex().encode() + b"\r\n")
+
+    end = read_exact(6)
+    if end != b"\x1b[201~":
+        raise RuntimeError("invalid paste end: " + end.hex())
+    os.write(1, b"TUI_PASTE_ENDED\r\n")
+finally:
+    termios.tcsetattr(fd, termios.TCSANOW, saved)
+"#,
+    )
+    .expect("incremental paste TUI fixture");
+
+    let payload = "first line\n第二行🙂e\u{301}👩‍💻\nthird line".as_bytes();
+    let payload_hex = payload
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let mut terminal = TerminalSession::spawn_hokan(home, work, 2);
+    terminal.wait_for_screen("HK> ");
+    terminal.settle(Duration::from_millis(300));
+
+    let command_start = terminal.transcript.len();
+    terminal.write(format!("python3 ./incremental-paste-tui.py {}\r", payload.len()).as_bytes());
+    terminal.wait_for_bytes_since(command_start, b"TUI_PASTE_READY");
+
+    // Each write waits for an acknowledgement that cannot be emitted until
+    // the TUI receives that stage. A decoder that buffers until PASTE_END will
+    // therefore fail at TUI_PASTE_STARTED instead of passing on final bytes.
+    terminal.write(PASTE_START);
+    terminal.wait_for_bytes_since(command_start, b"TUI_PASTE_STARTED");
+    terminal.write(payload);
+    terminal.wait_for_bytes_since(
+        command_start,
+        format!("TUI_PASTE_PAYLOAD={payload_hex}").as_bytes(),
+    );
+    terminal.write(PASTE_END);
+    terminal.wait_for_bytes_since(command_start, b"TUI_PASTE_ENDED");
+    terminal.wait_for_bytes_since(command_start, b"HK> ");
+
+    terminal.exit_shell();
+    terminal.wait_until_exit();
+}
+
+#[test]
+fn ssh_pty_preserves_queries_unicode_resize_ctrl_c_and_escape() {
+    if !command_exists("zsh")
+        || !command_exists("ssh")
+        || !command_exists("sshd")
+        || !command_exists("ssh-keygen")
+        || !command_exists("python3")
+    {
+        return;
+    }
+
+    let server = SshServer::start();
+    let mut terminal = TerminalSession::spawn();
+    terminal.wait_for_screen("HK> ");
+    terminal.settle(Duration::from_secs(1));
+
+    let fixture = terminal._work.path().join("ssh-pty.py");
+    fs::write(
+        &fixture,
+        r#"import fcntl
+import os
+import select
+import signal
+import struct
+import sys
+import termios
+import time
+import tty
+
+fd = sys.stdin.fileno()
+
+def write(data):
+    os.write(1, data)
+
+def dimensions():
+    raw = fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\0" * 8)
+    return struct.unpack("HHHH", raw)[:2]
+
+saved = termios.tcgetattr(fd)
+tty.setraw(fd)
+try:
+    write(b"\x1b[?1004h\x1b[?2004lSSH_READY\r\n\x1b[6n")
+    reply = bytearray()
+    deadline = time.monotonic() + 5
+    while not reply.endswith(b"R"):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not select.select([fd], [], [], remaining)[0]:
+            raise RuntimeError("CPR timeout")
+        reply.extend(os.read(fd, 1))
+    if not (reply.startswith(b"\x1b[") and b";" in reply):
+        raise RuntimeError("invalid CPR")
+    write(b"\r\nSSH_CPR_OK\r\n")
+    rows, cols = dimensions()
+    write((f"SSH_SIZE={rows}x{cols}\r\n").encode())
+
+    deadline = time.monotonic() + 5
+    while True:
+        rows, cols = dimensions()
+        if (rows, cols) == (30, 100):
+            write(b"SSH_RESIZE_OK=30x100\r\n")
+            break
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"resize timeout: {rows}x{cols}")
+        select.select([fd], [], [], 0.05)
+
+    payload = bytearray()
+    while True:
+        payload.extend(os.read(fd, 4096))
+        if b"\r" in payload or b"\n" in payload:
+            break
+    end = min(
+        [index for index in (payload.find(b"\r"), payload.find(b"\n")) if index >= 0]
+    )
+    write(b"SSH_INPUT=" + bytes(payload[:end]).hex().encode() + b"\r\n")
+    write(b"SSH_CTRL_C_READY\r\n")
+
+    def interrupted(_signal, _frame):
+        write(b"\r\nSSH_CTRL_C_OK\r\n")
+        raise SystemExit(42)
+
+    signal.signal(signal.SIGINT, interrupted)
+    while True:
+        if select.select([fd], [], [], 1)[0]:
+            extra = os.read(fd, 64)
+            if b"\x03" in extra:
+                write(b"\r\nSSH_CTRL_C_OK\r\n")
+                raise SystemExit(42)
+finally:
+    termios.tcsetattr(fd, termios.TCSANOW, saved)
+"#,
+    )
+    .expect("SSH PTY fixture");
+    let input = "\x1b[200~远端🙂e\u{301}👩‍💻\x1b[201~";
+    let expected_hex = input
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let command = format!(
+        "ssh -tt -o LogLevel=ERROR -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -i {} -p {} {}@127.0.0.1 python3 -u {}",
+        shell_quote(&server.identity_key),
+        server.port,
+        shell_quote_text(&server.username),
+        shell_quote(&fixture),
+    );
+    let command_start = terminal.transcript.len();
+    terminal.write(format!("{command}\r").as_bytes());
+    terminal.wait_for_bytes_since(command_start, b"SSH_READY");
+    terminal.wait_for_bytes_since(command_start, b"SSH_CPR_OK");
+    terminal.wait_for_bytes_since(command_start, b"SSH_SIZE=24x80");
+
+    terminal.resize(30, 100);
+    terminal.wait_for_bytes_since(command_start, b"SSH_RESIZE_OK=30x100");
+    terminal.write(input.as_bytes());
+    terminal.write(b"\r");
+    terminal.wait_for_bytes_since(
+        command_start,
+        format!("SSH_INPUT={expected_hex}").as_bytes(),
+    );
+    terminal.wait_for_bytes_since(command_start, b"SSH_CTRL_C_READY");
+    terminal.write(b"\x03");
+    terminal.wait_for_bytes_since(command_start, b"SSH_CTRL_C_OK");
+    terminal.wait_for_screen("HK> ");
+    terminal.settle(Duration::from_millis(300));
+    assert!(
+        terminal.cpr_replies >= 1,
+        "the outer terminal did not answer the remote CPR query"
+    );
+
+    let escape_fixture = terminal._work.path().join("ssh-escape.py");
+    fs::write(
+        &escape_fixture,
+        r#"import os
+import termios
+import time
+import tty
+
+fd = 0
+saved = termios.tcgetattr(fd)
+tty.setraw(fd)
+try:
+    os.write(1, b"SSH_ESCAPE_READY\r\n")
+    while True:
+        time.sleep(1)
+finally:
+    termios.tcsetattr(fd, termios.TCSANOW, saved)
+"#,
+    )
+    .expect("SSH escape fixture");
+    let escape_command = format!(
+        "ssh -tt -o LogLevel=ERROR -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -i {} -p {} {}@127.0.0.1 python3 -u {}",
+        shell_quote(&server.identity_key),
+        server.port,
+        shell_quote_text(&server.username),
+        shell_quote(&escape_fixture),
+    );
+    let escape_start = terminal.transcript.len();
+    terminal.write(format!("{escape_command}\r").as_bytes());
+    terminal.wait_for_bytes_since(escape_start, b"SSH_ESCAPE_READY");
+    terminal.write(b"\r~.");
+    terminal.wait_for_bytes_since(escape_start, b"HK> ");
+
+    terminal.write(b"true\r");
+    terminal.wait_for_bare_row("HK>");
+    terminal.exit_shell();
+    terminal.wait_until_exit();
+    assert_eq!(
+        terminal.try_wait().map(|status| status.exit_code()),
+        Some(0)
+    );
+    drop(server);
 }
 
 #[test]
@@ -1847,7 +2324,7 @@ fn rapid_typing_and_backspacing_still_surfaces_the_overlay() {
     for round in 0..6 {
         // One write: type "ls -la", erase it entirely, retype "ls ".
         terminal.write(b"ls -la\x7f\x7f\x7f\x7f\x7f\x7fls ");
-        terminal.wait_for_screen(TAG_SPEC);
+        terminal.wait_for_clean_overlay("HK> ls");
         let text = terminal.screen_text();
         assert!(
             text.contains("HK> ls"),
@@ -2049,6 +2526,129 @@ fn empty_fixture_directories() -> (TempDir, TempDir) {
     (home, work)
 }
 
+struct SshServer {
+    _directory: TempDir,
+    child: Option<std::process::Child>,
+    identity_key: PathBuf,
+    port: u16,
+    username: String,
+}
+
+impl SshServer {
+    fn start() -> Self {
+        let directory = tempfile::Builder::new()
+            .prefix("hokan-ssh-")
+            .tempdir()
+            .expect("SSH fixture directory");
+        let host_key = directory.path().join("host_ed25519");
+        let identity_key = directory.path().join("client_ed25519");
+        generate_ssh_key(&host_key, "host key");
+        generate_ssh_key(&identity_key, "client key");
+        let public_key =
+            fs::read_to_string(identity_key.with_extension("pub")).expect("client public key");
+        let authorized_keys = directory.path().join("authorized_keys");
+        fs::write(&authorized_keys, public_key).expect("authorized keys");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&authorized_keys, fs::Permissions::from_mode(0o600))
+                .expect("authorized keys permissions");
+        }
+
+        let port = TcpListener::bind(("127.0.0.1", 0))
+            .expect("reserve SSH port")
+            .local_addr()
+            .expect("SSH listener address")
+            .port();
+        let pid_file = directory.path().join("sshd.pid");
+        let config = directory.path().join("sshd_config");
+        let username = std::env::var("USER").expect("USER is required for SSH fixture");
+        let config_text = format!(
+            "Port {port}\nListenAddress 127.0.0.1\nAddressFamily inet\nHostKey {}\nPidFile {}\nAuthorizedKeysFile {}\nStrictModes no\nUsePAM no\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nPubkeyAuthentication yes\nPermitRootLogin no\nPermitTTY yes\nX11Forwarding no\nAllowTcpForwarding no\nPrintMotd no\nUseDNS no\nLogLevel ERROR\n",
+            host_key.display(),
+            pid_file.display(),
+            authorized_keys.display(),
+        );
+        fs::write(&config, config_text).expect("sshd config");
+
+        let mut child = Command::new(command_path("sshd"))
+            .arg("-D")
+            .arg("-e")
+            .arg("-f")
+            .arg(&config)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start sshd");
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            if let Some(status) = child.try_wait().expect("poll sshd") {
+                let mut stderr = String::new();
+                if let Some(mut pipe) = child.stderr.take() {
+                    let _ = pipe.read_to_string(&mut stderr);
+                }
+                panic!("sshd exited before becoming ready ({status}); stderr={stderr}");
+            }
+            if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "sshd did not become ready");
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        Self {
+            _directory: directory,
+            child: Some(child),
+            identity_key,
+            port,
+            username,
+        }
+    }
+}
+
+impl Drop for SshServer {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn generate_ssh_key(path: &Path, description: &str) {
+    let output = Command::new(command_path("ssh-keygen"))
+        .args(["-q", "-t", "ed25519", "-N", ""])
+        .arg("-f")
+        .arg(path)
+        .output()
+        .unwrap_or_else(|error| panic!("generate {description}: {error}"));
+    assert!(
+        output.status.success(),
+        "generate {description} failed: stdout={:?}, stderr={:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn shell_quote(path: &Path) -> String {
+    shell_quote_text(&path.to_string_lossy())
+}
+
+fn shell_quote_text(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
+fn command_path(name: &str) -> PathBuf {
+    std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+        .map(|directory| directory.join(name))
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| panic!("{name} was not found in PATH"))
+}
+
 fn configure_command(command: &mut CommandBuilder, home: &TempDir, work: &TempDir) {
     command.env_remove("HOKAN_ACTIVE");
     command.env_remove("HOKAN_AUTO_START");
@@ -2088,6 +2688,27 @@ fn command_exists(name: &str) -> bool {
     std::env::var_os("PATH").is_some_and(|path| {
         std::env::split_paths(&path).any(|directory| directory.join(name).is_file())
     })
+}
+
+fn wait_until_stopped(pid: i32) {
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        match waitpid(
+            Pid::from_raw(pid),
+            Some(WaitPidFlag::WUNTRACED | WaitPidFlag::WNOHANG),
+        ) {
+            Ok(WaitStatus::Stopped(_, _)) => return,
+            Ok(WaitStatus::StillAlive | WaitStatus::Continued(_)) => {}
+            Ok(status) => panic!("Hokan exited instead of suspending: {status:?}"),
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(error) => panic!("failed to observe suspended Hokan process: {error}"),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Hokan did not enter stopped state"
+        );
+        thread::sleep(READ_POLL);
+    }
 }
 
 fn hokan_test_bin() -> PathBuf {

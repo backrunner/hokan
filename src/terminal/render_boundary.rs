@@ -78,6 +78,7 @@ pub struct RenderBoundaryDecoder {
     token: SessionToken,
     scanner: SafeBoundaryScanner,
     candidate: Vec<u8>,
+    candidate_passthrough: bool,
     next_prompt: BoundaryId,
     next_redisplay: BoundaryId,
     phase: ShellPhase,
@@ -96,6 +97,7 @@ impl RenderBoundaryDecoder {
             token,
             scanner: SafeBoundaryScanner::default(),
             candidate: Vec::new(),
+            candidate_passthrough: false,
             next_prompt: BoundaryId::new(1),
             next_redisplay: BoundaryId::new(1),
             phase: ShellPhase::Prompt,
@@ -113,15 +115,17 @@ impl RenderBoundaryDecoder {
     /// A fresh prompt announced over the trusted control channel is the one
     /// place a wedge may be cleared: drop any withheld partial marker and heal
     /// a desynchronized scanner. Without this a crashed TUI that emitted an
-    /// overlong/invalid sequence leaves the scanner `Desynchronized` forever,
-    /// every later marker passes through invisibly, and the overlay never
-    /// recovers. The withheld fragment is DROPPED, not flushed: it is an
+    /// overlong/invalid sequence leaves the scanner `Desynchronized` forever.
+    /// Authenticated markers are still observed while desynchronized, but are
+    /// passed through until this control-channel reset confirms the boundary.
+    /// The withheld fragment is DROPPED, not flushed: it is an
     /// unterminated control string the screen model never saw, so writing it
     /// through would put the real terminal into string-swallow mode while the
     /// model disagrees about what is on screen.
     pub fn reset_at_trusted_boundary(&mut self) {
         self.scanner.reset_at_trusted_boundary();
         self.candidate.clear();
+        self.candidate_passthrough = false;
     }
 
     pub fn feed(&mut self, bytes: &[u8]) -> DecodedChildOutput {
@@ -134,13 +138,15 @@ impl RenderBoundaryDecoder {
 
     pub fn finish(&mut self) -> Vec<u8> {
         let pending = std::mem::take(&mut self.candidate);
+        self.candidate_passthrough = false;
         self.scanner.feed(&pending);
         pending
     }
 
     fn push_byte(&mut self, byte: u8, decoded: &mut DecodedChildOutput) {
         if self.candidate.is_empty() {
-            if self.scanner.is_safe() && byte == 0x1b {
+            if byte == 0x1b && (self.scanner.is_safe() || self.scanner.is_desynchronized()) {
+                self.candidate_passthrough = self.scanner.is_desynchronized();
                 self.candidate.push(byte);
             } else {
                 decoded.passthrough.push(byte);
@@ -164,13 +170,28 @@ impl RenderBoundaryDecoder {
         if self.candidate.len() >= 2 && self.candidate.ends_with(b"\x1b\\") {
             match self.parse_complete_marker() {
                 MarkerOutcome::Event(event) => {
+                    let passthrough_offset = if self.candidate_passthrough {
+                        let candidate = std::mem::take(&mut self.candidate);
+                        self.scanner.feed(&candidate);
+                        decoded.passthrough.extend_from_slice(&candidate);
+                        decoded.passthrough.len()
+                    } else {
+                        self.candidate.clear();
+                        decoded.passthrough.len()
+                    };
+                    self.candidate_passthrough = false;
                     decoded.boundaries.push(BoundaryAt {
-                        passthrough_offset: decoded.passthrough.len(),
+                        passthrough_offset,
                         event,
                     });
-                    self.candidate.clear();
                 }
-                MarkerOutcome::Consume => self.candidate.clear(),
+                MarkerOutcome::Consume if self.candidate_passthrough => {
+                    self.flush_candidate(decoded);
+                }
+                MarkerOutcome::Consume => {
+                    self.candidate.clear();
+                    self.candidate_passthrough = false;
+                }
                 MarkerOutcome::Invalid => self.flush_candidate(decoded),
             }
         }
@@ -178,6 +199,7 @@ impl RenderBoundaryDecoder {
 
     fn flush_candidate(&mut self, decoded: &mut DecodedChildOutput) {
         let candidate = std::mem::take(&mut self.candidate);
+        self.candidate_passthrough = false;
         self.scanner.feed(&candidate);
         decoded.passthrough.extend_from_slice(&candidate);
     }
@@ -410,8 +432,9 @@ mod tests {
     #[test]
     fn trusted_boundary_reset_heals_desynchronization_and_reanchors_ids() {
         let mut decoder = RenderBoundaryDecoder::new(token());
-        // An invalid raw byte desynchronizes the scanner; while desynced every
-        // marker — even a valid, authenticated one — passes through invisibly.
+        // An invalid raw byte desynchronizes the scanner. A valid marker is
+        // kept byte-exact in the output, but its authenticated boundary is
+        // still reported so a later control event can establish ordering.
         assert!(decoder.feed(&[0xf5]).boundaries.is_empty());
         let lost = encode_marker(
             &token(),
@@ -419,9 +442,17 @@ mod tests {
                 boundary_id: BoundaryId::new(1),
             },
         );
-        let swallowed = decoder.feed(&lost);
-        assert_eq!(swallowed.passthrough, lost);
-        assert!(swallowed.boundaries.is_empty());
+        let observed = decoder.feed(&lost);
+        assert_eq!(observed.passthrough, lost);
+        assert_eq!(
+            observed.boundaries,
+            vec![BoundaryAt {
+                passthrough_offset: lost.len(),
+                event: RenderBoundaryEvent::PromptRendered {
+                    boundary_id: BoundaryId::new(1),
+                },
+            }]
+        );
 
         // The shell moved on: its next prompt carries id 2. The reset heals
         // the scanner, and the authenticated id gap fast-forwards the

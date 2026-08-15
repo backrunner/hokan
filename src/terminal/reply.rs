@@ -61,6 +61,11 @@ pub struct TerminalReplyRouter {
     late: Vec<LateQuery>,
     candidate: Vec<u8>,
     candidate_started: Option<Instant>,
+    /// Once a foreground child owns the PTY, a timed-out Hokan query must not
+    /// keep filtering the child's own terminal replies.  A query which was
+    /// already written before the hand-off is still matched in order; only
+    /// the grace-period filter for late replies is removed.
+    foreground: bool,
 }
 
 impl TerminalReplyRouter {
@@ -99,6 +104,38 @@ impl TerminalReplyRouter {
         Ok(RegisteredQuery { id, bytes })
     }
 
+    /// Switch reply ownership along with the shell foreground state.
+    ///
+    /// Hokan probes are emitted just before a command is handed to the child,
+    /// so an outstanding probe may legitimately finish after that hand-off.
+    /// Keeping that one outstanding registration preserves ordering, while
+    /// dropping the late-reply quarantine prevents a TUI/SSH client's CPR or
+    /// DECRQM response from being mistaken for an expired Hokan probe.
+    pub fn set_foreground(&mut self, foreground: bool) -> Vec<u8> {
+        self.foreground = foreground;
+        if !foreground {
+            return Vec::new();
+        }
+        self.late.clear();
+
+        // A partial reply for the one query that is still outstanding must
+        // remain ordered across the hand-off. A candidate held only by the
+        // expired-query quarantine, however, now belongs to the foreground
+        // program and must be released instead of resurfacing at the next
+        // Hokan probe after that program exits.
+        let belongs_to_outstanding = self.outstanding.is_some_and(|query| {
+            matches!(
+                classify(query.kind, &self.candidate),
+                CandidateState::Potential
+            )
+        });
+        if belongs_to_outstanding {
+            return Vec::new();
+        }
+        self.candidate_started = None;
+        std::mem::take(&mut self.candidate)
+    }
+
     pub fn route(&mut self, bytes: &[u8], now: Instant) -> RoutedInput {
         let mut routed = self.expire(now);
         for &byte in bytes {
@@ -123,7 +160,9 @@ impl TerminalReplyRouter {
                 kind: outstanding.kind,
             });
             self.outstanding = None;
-            self.remember_late(outstanding.kind, now);
+            if !self.foreground {
+                self.remember_late(outstanding.kind, now);
+            }
             if partial_reply {
                 self.candidate_started = Some(now);
             }
@@ -505,5 +544,69 @@ mod tests {
         assert!(router.route(b"\x1b", timed_out).input.is_empty());
         let routed = router.expire(timed_out + LATE_REPLY_PREFIX_TIMEOUT);
         assert_eq!(routed.input, b"\x1b");
+    }
+
+    #[test]
+    fn foreground_handoff_drops_late_reply_quarantine() {
+        let started = Instant::now();
+        let mut router = TerminalReplyRouter::default();
+        router
+            .register(
+                TerminalQueryKind::CursorPosition,
+                started,
+                Duration::from_millis(1),
+            )
+            .expect("cursor query");
+        router.expire(started + Duration::from_millis(2));
+        assert!(router.set_foreground(true).is_empty());
+
+        let child_reply = b"\x1b[12;34Rpayload";
+        let routed = router.route(child_reply, started + Duration::from_millis(2));
+        assert_eq!(routed.input, child_reply);
+        assert!(routed.replies.is_empty());
+    }
+
+    #[test]
+    fn foreground_handoff_releases_a_partial_expired_reply() {
+        let started = Instant::now();
+        let mut router = TerminalReplyRouter::default();
+        router
+            .register(
+                TerminalQueryKind::CursorPosition,
+                started,
+                Duration::from_millis(1),
+            )
+            .expect("cursor query");
+        assert!(router.route(b"\x1b[12", started).input.is_empty());
+        router.expire(started + Duration::from_millis(2));
+
+        assert_eq!(router.set_foreground(true), b"\x1b[12");
+        let routed = router.route(b";34Rpayload", started + Duration::from_millis(2));
+        assert_eq!(routed.input, b";34Rpayload");
+        assert!(routed.replies.is_empty());
+    }
+
+    #[test]
+    fn outstanding_probe_remains_ordered_across_foreground_handoff() {
+        let started = Instant::now();
+        let mut router = TerminalReplyRouter::default();
+        let query = router
+            .register(
+                TerminalQueryKind::CursorPosition,
+                started,
+                Duration::from_secs(1),
+            )
+            .expect("cursor query");
+        assert!(router.route(b"\x1b[12", started).input.is_empty());
+        assert!(router.set_foreground(true).is_empty());
+        let routed = router.route(b";34R", started);
+        assert_eq!(routed.input, b"");
+        assert_eq!(
+            routed.replies,
+            vec![TerminalReply::CursorPosition {
+                query_id: query.id,
+                position: CellPos::new(11, 33),
+            }]
+        );
     }
 }

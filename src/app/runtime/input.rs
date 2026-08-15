@@ -16,7 +16,10 @@ use crate::{
     config::Config,
     pty::{PtyChild, PtyReadEvent, SignalEvent},
     shell::{ShellKind, ShellSession, accept_sequence, replacement_sequence},
-    terminal::{InputDecoder, InputEvent, InputKind, OutputHandle, TerminalReplyRouter},
+    terminal::{
+        InputDecoder, InputEvent, InputKind, OutputHandle, TerminalReplyRouter,
+        input::{PASTE_END, PASTE_START},
+    },
 };
 use crossbeam_channel::Sender;
 
@@ -39,14 +42,70 @@ pub(super) fn route_terminal_input(
             render_current(state, output)?;
         }
     }
-    let events = decoder.feed(&routed.input);
-    state.escape_deadline = decoder
-        .has_pending_ambiguity()
-        .then(|| Instant::now() + ESCAPE_TIMEOUT);
+    forward_terminal_input(
+        &routed.input,
+        decoder,
+        state,
+        pty,
+        session,
+        output,
+        worker,
+        config,
+        ai_sender,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn forward_terminal_input(
+    bytes: &[u8],
+    decoder: &mut InputDecoder,
+    state: &mut RuntimeState,
+    pty: &mut PtyChild,
+    session: &ShellSession,
+    output: &OutputHandle,
+    worker: &ProviderWorker,
+    config: &Arc<Config>,
+    ai_sender: &Sender<AiResult>,
+) -> crate::Result<()> {
+    if state.foreground_process {
+        // The decoder may contain bytes read just after the command's Enter
+        // but before the foreground transition was observed. They precede the
+        // current batch and must be released first, without waiting for an
+        // escape timeout or a bracketed-paste end marker.
+        let buffered = decoder.take_buffered_raw();
+        state.escape_deadline = None;
+        if !buffered.is_empty() {
+            pty.write_all(&buffered)?;
+        }
+        if !bytes.is_empty() {
+            pty.write_all(bytes)?;
+        }
+        return Ok(());
+    }
+
+    let events = decoder.feed(bytes);
+    if decoder.has_pending_ambiguity() {
+        if !bytes.is_empty() || state.escape_deadline.is_none() {
+            state.escape_deadline = Some(Instant::now() + ESCAPE_TIMEOUT);
+        }
+    } else {
+        state.escape_deadline = None;
+    }
     for event in events {
         handle_input_event(
             event, state, pty, session, output, worker, config, ai_sender,
         )?;
+    }
+
+    // `feed` can return an Enter event while retaining a trailing partial
+    // escape or paste sequence from the same terminal read. Once that Enter
+    // hands the PTY to the command, release the retained suffix immediately.
+    if state.foreground_process {
+        let buffered = decoder.take_buffered_raw();
+        state.escape_deadline = None;
+        if !buffered.is_empty() {
+            pty.write_all(&buffered)?;
+        }
     }
     Ok(())
 }
@@ -62,8 +121,19 @@ pub(super) fn handle_input_event(
     config: &Arc<Config>,
     ai_sender: &Sender<AiResult>,
 ) -> crate::Result<()> {
+    let child_bytes =
+        input_bytes_for_shell(&event, session.supports_bracketed_paste(), state.editing);
     if !state.editing {
-        pty.write_all(&event.raw)?;
+        // Input can already be queued in the outer PTY while the first prompt
+        // event is still crossing the control FIFO.  Mark an Enter-triggered
+        // command as foreground before forwarding it so a fast-starting TUI
+        // cannot change terminal modes before the output actor snapshots the
+        // shell baseline.
+        if !state.foreground_process && matches!(event.kind, InputKind::Enter) {
+            state.foreground_process = true;
+            output.set_foreground_and_wait(true).map_err(output_error)?;
+        }
+        pty.write_all(child_bytes)?;
         return Ok(());
     }
 
@@ -180,11 +250,12 @@ pub(super) fn handle_input_event(
     if matches!(event.kind, InputKind::Enter) {
         state.pending_command = Some(state.buffer.text.clone());
         state.editing = false;
+        state.foreground_process = true;
         state.overlay_visible = false;
         state.cancel_ai();
         output.hide_overlay().map_err(output_error)?;
         output.set_foreground_and_wait(true).map_err(output_error)?;
-        pty.write_all(&event.raw)?;
+        pty.write_all(child_bytes)?;
         return Ok(());
     }
 
@@ -203,10 +274,10 @@ pub(super) fn handle_input_event(
     // never turn a following Enter into a candidate execution.
     state.selected = None;
 
-    pty.write_all(&event.raw)?;
+    pty.write_all(child_bytes)?;
 
     if state.shell.exact_buffer_sync() {
-        if matches!(event.kind, InputKind::Raw) {
+        if matches!(event.kind, InputKind::Raw | InputKind::PasteFragment { .. }) {
             state.buffer.mark_uncertain();
             output.hide_overlay().map_err(output_error)?;
         }
@@ -226,6 +297,36 @@ pub(super) fn handle_input_event(
         MirrorOutcome::Submitted | MirrorOutcome::Unchanged => {}
     }
     Ok(())
+}
+
+fn input_bytes_for_shell(
+    event: &InputEvent,
+    supports_bracketed_paste: bool,
+    editing: bool,
+) -> &[u8] {
+    if !editing || supports_bracketed_paste {
+        return &event.raw;
+    }
+    match &event.kind {
+        InputKind::Paste(payload) => payload,
+        InputKind::PasteFragment {
+            strip_start,
+            strip_end,
+        } => {
+            let start = if *strip_start && event.raw.starts_with(PASTE_START) {
+                PASTE_START.len()
+            } else {
+                0
+            };
+            let end = if *strip_end && event.raw.ends_with(PASTE_END) {
+                event.raw.len() - PASTE_END.len()
+            } else {
+                event.raw.len()
+            };
+            &event.raw[start.min(end)..end]
+        }
+        _ => &event.raw,
+    }
 }
 
 fn arm_hidden_overlay_query(state: &mut RuntimeState, output: &OutputHandle) -> crate::Result<()> {
@@ -358,6 +459,7 @@ fn execute_text(
 ) -> crate::Result<()> {
     state.pending_command = Some(text.clone());
     state.editing = false;
+    state.foreground_process = true;
     state.overlay_visible = false;
     state.pending_confirm = None;
     state.cancel_ai();
@@ -508,4 +610,93 @@ pub(super) fn detect_foreground_process(
         output.set_foreground(true).map_err(output_error)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::terminal::input::MAX_PASTE_BYTES;
+
+    fn paste_event(payload: &[u8]) -> InputEvent {
+        let mut raw = b"\x1b[200~".to_vec();
+        raw.extend_from_slice(payload);
+        raw.extend_from_slice(b"\x1b[201~");
+        InputEvent {
+            kind: InputKind::Paste(payload.to_vec()),
+            raw,
+        }
+    }
+
+    #[test]
+    fn bash_readline_receives_only_the_paste_payload() {
+        let event = paste_event("粘贴中文🙂e\u{301}👩‍💻".as_bytes());
+        let InputKind::Paste(payload) = &event.kind else {
+            panic!("fixture should be a paste event");
+        };
+        assert_eq!(input_bytes_for_shell(&event, false, true), payload);
+    }
+
+    #[test]
+    fn bracketed_paste_stays_raw_for_native_editors_and_foreground_programs() {
+        let event = paste_event(b"first\nsecond");
+        assert_eq!(input_bytes_for_shell(&event, true, true), event.raw);
+        assert_eq!(input_bytes_for_shell(&event, false, false), event.raw);
+    }
+
+    #[test]
+    fn legacy_readline_strips_only_oversized_paste_boundaries() {
+        let first = InputEvent {
+            kind: InputKind::PasteFragment {
+                strip_start: true,
+                strip_end: false,
+            },
+            raw: b"\x1b[200~first".to_vec(),
+        };
+        assert_eq!(input_bytes_for_shell(&first, false, true), b"first");
+
+        let middle = InputEvent {
+            kind: InputKind::PasteFragment {
+                strip_start: false,
+                strip_end: false,
+            },
+            raw: b"\x1b[200~literal\x1b[201~".to_vec(),
+        };
+        assert_eq!(input_bytes_for_shell(&middle, false, true), middle.raw);
+
+        let last = InputEvent {
+            kind: InputKind::PasteFragment {
+                strip_start: false,
+                strip_end: true,
+            },
+            raw: b"last\x1b[201~".to_vec(),
+        };
+        assert_eq!(input_bytes_for_shell(&last, false, true), b"last");
+    }
+
+    #[test]
+    fn oversized_paste_round_trips_for_legacy_and_native_editors() {
+        let payload = vec![b'x'; MAX_PASTE_BYTES + 64 * 1024];
+        let mut raw = PASTE_START.to_vec();
+        raw.extend_from_slice(&payload);
+        raw.extend_from_slice(PASTE_END);
+
+        let mut decoder = InputDecoder::default();
+        let mut events = Vec::new();
+        for chunk in raw.chunks(16 * 1024) {
+            events.extend(decoder.feed(chunk));
+        }
+        assert!(events.len() > 1, "fixture should exercise streaming");
+
+        let legacy: Vec<_> = events
+            .iter()
+            .flat_map(|event| input_bytes_for_shell(event, false, true).iter().copied())
+            .collect();
+        assert_eq!(legacy, payload);
+
+        let native: Vec<_> = events
+            .iter()
+            .flat_map(|event| input_bytes_for_shell(event, true, true).iter().copied())
+            .collect();
+        assert_eq!(native, raw);
+    }
 }

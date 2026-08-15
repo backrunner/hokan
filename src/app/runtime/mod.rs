@@ -116,6 +116,13 @@ pub fn run_session(options: SessionOptions) -> crate::Result<u8> {
             .map_err(output_error)?;
     let mut output = OutputLease::new(output_handle, output_join);
     configure_overlay(output.handle(), &config)?;
+    // Normalize any mode leaked by a previous process before child output is
+    // forwarded. Native line editors re-enable bracketed paste themselves.
+    output
+        .handle()
+        .set_bracketed_paste(false)
+        .map_err(output_error)?;
+    output.handle().barrier().map_err(output_error)?;
     if let Some(log) = &debug_log {
         output
             .handle()
@@ -249,24 +256,28 @@ pub fn run_session(options: SessionOptions) -> crate::Result<u8> {
                 )?;
             }
         }
+        // Keep terminal-reply ownership aligned with the shell state.  In
+        // particular, a timed-out Hokan probe must stop quarantining bytes as
+        // soon as a TUI/SSH child takes the foreground PTY.
+        let mut routed_input = reply_router.set_foreground(state.foreground_process);
         let expired = reply_router.expire(now);
         for reply in expired.replies {
             if handle_terminal_reply(reply, output.handle())? {
                 render_current(&mut state, output.handle())?;
             }
         }
-        for event in decoder.feed(&expired.input) {
-            handle_input_event(
-                event,
-                &mut state,
-                &mut pty,
-                &shell_session,
-                output.handle(),
-                &worker,
-                &config,
-                &ai_sender,
-            )?;
-        }
+        routed_input.extend_from_slice(&expired.input);
+        forward_terminal_input(
+            &routed_input,
+            &mut decoder,
+            &mut state,
+            &mut pty,
+            &shell_session,
+            output.handle(),
+            &worker,
+            &config,
+            &ai_sender,
+        )?;
         maybe_probe_cursor(&mut state, &mut reply_router, output.handle())?;
         state.refresh_help_results(&worker)?;
         flush_scheduled_frame(&mut state, output.handle())?;

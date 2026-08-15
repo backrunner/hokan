@@ -3,7 +3,13 @@ use std::io::{self, Write};
 use super::{StagedFrame, SyncOwnership};
 
 const END_SYNCHRONIZED_UPDATE: &[u8] = b"\x1b[?2026l";
-const RESTORE_PRESENTATION: &[u8] = b"\x18\x1b[0m\x1b[?25h";
+const ENABLE_BRACKETED_PASTE: &[u8] = b"\x1b[?2004h";
+const DISABLE_BRACKETED_PASTE: &[u8] = b"\x1b[?2004l";
+// Keep the final `?2004l`, SGR reset, and cursor restore suffix stable for
+// terminals which inspect the cleanup tail.  The preceding modes cover the
+// input protocols used by modern TUIs (mouse/focus, xterm modifyOtherKeys,
+// kitty keyboard, and in-band resize modes).
+const RESTORE_PRESENTATION: &[u8] = b"\x18\x1b[?1l\x1b[?9l\x1b[?1000l\x1b[?1001l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1007l\x1b[?1015l\x1b[?1016l\x1b[?1034l\x1b[?1036l\x1b[?1039l\x1b[?2027l\x1b[?2028l\x1b[?2031l\x1b[?8452l\x1b[>4;0m\x1b[<u\x1b>\x1b[?2004l\x1b[0m\x1b[?25h";
 
 pub struct TerminalGuard<W: Write> {
     writer: Option<W>,
@@ -82,6 +88,14 @@ impl<W: Write> TerminalGuard<W> {
 
     pub fn write_control(&mut self, bytes: &[u8]) -> io::Result<()> {
         self.write_child(bytes)
+    }
+
+    pub fn set_bracketed_paste(&mut self, enabled: bool) -> io::Result<()> {
+        self.write_control(if enabled {
+            ENABLE_BRACKETED_PASTE
+        } else {
+            DISABLE_BRACKETED_PASTE
+        })
     }
 
     pub fn write_staged(&mut self, frame: &StagedFrame) -> io::Result<()> {
@@ -243,5 +257,18 @@ mod tests {
                 .any(|window| window == END_SYNCHRONIZED_UPDATE)
         );
         assert!(output.ends_with(RESTORE_PRESENTATION));
+    }
+
+    #[test]
+    fn restore_always_disables_bracketed_paste() {
+        let output = TerminalGuard::new(Vec::new())
+            .finish()
+            .expect("guard should restore");
+        assert!(output.ends_with(RESTORE_PRESENTATION));
+        assert!(
+            output
+                .windows(DISABLE_BRACKETED_PASTE.len())
+                .any(|window| window == DISABLE_BRACKETED_PASTE)
+        );
     }
 }

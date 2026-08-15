@@ -1,7 +1,5 @@
 use std::{io::Write, time::Instant};
 
-use ratatui::buffer::Buffer;
-
 use super::super::{
     AnchorConfidence, CellPos, CursorRestore, FrameTicket, RenderReadiness, SurfaceGeometry,
     SyncOutputCapability, SyncOwnership,
@@ -61,7 +59,7 @@ impl<W: Write> OutputActor<W> {
 
     pub(super) fn hide_overlay(&mut self) -> Result<(), OutputError> {
         self.latest_frame = None;
-        let Some(key) = self.compositor.current_key() else {
+        let Some(key) = self.compositor.footprint_key() else {
             return Ok(());
         };
         let Some(last_ticket) = self.last_committed_ticket else {
@@ -94,17 +92,19 @@ impl<W: Write> OutputActor<W> {
             screen_revision: self.model.screen_revision(),
             screen_epoch: self.model.screen_epoch(),
         };
-        let prepared = self.compositor.prepare(
-            key,
-            Buffer::empty(key.rect),
+        let Some(prepared) = self.compositor.prepare_hide(
             ticket,
             &self.model.cursor_restore(),
             self.capability,
             Some(&self.model),
-        )?;
+        )?
+        else {
+            return Ok(());
+        };
         self.guard.write_staged(prepared.staged())?;
         self.model.apply_hokan_frame(&prepared.staged().bytes);
         self.compositor.commit(prepared)?;
+        self.last_committed_ticket = Some(ticket);
         // Same deferred-drain kick as after a frame commit: the erase closes
         // the sync-output window that held the redisplay marker.
         self.observe_drain(self.last_read_cycle);

@@ -1,6 +1,6 @@
 # Hokan 兼容矩阵
 
-更新日期：2026-08-11。
+更新日期：2026-08-15。
 
 本页区分实现能力、自动化验证和真实环境认证。只有标记为“实测通过”的组合才代表当前
 机器完成了端到端验证；“待认证”不能被发布说明改写为已支持。
@@ -25,12 +25,13 @@ v1 面向 macOS 和 Linux 上支持 UTF-8 与常见 ANSI/VT 控制序列的 POSI
 | Prompt 主题 | oh-my-posh（.zprofile 初始化 + login shell） | 实测通过 | 本机真实 PTY 会话：主题与 tooltip 透传、命令执行与退出正常；overlay 锚定同动态 prompt fixture 覆盖 |
 | Multiplexer | tmux 3.6b | 实测通过 | runtime probe 判定不支持 mode 2026，走 diff fallback |
 | Multiplexer | tmux 3.7+ | 待认证 | 必须按 runtime probe 选择路径，不能按版本猜测 |
-| Transport | SSH | 待认证 | timeout/分片策略已实现，尚无真实远端记录 |
+| Transport | SSH（OpenSSH loopback） | 自动化通过 | 隔离 `sshd` + `ssh -tt` 真实 PTY；覆盖 CPR、Unicode、resize、Ctrl-C、`~.` 与 prompt 恢复；真实远端仍待认证 |
+| TUI | Codex/Grok/Kimi 风格输入协议与异常退出 | 自动化通过 | CPR/DA 查询、mouse/focus/kitty keyboard、增量 Unicode 多行 paste、alternate/synchronized-output 与模式泄漏恢复 |
 | Rendering | mode 2026 | 自动化通过 | 强制 capability 的外层 PTY 与双 emulator 测试 |
 | Rendering | unsupported fallback | 实测通过 | 外层 PTY 与真实 tmux 3.6b 测试 |
 | Input | Unicode/CJK/emoji | 自动化通过 | parser、surface 和真实 PTY 输入测试 |
 | Input | CSI/SS3 上下箭头 | 自动化通过 | history 列表入口、zsh 自定义 widget 隔离与真实 PTY 测试 |
-| Input | 1 MiB bracketed paste | 自动化通过 | 单事件上限及超限 raw streaming 测试 |
+| Input | bracketed paste | 自动化通过 | shell 编辑态覆盖 1 MiB 单事件与超限分片；前台 TUI 覆盖 start/payload/end 即时原样透传 |
 | Recovery | panic/TERM/HUP/TSTP/CONT | 自动化通过 | 子进程恢复、termios 与 signal integration 测试 |
 | Recovery | `hokan-leave` 返回未包装 shell | 自动化通过 | 正式安装块 + 真实 zsh PTY；验证 restore sequence 与 `HOKAN_ACTIVE` 清除 |
 

@@ -1,6 +1,8 @@
 use std::io::{self, Write};
 
-use super::super::{OverlaySurfaceRenderer, RenderReadiness, TerminalSize};
+use super::super::{
+    OverlaySurfaceRenderer, RenderReadiness, TerminalSize, modes::TerminalInputModes,
+};
 use super::actor::OutputActor;
 
 impl<W: Write> OutputActor<W> {
@@ -19,6 +21,9 @@ impl<W: Write> OutputActor<W> {
 
     pub(super) fn resume_terminal(&mut self, size: TerminalSize) -> io::Result<()> {
         self.guard.resume()?;
+        let child_modes = self.model.input_modes();
+        let restore_child_modes = TerminalInputModes::default().restore_bytes(child_modes);
+        self.guard.write_control(&restore_child_modes)?;
         self.size = size;
         let height = self
             .max_overlay_height

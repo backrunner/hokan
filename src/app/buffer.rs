@@ -153,6 +153,7 @@ impl EditableBuffer {
             | InputKind::Escape
             | InputKind::CtrlD
             | InputKind::CtrlR
+            | InputKind::PasteFragment { .. }
             | InputKind::Raw => {
                 self.sync = SyncQuality::Uncertain;
                 return Ok(MirrorOutcome::Uncertain);

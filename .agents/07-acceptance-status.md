@@ -1,12 +1,12 @@
 # Hokan v0.1 实现与验收状态
 
-更新日期：2026-08-11。
+更新日期：2026-08-15。
 
 ## 结论
 
 原始五类功能已从 provider、排序、列表交互接通到真实 shell buffer；PTY wrapper、唯一
-stdout writer、无闪烁 compositor、异常恢复和维护 CLI 也已实现。当前代码状态是首个
-公开 beta（`0.1.0-beta.1`），不是完成全矩阵认证的稳定版：Fish、SSH、tmux 3.7+、
+stdout writer、无闪烁 compositor、异常恢复和维护 CLI 也已实现。当前代码状态是公开
+beta（`0.1.0-beta.2`），不是完成全矩阵认证的稳定版：Fish、SSH、tmux 3.7+、
 Linux 实机和六个指定终端应用仍需按发布矩阵完成录制与人工检查。
 
 2026-08-02 的发布前复核又完成了以下加固：output actor 在 I/O/compositor 错误或 panic
@@ -20,6 +20,13 @@ IPC/edit/config/backup 的特殊文件和容量边界均有回归测试。shell 
 v2，以 `START`/`END` phase 配对保留含 Tab 的命令与 CWD；真实 zsh/bash PTY 已覆盖该路径。
 zsh setup 块固定在 `.zshrc` 顶部，外层在用户配置加载前进入 Hokan，用户 rc 只执行一次；
 `HOKAN_AUTO_START=0` 可临时旁路。
+
+2026-08-15 的终端兼容复核补齐了 bracketed-paste 与前台程序边界：macOS Bash 3.2
+只接收 payload，zsh、现代 Bash 和前台 TUI/SSH 保持原始协议字节；前台程序拥有 PTY 后，
+输入不再经过 Hokan 键位解码或等待 paste 结束标记。真实 PTY 分阶段验证 start、中文/
+emoji/组合字符/ZWJ 多行 payload 和 end 均能即时到达；同时覆盖 Kimi 风格 terminal 查询、
+mouse/focus/kitty keyboard 模式、alternate/synchronized-output 异常恢复，以及 OpenSSH
+loopback 的 CPR、Unicode、resize、Ctrl-C 和 `~.`。
 
 ## 功能闭环
 
@@ -44,10 +51,11 @@ zsh setup 块固定在 `.zshrc` 顶部，外层在用户配置加载前进入 Ho
 - zsh redisplay marker 明确为 redraw-start；marker-only drain 不解锁，必须等后续 screen byte、
   model convergence 与 `DrainedToEagain`。
 - 真实 PTY 覆盖 Ctrl-L、resize、CPR、SIGTSTP/SIGCONT、SIGTERM/SIGHUP、Unicode、前台
-  alternate-screen fixture、canonical/echo 恢复、动态 prompt、自定义 `ZDOTDIR` 和 tmux
-  3.6b fallback。
-- bracketed paste 恰好 1 MiB 保持单事件；超限后保持 raw streaming 到结束 marker，内部
-  Enter/Ctrl-C/箭头不会被拆成独立输入。
+  alternate-screen fixture、canonical/echo 恢复、动态 prompt、自定义 `ZDOTDIR`、tmux
+  3.6b fallback、Kimi 风格 TUI 和 OpenSSH loopback。
+- shell 编辑态下 bracketed paste 恰好 1 MiB 保持单事件，超限后保持 raw streaming 到
+  结束 marker；前台 TUI/SSH 则完全绕过输入解码，start、Unicode 多行 payload 和 end
+  按到达顺序即时透传，内部 Enter/Ctrl-C/箭头不会被 Hokan 拆成独立操作。
 
 ## 安全与数据边界
 
@@ -83,23 +91,24 @@ zsh setup 块固定在 `.zshrc` 顶部，外层在用户配置加载前进入 Ho
   修复取代，不能作为当前源码的 release artifact；正式发布必须由 release workflow 重建。
 - 当前源码通过 `cargo package --locked` 的隔离重编译。本机开发二进制安装在
   `~/.cargo/bin/hokan`，SHA-256 为
-  `6116bffdc3e252879b7a062248e89c017fa2b34e9d160ff72e07f79bb6771a98`，并由
-  `/opt/homebrew/bin/hokan` 链入。
-- 安装后二进制通过完整 `terminal_session` 8/8 和正式 setup 自动启动用例；实际 `.zshrc`
+  `f546b2f2fb96257ed804760b23efad61bf09c491b34b00e3a871ec5e91d9f924`，当前 `PATH`
+  解析到该路径。
+- 安装后二进制通过完整 `terminal_session` 49/49 和正式 setup 自动启动用例；实际 `.zshrc`
   语法有效，受管块二次 setup 保持幂等，`-c`/非 TTY 旁路与 `HOKAN_AUTO_START=0` 均验证。
 
-## 2026-08-02 自动化结果
+## 2026-08-15 自动化结果
 
 | 检查 | 结果 |
 | --- | --- |
 | `cargo fmt --all -- --check` | 通过 |
 | `cargo check --all-targets` | 通过 |
-| `cargo test` | 178 passed；2 个 multiprocess 内部 worker invocation 按设计 filtered |
+| `cargo test --locked` | 736 passed；2 个 multiprocess 内部 worker invocation 按设计 filtered |
 | `cargo clippy --all-targets --all-features -- -D warnings` | 通过，0 issue |
-| `cargo test --release` | 178 passed；真实 terminal suite 8/8 |
-| `cargo audit --deny warnings` | 通过，扫描 335 个依赖，无 advisory |
+| `cargo test --locked --release` | 736 passed；真实 terminal suite 49/49 |
+| current stable `cargo check --all-targets` + `cargo test --lib` | 通过；675 个 lib tests |
+| `cargo audit --deny warnings` | 通过，扫描 344 个依赖，无 advisory |
 | `cargo deny check advisories licenses sources` | 全部通过 |
-| `cargo package --locked` | 103 个文件；package 与隔离重编译通过 |
+| `cargo package --locked` | 169 个文件；package 与隔离重编译通过 |
 
 ## 尚未完成的外部认证
 

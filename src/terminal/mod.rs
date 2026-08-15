@@ -3,6 +3,7 @@ pub mod guard;
 pub mod icons;
 pub mod input;
 pub mod model;
+mod modes;
 pub mod output;
 pub mod render_boundary;
 pub mod reply;

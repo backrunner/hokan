@@ -126,6 +126,11 @@ impl OutputHandle {
             .push_control(ControlCommand::SetSyncCapability(capability))
     }
 
+    pub fn set_bracketed_paste(&self, enabled: bool) -> Result<(), OutputError> {
+        self.mailbox
+            .push_control(ControlCommand::SetBracketedPaste(enabled))
+    }
+
     pub fn probe(&self, bytes: &'static [u8]) -> Result<(), OutputError> {
         self.mailbox
             .push_control(ControlCommand::Probe(bytes.to_vec()))
@@ -231,6 +236,7 @@ enum ControlCommand {
     ArmRenderGate(RenderGateRequest),
     ConfirmCursor(super::CellPos),
     SetSyncCapability(SyncOutputCapability),
+    SetBracketedPaste(bool),
     Resize(TerminalSize),
     ConfigureOverlay {
         max_height: u16,

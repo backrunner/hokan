@@ -10,6 +10,7 @@ use std::{
     },
     path::{Path, PathBuf},
     thread::{self, JoinHandle},
+    time::Duration,
 };
 
 use crossbeam_channel::Sender;
@@ -43,10 +44,14 @@ pub struct ShellSession {
     leave_path: PathBuf,
     token: SessionToken,
     shell: ShellKind,
+    executable: PathBuf,
+    supports_bracketed_paste: bool,
 }
 
 impl ShellSession {
     pub fn new(shell: ShellKind) -> crate::Result<Self> {
+        let executable = configured_executable(shell);
+        let supports_bracketed_paste = shell_supports_bracketed_paste(shell, &executable);
         let directory = tempfile::Builder::new().prefix("hokan-").tempdir()?;
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))?;
         let fifo_path = directory.path().join("control.fifo");
@@ -66,6 +71,8 @@ impl ShellSession {
             init_path,
             token,
             shell,
+            executable,
+            supports_bracketed_paste,
         })
     }
 
@@ -77,6 +84,11 @@ impl ShellSession {
     #[must_use]
     pub fn shell(&self) -> ShellKind {
         self.shell
+    }
+
+    #[must_use]
+    pub const fn supports_bracketed_paste(&self) -> bool {
+        self.supports_bracketed_paste
     }
 
     pub fn command_builder(&self, login: bool) -> crate::Result<CommandBuilder> {
@@ -93,8 +105,7 @@ impl ShellSession {
         login: bool,
         source_user_config: bool,
     ) -> crate::Result<CommandBuilder> {
-        let executable = configured_executable(self.shell);
-        let mut command = CommandBuilder::new(executable);
+        let mut command = CommandBuilder::new(self.executable.clone());
         command.env_remove("HOKAN_INTEGRATION_DIR");
         command.env("HOKAN_ACTIVE", "1");
         command.env("HOKAN_HOOK_OWNER_PID", "");
@@ -420,6 +431,40 @@ fn configured_executable(shell: ShellKind) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(shell.name()))
 }
 
+fn shell_supports_bracketed_paste(shell: ShellKind, executable: &Path) -> bool {
+    if shell != ShellKind::Bash {
+        return true;
+    }
+
+    // macOS still ships Bash 3.2, whose Readline cannot consume bracketed
+    // paste delimiters. Bash 4.4+ enables the Readline 7 implementation; use
+    // the actual selected executable so Homebrew and Linux Bash stay native.
+    crate::platform::run_bounded(
+        executable,
+        ["--version"],
+        Duration::from_millis(500),
+        16 * 1024,
+    )
+    .ok()
+    .filter(|output| output.status.success())
+    .is_some_and(|output| bash_version_supports_bracketed_paste(&output.stdout))
+}
+
+fn bash_major_minor(output: &[u8]) -> Option<(u32, u32)> {
+    String::from_utf8_lossy(output)
+        .split(|character: char| !(character.is_ascii_digit() || character == '.'))
+        .find_map(|candidate| {
+            let mut parts = candidate.split('.');
+            let major = parts.next()?.parse().ok()?;
+            let minor = parts.next()?.parse().ok()?;
+            Some((major, minor))
+        })
+}
+
+fn bash_version_supports_bracketed_paste(output: &[u8]) -> bool {
+    bash_major_minor(output).is_some_and(|(major, minor)| major > 4 || (major == 4 && minor >= 4))
+}
+
 fn private_session_directory(session: &str) -> crate::Result<PathBuf> {
     let expected = env::var("HOKAN_SESSION_TOKEN")
         .map_err(|_| crate::Error::Shell("IPC is only available inside a Hokan session".into()))?;
@@ -573,6 +618,34 @@ mod tests {
             );
             assert_eq!(command.get_env("HOKAN_INTEGRATION_DIR"), None);
             assert!(command.get_argv().len() >= 2);
+        }
+    }
+
+    #[test]
+    fn bash_version_gates_native_bracketed_paste_support() {
+        assert_eq!(
+            bash_major_minor(b"GNU bash, version 3.2.57(1)-release"),
+            Some((3, 2))
+        );
+        assert_eq!(
+            bash_major_minor(b"GNU bash, version 5.3.0(1)-release"),
+            Some((5, 3))
+        );
+        assert!(bash_major_minor(b"not bash").is_none());
+
+        for (version, supported) in [
+            ("3.2.57", false),
+            ("4.3.30", false),
+            ("4.4.0", true),
+            ("5.0.0", true),
+        ] {
+            assert_eq!(
+                bash_version_supports_bracketed_paste(
+                    format!("GNU bash, version {version}(1)-release").as_bytes()
+                ),
+                supported,
+                "Bash {version}"
+            );
         }
     }
 

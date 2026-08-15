@@ -129,6 +129,137 @@ fn prepare_surface_scroll_keeps_the_actor_model_consistent() {
 }
 
 #[test]
+fn prompt_gate_repairs_kimi_input_modes_left_by_a_foreground_child() {
+    let size = TerminalSize::new(24, 80).expect("fixture terminal size is valid");
+    let mut actor = OutputActor::new(Vec::new(), token(), size, 3);
+    actor
+        .handle_control(ControlCommand::SetForeground(true))
+        .expect("foreground transition");
+    actor
+        .handle_child(ChildOutputBatch {
+            read_cycle: 1,
+            bytes: b"\x1b[?1003h\x1b[?1004h\x1b[?1006h\x1b[?2031h\x1b[>4;2m\x1b[>7u".to_vec(),
+            drain: DrainState::DrainedToEagain,
+        })
+        .expect("TUI output");
+    actor
+        .handle_control(ControlCommand::SetForeground(false))
+        .expect("foreground exit");
+    let marker = encode_marker(
+        &token(),
+        RenderBoundaryEvent::PromptRendered {
+            boundary_id: BoundaryId::new(1),
+        },
+    );
+    actor
+        .handle_child(ChildOutputBatch {
+            read_cycle: 2,
+            bytes: marker,
+            drain: DrainState::DrainedToEagain,
+        })
+        .expect("prompt marker");
+    actor
+        .arm_prompt_gate(BoundaryId::new(1))
+        .expect("prompt recovery");
+    let output = actor.guard.finish().expect("guard should finish");
+    for reset in [
+        b"\x1b[?1003l".as_slice(),
+        b"\x1b[?1004l".as_slice(),
+        b"\x1b[?1006l".as_slice(),
+        b"\x1b[?2031l".as_slice(),
+        b"\x1b[>4;0m".as_slice(),
+        b"\x1b[<u".as_slice(),
+    ] {
+        assert!(
+            output.windows(reset.len()).any(|window| window == reset),
+            "missing prompt recovery sequence {reset:?}"
+        );
+    }
+}
+
+#[test]
+fn prompt_gate_recovers_when_desynchronization_precedes_the_marker() {
+    let size = TerminalSize::new(24, 80).expect("fixture terminal size is valid");
+    let mut actor = OutputActor::new(Vec::new(), token(), size, 3);
+    actor
+        .handle_control(ControlCommand::SetForeground(true))
+        .expect("foreground transition");
+    let marker = encode_marker(
+        &token(),
+        RenderBoundaryEvent::PromptRendered {
+            boundary_id: BoundaryId::new(1),
+        },
+    );
+    let mut bytes = b"\x1b[?1003h\x1b[?1004h\x1b[>7u".to_vec();
+    bytes.push(0xf5);
+    bytes.extend_from_slice(&marker);
+    actor
+        .handle_child(ChildOutputBatch {
+            read_cycle: 1,
+            bytes,
+            drain: DrainState::DrainedToEagain,
+        })
+        .expect("desynchronized prompt output");
+    actor
+        .handle_control(ControlCommand::SetForeground(false))
+        .expect("foreground exit");
+    actor
+        .arm_prompt_gate(BoundaryId::new(1))
+        .expect("prompt recovery");
+    assert!(actor.pending_prompt_recovery.is_none());
+
+    let output = actor.guard.finish().expect("guard should finish");
+    assert!(output.windows(marker.len()).any(|window| window == marker));
+    for reset in [
+        b"\x1b[?1003l".as_slice(),
+        b"\x1b[?1004l".as_slice(),
+        b"\x1b[<u".as_slice(),
+    ] {
+        assert!(
+            output.windows(reset.len()).any(|window| window == reset),
+            "missing prompt recovery sequence {reset:?}"
+        );
+    }
+}
+
+#[test]
+fn prompt_mode_recovery_waits_for_prompt_marker_when_control_wins_race() {
+    let size = TerminalSize::new(24, 80).expect("fixture terminal size is valid");
+    let mut actor = OutputActor::new(Vec::new(), token(), size, 3);
+    actor
+        .handle_control(ControlCommand::SetForeground(true))
+        .expect("foreground transition");
+    actor
+        .handle_control(ControlCommand::SetForeground(false))
+        .expect("foreground exit");
+    actor
+        .arm_prompt_gate(BoundaryId::new(1))
+        .expect("prompt gate");
+    let marker = encode_marker(
+        &token(),
+        RenderBoundaryEvent::PromptRendered {
+            boundary_id: BoundaryId::new(1),
+        },
+    );
+    let mut bytes = b"\x1b[?1003h\x1b[?1004h\x1b[?2031h\x1b[>7uPROMPT ".to_vec();
+    bytes.extend_from_slice(&marker);
+    actor
+        .handle_child(ChildOutputBatch {
+            read_cycle: 1,
+            bytes,
+            drain: DrainState::DrainedToEagain,
+        })
+        .expect("prompt output");
+    let output = actor.guard.finish().expect("guard should finish");
+    assert!(
+        output
+            .windows(b"\x1b[?1003l".len())
+            .any(|w| w == b"\x1b[?1003l")
+    );
+    assert!(output.windows(b"\x1b[<u".len()).any(|w| w == b"\x1b[<u"));
+}
+
+#[test]
 fn prepare_surface_scroll_is_wrapped_in_a_transaction_when_2026_is_available() {
     let size = TerminalSize::new(24, 80).expect("fixture terminal size is valid");
     let mut actor = OutputActor::new(Vec::new(), token(), size, 3);
@@ -162,7 +293,7 @@ fn prepare_surface_scroll_is_wrapped_in_a_transaction_when_2026_is_available() {
             .count(),
         1
     );
-    assert!(writer[end_at + end_sync.len()..].starts_with(b"\x18\x1b[0m\x1b[?25h"));
+    assert!(writer[end_at + end_sync.len()..].ends_with(b"\x1b[?2004l\x1b[0m\x1b[?25h"));
 }
 
 #[test]
@@ -212,6 +343,69 @@ fn hide_overlay_guard_rejection_writes_a_debug_log_event() {
         .expect("rejection event should be recorded");
     assert!(line.contains("confidence-unknown"), "event line: {line}");
     assert!(actor.compositor.current_key().is_none());
+}
+
+#[test]
+fn hide_after_partial_shell_overwrite_clears_only_hokan_footprint() {
+    let size = TerminalSize::new(24, 80).expect("fixture terminal size is valid");
+    let mut actor = OutputActor::new(Vec::new(), token(), size, 3);
+    actor.model.invalidate().expect("fixture epoch");
+    actor.model.establish_anchor();
+
+    let frame = frame_request();
+    let buffer = actor.renderer.render(frame.geometry, &frame.view);
+    let prepared = actor
+        .compositor
+        .prepare(
+            frame.key,
+            buffer,
+            frame.ticket,
+            &actor.model.cursor_restore(),
+            SyncOutputCapability::UnsupportedFallback,
+            Some(&actor.model),
+        )
+        .expect("frame should compose");
+    let frame_bytes = prepared.staged().bytes.clone();
+    actor
+        .guard
+        .write_staged(prepared.staged())
+        .expect("frame should be written");
+    actor.model.apply_hokan_frame(&frame_bytes);
+    actor
+        .compositor
+        .commit(prepared)
+        .expect("frame should commit");
+    actor.last_committed_ticket = Some(frame.ticket);
+
+    // PTY output is drained before a queued Hide. It overwrites only two
+    // cells in the box, invalidating the diff base while leaving the rest of
+    // the committed footprint visible.
+    actor
+        .handle_child(ChildOutputBatch {
+            read_cycle: 1,
+            bytes: b"\x1b[6;1Hfg".to_vec(),
+            drain: DrainState::DrainedToEagain,
+        })
+        .expect("shell redisplay should be written");
+    assert!(actor.compositor.current_key().is_none());
+    assert_eq!(actor.compositor.footprint_key(), Some(frame.key));
+
+    actor.hide_overlay().expect("overlay should hide");
+    let output = actor.guard.finish().expect("guard should finish");
+    let mut parser = vt100::Parser::new(24, 80, 0);
+    parser.process(&output);
+
+    // Shell-owned text survives, while untouched top and bottom borders from
+    // the old overlay are erased instead of becoming permanent screen smear.
+    assert_eq!(parser.screen().cell(5, 0).expect("cell").contents(), "f");
+    assert_eq!(parser.screen().cell(5, 1).expect("cell").contents(), "g");
+    for row in [4, 6] {
+        let contents = parser.screen().cell(row, 0).expect("cell").contents();
+        assert!(
+            contents.is_empty() || contents == " ",
+            "stale border at ({row}, 0): {contents:?}"
+        );
+    }
 }
 
 fn frame_request() -> FrameRequest {
@@ -272,6 +466,77 @@ fn actor_failure_closes_mailbox_and_releases_waiters() {
         }),
         Err(OutputError::Closed)
     ));
+}
+
+#[test]
+fn suspend_restores_and_resume_reapplies_child_input_modes() {
+    const ENABLE: &[u8] = b"\x1b[?2004h";
+    const DISABLE: &[u8] = b"\x1b[?2004l";
+    const ENABLE_ALT_SCROLL: &[u8] = b"\x1b[?1007h";
+    const DISABLE_ALT_SCROLL: &[u8] = b"\x1b[?1007l";
+    const ENABLE_META_ESCAPE: &[u8] = b"\x1b[?1036h";
+    const DISABLE_META_ESCAPE: &[u8] = b"\x1b[?1036l";
+
+    let size = TerminalSize::new(24, 80).expect("fixture terminal size is valid");
+    let (handle, join) =
+        spawn_with_writer(Vec::new(), token(), size, 3).expect("output actor should spawn");
+    handle
+        .child_output(ChildOutputBatch {
+            read_cycle: 1,
+            bytes: [ENABLE, ENABLE_ALT_SCROLL, ENABLE_META_ESCAPE].concat(),
+            drain: DrainState::DrainedToEagain,
+        })
+        .expect("child mode should queue");
+    handle.barrier().expect("child mode should be observed");
+    handle
+        .restore_for_suspend()
+        .expect("suspend should restore the outer terminal");
+    handle
+        .resume_after_continue(size)
+        .expect("resume should restore the child terminal");
+    handle
+        .restore_and_exit()
+        .expect("final restore should queue");
+    let output = join
+        .join()
+        .expect("actor should not panic")
+        .expect("actor should exit cleanly")
+        .writer;
+
+    let transitions: Vec<_> = output
+        .windows(ENABLE.len())
+        .filter_map(|window| {
+            if window == ENABLE {
+                Some(true)
+            } else if window == DISABLE {
+                Some(false)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(transitions, [true, false, true, false]);
+    for (enable, disable) in [
+        (ENABLE_ALT_SCROLL, DISABLE_ALT_SCROLL),
+        (ENABLE_META_ESCAPE, DISABLE_META_ESCAPE),
+    ] {
+        assert_eq!(
+            output
+                .windows(enable.len())
+                .filter(|window| *window == enable)
+                .count(),
+            2,
+            "child and resume should both enable {enable:?}"
+        );
+        assert_eq!(
+            output
+                .windows(disable.len())
+                .filter(|window| *window == disable)
+                .count(),
+            2,
+            "suspend and exit should both disable {disable:?}"
+        );
+    }
 }
 
 #[test]

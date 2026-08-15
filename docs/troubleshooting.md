@@ -48,11 +48,14 @@ Hokan 会在正常退出、panic 和可处理信号路径恢复 canonical mode�
 
 ```bash
 stty sane
+printf '\033[?2004l'
 printf '\033[0m\033[?25h'
 reset
 ```
 
-`reset` 会重置更多终端状态，通常只在前两条仍无法恢复时需要。
+`stty sane` 只恢复 TTY 的 canonical/echo 等属性；若粘贴内容前后出现
+`ESC[200~`/`ESC[201~`，需要额外关闭 terminal emulator 的 bracketed-paste 模式。
+`reset` 会重置更多终端状态，通常只在前几条仍无法恢复时需要。
 
 ## 列表不显示
 

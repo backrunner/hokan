@@ -1,4 +1,7 @@
-use super::{AnchorConfidence, CellPos, ScreenEpoch, ScreenRevision, SyncOwnership, TerminalSize};
+use super::{
+    AnchorConfidence, CellPos, ScreenEpoch, ScreenRevision, SyncOwnership, TerminalSize,
+    modes::TerminalInputModes,
+};
 use ratatui::layout::Rect;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -28,6 +31,18 @@ pub struct ScreenRegionSnapshot {
 struct EffectObserver {
     unknown_screen_effect: bool,
     sync_mode_change: Option<bool>,
+    mode_changes: Vec<InputModeChange>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum InputModeChange {
+    Dec { mode: u16, enabled: bool },
+    KittyPush(u32),
+    KittyPop(u16),
+    KittySet(u32),
+    ModifyOtherKeys(u16),
+    Keypad(bool),
+    Reset,
 }
 
 // OSC sequences are intentionally tolerated: without an osc_dispatch override
@@ -63,6 +78,13 @@ impl vte::Perform for EffectObserver {
                 '@' | 'A' | 'B' | 'C' | 'D' | 'E' | 'F' | 'G' | 'H' | 'J' | 'K' | 'L' | 'M' | 'P'
                 | 'S' | 'T' | 'X' | 'd' | 'f' | 'm' | 'r',
             ) => {}
+            // Device/status queries have no screen side effect.  TUI clients
+            // (Kimi in particular) use DA, CPR-like private queries, and
+            // keyboard-protocol queries during startup.
+            ([], 'c' | 'n' | 'u')
+            | ([b'?'], 'n' | 'u' | 'p')
+            | ([b'?', b'$'], 'p')
+            | ([b'>'], 'c') => {}
             ([], 't') => self.unknown_screen_effect = true,
             ([], 'h' | 'l') => {
                 for param in params {
@@ -78,13 +100,80 @@ impl vte::Perform for EffectObserver {
                 for param in params {
                     match param {
                         [2026] => self.sync_mode_change = Some(action == 'h'),
+                        [2004] => self.mode_changes.push(InputModeChange::Dec {
+                            mode: 2004,
+                            enabled: action == 'h',
+                        }),
+                        [1 | 6 | 7 | 9 | 25 | 47 | 1047 | 1049] => {
+                            if let [mode @ (1 | 9)] = *param {
+                                self.mode_changes.push(InputModeChange::Dec {
+                                    mode,
+                                    enabled: action == 'h',
+                                });
+                            }
+                        }
                         [
-                            1 | 6 | 7 | 9 | 25 | 47 | 1000 | 1002 | 1003 | 1005 | 1006 | 1049
-                            | 2004,
-                        ] => {}
+                            1000 | 1001 | 1002 | 1003 | 1004 | 1005 | 1006 | 1007 | 1015 | 1016
+                            | 1034 | 1036 | 1039 | 2027 | 2028 | 2031 | 8452,
+                        ] => {
+                            if let [mode] = *param {
+                                self.mode_changes.push(InputModeChange::Dec {
+                                    mode,
+                                    enabled: action == 'h',
+                                });
+                            }
+                        }
                         _ => self.unknown_screen_effect = true,
                     }
                 }
+            }
+            ([b'>'], 'm') => {
+                // xterm modifyOtherKeys: CSI > 4;{level} m.  Accept the
+                // complete family so a reset/query from a TUI does not make
+                // the prompt epoch permanently unknown.
+                let mut values = params.into_iter().flat_map(|param| match param {
+                    [value] => Some(*value),
+                    _ => None,
+                });
+                if values.next() == Some(4) {
+                    self.mode_changes
+                        .push(InputModeChange::ModifyOtherKeys(values.next().unwrap_or(0)));
+                } else {
+                    self.unknown_screen_effect = true;
+                }
+            }
+            ([b'>'], 'u') => {
+                let flags = params
+                    .into_iter()
+                    .next()
+                    .and_then(|param| match param {
+                        [value] => Some(*value as u32),
+                        _ => None,
+                    })
+                    .unwrap_or(0);
+                self.mode_changes.push(InputModeChange::KittyPush(flags));
+            }
+            ([b'<'], 'u') => {
+                let count = params
+                    .into_iter()
+                    .next()
+                    .and_then(|param| match param {
+                        [value] => Some(*value),
+                        _ => None,
+                    })
+                    .unwrap_or(1);
+                self.mode_changes.push(InputModeChange::KittyPop(count));
+            }
+            ([b'='], 'u') => {
+                let flags = params
+                    .into_iter()
+                    .next()
+                    .and_then(|param| match param {
+                        [value] => Some(*value as u32),
+                        _ => None,
+                    })
+                    .unwrap_or(0);
+                self.mode_changes.push(InputModeChange::KittySet(flags));
             }
             _ => self.unknown_screen_effect = true,
         }
@@ -96,7 +185,10 @@ impl vte::Perform for EffectObserver {
             return;
         }
         match intermediates {
-            [] if matches!(byte, b'7' | b'8' | b'=' | b'>' | b'M' | b'c' | b'g') => {}
+            [] if byte == b'c' => self.mode_changes.push(InputModeChange::Reset),
+            [] if byte == b'=' => self.mode_changes.push(InputModeChange::Keypad(true)),
+            [] if byte == b'>' => self.mode_changes.push(InputModeChange::Keypad(false)),
+            [] if matches!(byte, b'7' | b'8' | b'M' | b'g') => {}
             // G0–G3 charset designation (e.g. ESC ( B): vt100 models charsets,
             // and the final byte is constrained to the valid range by the parser.
             [b'(' | b')' | b'*' | b'+'] => {}
@@ -113,6 +205,9 @@ pub struct TerminalModel {
     screen_epoch: ScreenEpoch,
     confidence: AnchorConfidence,
     sync_ownership: SyncOwnership,
+    input_modes: TerminalInputModes,
+    foreground: bool,
+    foreground_baseline: Option<TerminalInputModes>,
 }
 
 impl TerminalModel {
@@ -126,6 +221,9 @@ impl TerminalModel {
             screen_epoch: ScreenEpoch::ZERO,
             confidence: AnchorConfidence::Unknown,
             sync_ownership: SyncOwnership::None,
+            input_modes: TerminalInputModes::default(),
+            foreground: false,
+            foreground_baseline: None,
         }
     }
 
@@ -150,6 +248,26 @@ impl TerminalModel {
             } else {
                 SyncOwnership::None
             };
+        }
+        for change in self.observer.mode_changes.drain(..) {
+            match change {
+                InputModeChange::Dec { mode, enabled } => {
+                    self.input_modes.apply_dec_mode(mode, enabled);
+                }
+                InputModeChange::KittyPush(flags) => self.input_modes.push_kitty(flags),
+                InputModeChange::KittyPop(count) => self.input_modes.pop_kitty(count),
+                InputModeChange::KittySet(flags) => self.input_modes.set_kitty(flags),
+                InputModeChange::ModifyOtherKeys(level) => {
+                    self.input_modes.apply_modify_other_keys(level);
+                }
+                InputModeChange::Keypad(enabled) => {
+                    self.input_modes.application_keypad = enabled;
+                }
+                InputModeChange::Reset => {
+                    self.input_modes = TerminalInputModes::default();
+                    self.sync_ownership = SyncOwnership::None;
+                }
+            }
         }
 
         let epoch_changed = unknown || was_alternate != is_alternate;
@@ -184,6 +302,32 @@ impl TerminalModel {
 
     pub fn apply_hokan_frame(&mut self, bytes: &[u8]) {
         self.parser.process(bytes);
+    }
+
+    /// Record the shell's terminal input state immediately before a command
+    /// or foreground application receives the PTY.
+    pub fn begin_foreground(&mut self) {
+        if !self.foreground {
+            self.foreground_baseline = Some(self.input_modes);
+        }
+        self.foreground = true;
+    }
+
+    pub fn end_foreground(&mut self) {
+        self.foreground = false;
+    }
+
+    /// Restore input modes changed by the foreground child and return the
+    /// exact control bytes that must be sent to the outer terminal.
+    pub fn recover_foreground_modes(&mut self) -> Vec<u8> {
+        let target = self
+            .foreground_baseline
+            .take()
+            .unwrap_or_else(|| self.input_modes.fallback_prompt_baseline());
+        let bytes = self.input_modes.restore_bytes(target);
+        self.input_modes = target;
+        self.foreground = false;
+        bytes
     }
 
     #[must_use]
@@ -263,6 +407,16 @@ impl TerminalModel {
     }
 
     #[must_use]
+    pub const fn bracketed_paste(&self) -> bool {
+        self.input_modes.bracketed_paste
+    }
+
+    #[must_use]
+    pub(crate) const fn input_modes(&self) -> TerminalInputModes {
+        self.input_modes
+    }
+
+    #[must_use]
     pub fn alternate_screen(&self) -> bool {
         self.parser.screen().alternate_screen()
     }
@@ -336,6 +490,87 @@ mod tests {
             .process(b"\x1b[?2026l")
             .expect("sync reset should parse");
         assert_eq!(model.sync_ownership(), SyncOwnership::None);
+    }
+
+    #[test]
+    fn tracks_bracketed_paste_and_terminal_resets() {
+        let mut model = model();
+        model
+            .process(b"\x1b[?2004h")
+            .expect("bracketed paste enable should parse");
+        assert!(model.bracketed_paste());
+        model
+            .process(b"\x1b[?2004l")
+            .expect("bracketed paste disable should parse");
+        assert!(!model.bracketed_paste());
+
+        model
+            .process(b"\x1b[?2004h\x1bc")
+            .expect("full reset should parse");
+        assert!(!model.bracketed_paste());
+    }
+
+    #[test]
+    fn recognizes_kimi_input_modes_and_queries_without_invalidating_screen() {
+        let mut model = model();
+        model
+            .confirm_cursor(CellPos::new(0, 0))
+            .expect("CPR should apply");
+        let epoch = model.screen_epoch();
+        let update = model
+            .process(b"\x1b[?1003h\x1b[?1004h\x1b[?1006h\x1b[?2031h\x1b[>7u\x1b[?u\x1b[?996n\x1b[c")
+            .expect("TUI mode bytes should parse");
+        assert!(!update.epoch_changed);
+        assert_eq!(model.screen_epoch(), epoch);
+
+        let mut child = model;
+        child.begin_foreground();
+        child
+            .process(b"\x1b[?1003l\x1b[?1004l\x1b[?1006l\x1b[?2031l\x1b[<u")
+            .expect("TUI cleanup bytes should parse");
+        child.end_foreground();
+        let recovery = child.recover_foreground_modes();
+        assert!(
+            recovery
+                .windows(b"\x1b[?1003h".len())
+                .any(|w| w == b"\x1b[?1003h")
+        );
+        assert!(
+            recovery
+                .windows(b"\x1b[?1004h".len())
+                .any(|w| w == b"\x1b[?1004h")
+        );
+    }
+
+    #[test]
+    fn foreground_recovery_restores_shell_paste_and_clears_tui_modes() {
+        let mut model = model();
+        model
+            .process(b"\x1b[?2004h")
+            .expect("shell bracketed paste should parse");
+        model.begin_foreground();
+        model
+            .process(b"\x1b[?2004l\x1b[?1004h\x1b[?2031h\x1b[>7u")
+            .expect("TUI modes should parse");
+        model.end_foreground();
+        let recovery = model.recover_foreground_modes();
+        assert!(
+            recovery
+                .windows(b"\x1b[?2004h".len())
+                .any(|w| w == b"\x1b[?2004h")
+        );
+        assert!(
+            recovery
+                .windows(b"\x1b[?1004l".len())
+                .any(|w| w == b"\x1b[?1004l")
+        );
+        assert!(
+            recovery
+                .windows(b"\x1b[?2031l".len())
+                .any(|w| w == b"\x1b[?2031l")
+        );
+        assert!(recovery.windows(b"\x1b[<u".len()).any(|w| w == b"\x1b[<u"));
+        assert!(model.bracketed_paste());
     }
 
     #[test]

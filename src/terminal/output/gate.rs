@@ -21,30 +21,21 @@ pub(super) struct RedisplayConvergence {
 
 impl<W: Write> OutputActor<W> {
     pub(super) fn arm_prompt_gate(&mut self, boundary_id: BoundaryId) -> Result<(), OutputError> {
-        if self.model.alternate_screen() {
-            // A TUI that exited without restoring the alternate screen (a
-            // crash, or restoring only the main modes) leaves the shell's
-            // prompt inside it: force-close it so the model and the overlay
-            // agree with what the user actually sees. No prompt event fires
-            // while a full-screen app legitimately owns the screen, so this
-            // can only trigger after the child is gone.
-            self.guard.write_control(b"\x1b[?1049l")?;
-            self.model.apply_hokan_frame(b"\x1b[?1049l");
-        }
-        if self.model.sync_ownership() == super::super::SyncOwnership::External {
-            // Same leak class for synchronized output: the child's open
-            // ?2026 transaction can never belong to the shell at a prompt,
-            // so close it ourselves and reclaim ownership.
-            self.guard.write_control(b"\x1b[?2026l")?;
-            self.model.reset_sync_ownership();
-        }
         let observed_position = self.recent_boundaries.iter().rposition(|observed| {
             matches!(
-                observed.event,
-                RenderBoundaryEvent::PromptRendered { boundary_id: observed_id }
-                    if observed_id == boundary_id
+            observed.event,
+            RenderBoundaryEvent::PromptRendered { boundary_id: observed_id }
+                if observed_id == boundary_id
             )
         });
+        if observed_position.is_some() {
+            self.recover_prompt_terminal_state()?;
+        } else {
+            // The control FIFO can beat the PTY reader to the prompt marker.
+            // Recovery is then performed by `handle_child` immediately after
+            // the marker's preceding bytes have been written.
+            self.pending_prompt_recovery = Some(boundary_id);
+        }
         self.model.invalidate()?;
         let new_epoch = self.model.screen_epoch();
         if let Some(position) = observed_position {
@@ -74,6 +65,33 @@ impl<W: Write> OutputActor<W> {
         // is exactly the one where no marker can be observed anymore.
         self.scanner.reset_at_trusted_boundary();
         self.decoder.reset_at_trusted_boundary();
+        Ok(())
+    }
+
+    /// Repair terminal state left by a foreground child.  This is deliberately
+    /// called at a byte-order boundary, never merely when the shell control
+    /// message arrives, so a late PTY batch cannot re-enable the leaked modes.
+    pub(super) fn recover_prompt_terminal_state(&mut self) -> Result<(), OutputError> {
+        let mode_recovery = self.model.recover_foreground_modes();
+        if !mode_recovery.is_empty() {
+            self.guard.write_control(&mode_recovery)?;
+        }
+        if self.model.alternate_screen() {
+            // A TUI that exited without restoring the alternate screen (a
+            // crash, or restoring only the main modes) leaves the shell's
+            // prompt inside it: force-close it so the model and the overlay
+            // agree with what the user actually sees.
+            self.guard.write_control(b"\x1b[?1049l")?;
+            self.model.apply_hokan_frame(b"\x1b[?1049l");
+        }
+        if self.model.sync_ownership() == super::super::SyncOwnership::External {
+            // Same leak class for synchronized output: the child's open
+            // ?2026 transaction can never belong to the shell at a prompt,
+            // so close it ourselves and reclaim ownership.
+            self.guard.write_control(b"\x1b[?2026l")?;
+            self.model.reset_sync_ownership();
+        }
+        self.pending_prompt_recovery = None;
         Ok(())
     }
 

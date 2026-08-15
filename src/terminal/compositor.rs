@@ -153,6 +153,53 @@ impl OverlayCompositor {
                 model,
             ));
         }
+        self.stage_changes(key, current, ticket, cursor, capability, changes)
+    }
+
+    /// Prepare a conservative erase of the last committed footprint.
+    ///
+    /// A shell redisplay can overwrite only part of an overlay between the
+    /// commit and a queued `Hide` command.  In that case `previous` is dropped
+    /// so a normal frame cannot diff against shell-owned cells, but the
+    /// untouched part of the footprint is still ours to erase.  Compare each
+    /// cell with the model and blank only cells that still contain the glyph we
+    /// painted; shell text that replaced a cell is left alone.
+    pub fn prepare_hide(
+        &self,
+        ticket: FrameTicket,
+        cursor: &CursorRestore,
+        capability: SyncOutputCapability,
+        model: Option<&TerminalModel>,
+    ) -> Result<Option<PreparedFrame>, CompositorError> {
+        let Some((key, footprint)) = self.footprint.as_ref() else {
+            return Ok(None);
+        };
+        if !valid_restore_bytes(&cursor.sgr) {
+            return Err(CompositorError::UnsafeRestoreState);
+        }
+        if capability == SyncOutputCapability::BusyExternal {
+            return Err(CompositorError::ExternalSynchronizedOutput);
+        }
+        let changes = footprint_blanks(key.rect, footprint, model);
+        let target = Buffer::empty(key.rect);
+        self.stage_changes(*key, target, ticket, cursor, capability, changes)
+            .map(Some)
+    }
+
+    #[must_use]
+    pub fn footprint_key(&self) -> Option<SurfaceKey> {
+        self.footprint.as_ref().map(|(key, _)| *key)
+    }
+
+    fn stage_changes(
+        &self,
+        key: SurfaceKey,
+        target: Buffer,
+        ticket: FrameTicket,
+        cursor: &CursorRestore,
+        capability: SyncOutputCapability,
+        changes: Vec<(u16, u16, Cell)>,
+    ) -> Result<PreparedFrame, CompositorError> {
         let changed_cells = changes.len();
         let mut changed_rows: Vec<u16> = changes.iter().map(|(_, y, _)| *y).collect();
         changed_rows.sort_unstable();
@@ -167,7 +214,7 @@ impl OverlayCompositor {
                     changed_cells: 0,
                     changed_rows,
                 },
-                target: current,
+                target,
                 base_generation: self.generation,
             });
         }
@@ -213,7 +260,7 @@ impl OverlayCompositor {
                 changed_cells,
                 changed_rows,
             },
-            target: current,
+            target,
             base_generation: self.generation,
         })
     }
@@ -294,6 +341,40 @@ fn vacated_blanks(
                 continue;
             }
             let cell = &old_buffer[(x, y)];
+            if *cell == Cell::default() {
+                continue;
+            }
+            if let Some(model) = model {
+                let on_screen = model.cell_contents(y, x).unwrap_or_default();
+                let on_screen = if on_screen.is_empty() {
+                    " "
+                } else {
+                    on_screen.as_str()
+                };
+                let symbol = if cell.symbol().is_empty() {
+                    " "
+                } else {
+                    cell.symbol()
+                };
+                if on_screen != symbol {
+                    continue;
+                }
+            }
+            blanks.push((x, y, Cell::default()));
+        }
+    }
+    blanks
+}
+
+fn footprint_blanks(
+    rect: Rect,
+    footprint: &Buffer,
+    model: Option<&TerminalModel>,
+) -> Vec<(u16, u16, Cell)> {
+    let mut blanks = Vec::new();
+    for y in rect.y..rect.bottom() {
+        for x in rect.x..rect.right() {
+            let cell = &footprint[(x, y)];
             if *cell == Cell::default() {
                 continue;
             }

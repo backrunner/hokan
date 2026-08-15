@@ -1,11 +1,17 @@
-const PASTE_START: &[u8] = b"\x1b[200~";
-const PASTE_END: &[u8] = b"\x1b[201~";
-const MAX_PASTE_BYTES: usize = 1024 * 1024;
+pub(crate) const PASTE_START: &[u8] = b"\x1b[200~";
+pub(crate) const PASTE_END: &[u8] = b"\x1b[201~";
+pub(crate) const MAX_PASTE_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum InputKind {
     Text(String),
     Paste(Vec<u8>),
+    /// Raw bytes from an oversized paste; the flags identify protocol
+    /// delimiters at this fragment's edges without inspecting its payload.
+    PasteFragment {
+        strip_start: bool,
+        strip_end: bool,
+    },
     Backspace,
     Delete,
     Left,
@@ -43,6 +49,7 @@ pub struct InputDecoder {
     pending: Vec<u8>,
     paste_mode: bool,
     paste_overflow: bool,
+    paste_start_pending: bool,
     paste_raw: Vec<u8>,
 }
 
@@ -61,8 +68,13 @@ impl InputDecoder {
                     if self.paste_overflow
                         || raw.len() > MAX_PASTE_BYTES + PASTE_START.len() + PASTE_END.len()
                     {
+                        let strip_start = self.paste_start_pending;
+                        self.paste_start_pending = false;
                         events.push(InputEvent {
-                            kind: InputKind::Raw,
+                            kind: InputKind::PasteFragment {
+                                strip_start,
+                                strip_end: true,
+                            },
                             raw,
                         });
                     } else {
@@ -74,6 +86,7 @@ impl InputDecoder {
                         });
                     }
                     self.paste_overflow = false;
+                    self.paste_start_pending = false;
                     continue;
                 }
 
@@ -83,8 +96,13 @@ impl InputDecoder {
                 if self.paste_overflow && self.paste_raw.len() >= PASTE_END.len() {
                     let emit = self.paste_raw.len() - (PASTE_END.len() - 1);
                     let raw: Vec<_> = self.paste_raw.drain(..emit).collect();
+                    let strip_start = self.paste_start_pending;
+                    self.paste_start_pending = false;
                     events.push(InputEvent {
-                        kind: InputKind::Raw,
+                        kind: InputKind::PasteFragment {
+                            strip_start,
+                            strip_end: false,
+                        },
                         raw,
                     });
                 }
@@ -97,6 +115,7 @@ impl InputDecoder {
                     if raw == PASTE_START {
                         self.paste_mode = true;
                         self.paste_overflow = false;
+                        self.paste_start_pending = true;
                         self.paste_raw = raw;
                     } else {
                         events.push(InputEvent { kind, raw });
@@ -119,6 +138,19 @@ impl InputDecoder {
             InputKind::Raw
         };
         Some(InputEvent { kind, raw })
+    }
+
+    /// Return bytes held while waiting for an ambiguous key sequence or a
+    /// bracketed-paste terminator. Foreground applications own terminal input
+    /// framing, so a hand-off must preserve these bytes without interpreting
+    /// or delaying them further.
+    pub fn take_buffered_raw(&mut self) -> Vec<u8> {
+        let mut raw = std::mem::take(&mut self.paste_raw);
+        raw.append(&mut self.pending);
+        self.paste_mode = false;
+        self.paste_overflow = false;
+        self.paste_start_pending = false;
+        raw
     }
 
     #[must_use]
@@ -253,7 +285,9 @@ mod tests {
             b"\x1b[A".as_slice(),
             b"\x1bOA".as_slice(),
             "中".as_bytes(),
+            "粘贴中文🙂e\u{301}👩‍💻".as_bytes(),
             b"\x1b[200~hello\x1b[201~".as_slice(),
+            "\x1b[200~粘贴中文🙂e\u{301}👩‍💻\x1b[201~".as_bytes(),
         ] {
             let expected = InputDecoder::default().feed(fixture);
             for split in 0..=fixture.len() {
@@ -281,6 +315,32 @@ mod tests {
     }
 
     #[test]
+    fn decodes_common_navigation_and_editing_keys() {
+        for (raw, expected) in [
+            (b"\x1b[C".as_slice(), InputKind::Right),
+            (b"\x1b[D".as_slice(), InputKind::Left),
+            (b"\x1bOC".as_slice(), InputKind::Right),
+            (b"\x1bOD".as_slice(), InputKind::Left),
+            (b"\x1b[H".as_slice(), InputKind::Home),
+            (b"\x1b[1~".as_slice(), InputKind::Home),
+            (b"\x1b[7~".as_slice(), InputKind::Home),
+            (b"\x1bOH".as_slice(), InputKind::Home),
+            (b"\x1b[F".as_slice(), InputKind::End),
+            (b"\x1b[4~".as_slice(), InputKind::End),
+            (b"\x1b[8~".as_slice(), InputKind::End),
+            (b"\x1bOF".as_slice(), InputKind::End),
+            (b"\x1b[3~".as_slice(), InputKind::Delete),
+            (b"\x7f".as_slice(), InputKind::Backspace),
+            (b"\x1b[Z".as_slice(), InputKind::BackTab),
+        ] {
+            let events = InputDecoder::default().feed(raw);
+            assert_eq!(events.len(), 1, "sequence {raw:?}");
+            assert_eq!(events[0].kind, expected, "sequence {raw:?}");
+            assert_eq!(events[0].raw, raw, "sequence {raw:?}");
+        }
+    }
+
+    #[test]
     fn lone_escape_is_resolved_by_timeout_flush() {
         let mut decoder = InputDecoder::default();
         assert!(decoder.feed(b"\x1b").is_empty());
@@ -291,6 +351,22 @@ mod tests {
                 raw: b"\x1b".to_vec(),
             })
         );
+    }
+
+    #[test]
+    fn buffered_input_can_be_reclaimed_byte_exact_on_foreground_handoff() {
+        let partial_paste = "\x1b[200~first\n第二行🙂".as_bytes();
+        let mut decoder = InputDecoder::default();
+        assert!(decoder.feed(partial_paste).is_empty());
+        assert_eq!(decoder.take_buffered_raw(), partial_paste);
+
+        let events = decoder.feed(b"x");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].raw, b"x");
+
+        assert!(decoder.feed(b"\x1b").is_empty());
+        assert_eq!(decoder.take_buffered_raw(), b"\x1b");
+        assert!(!decoder.has_pending_ambiguity());
     }
 
     #[test]
@@ -318,7 +394,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_paste_stays_raw_until_its_end_marker() {
+    fn oversized_paste_streams_without_interpreting_payload() {
         let mut raw = Vec::with_capacity(MAX_PASTE_BYTES + 32);
         raw.extend_from_slice(PASTE_START);
         raw.extend(std::iter::repeat_n(b'x', MAX_PASTE_BYTES + 1));
@@ -339,8 +415,22 @@ mod tests {
         assert!(
             events[..first_text]
                 .iter()
-                .all(|event| matches!(event.kind, InputKind::Raw))
+                .all(|event| matches!(event.kind, InputKind::PasteFragment { .. }))
         );
+        assert!(matches!(
+            events.first().map(|event| &event.kind),
+            Some(InputKind::PasteFragment {
+                strip_start: true,
+                ..
+            })
+        ));
+        assert!(matches!(
+            events.get(first_text - 1).map(|event| &event.kind),
+            Some(InputKind::PasteFragment {
+                strip_end: true,
+                ..
+            })
+        ));
         let passthrough: Vec<_> = events[..first_text]
             .iter()
             .flat_map(|event| event.raw.iter().copied())
@@ -364,7 +454,13 @@ mod tests {
         raw.extend_from_slice(PASTE_END);
         let events = InputDecoder::default().feed(&raw);
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].kind, InputKind::Raw);
+        assert_eq!(
+            events[0].kind,
+            InputKind::PasteFragment {
+                strip_start: true,
+                strip_end: true,
+            }
+        );
         assert_eq!(events[0].raw, raw);
     }
 

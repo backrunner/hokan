@@ -2,9 +2,9 @@ use std::{collections::VecDeque, io::Write, sync::Arc, time::Instant};
 
 use super::super::{
     AnchorConfidence, BoundaryId, BufferRevision, ChildOutputBatch, DrainState, FrameRevision,
-    FrameTicket, OverlayCompositor, OverlaySurfaceRenderer, RenderBoundaryDecoder, RenderReadiness,
-    SafeBoundaryScanner, ScreenEpoch, ScreenRevision, SessionToken, SurfaceTheme,
-    SyncOutputCapability, TerminalGuard, TerminalModel, TerminalSize,
+    FrameTicket, OverlayCompositor, OverlaySurfaceRenderer, RenderBoundaryDecoder,
+    RenderBoundaryEvent, RenderReadiness, SafeBoundaryScanner, ScreenEpoch, ScreenRevision,
+    SessionToken, SurfaceTheme, SyncOutputCapability, TerminalGuard, TerminalModel, TerminalSize,
 };
 use super::{
     ActorCommand, ControlCommand, FrameRequest, MailboxCloseGuard, OutputActorExit, OutputError,
@@ -35,6 +35,10 @@ pub struct OutputActor<W: Write> {
     pub(super) pending_redisplays: VecDeque<(BoundaryId, u64, ScreenEpoch, ScreenRevision)>,
     pub(super) recent_convergences: VecDeque<RedisplayConvergence>,
     pub(super) expected_prompt: Option<BoundaryId>,
+    /// Prompt control messages travel over a separate FIFO from PTY output.
+    /// Defer mode/alternate-screen recovery until the authenticated marker
+    /// itself has crossed the output actor when the two streams race.
+    pub(super) pending_prompt_recovery: Option<BoundaryId>,
     pub(super) cursor_probe_ready: bool,
     pub(super) cursor_probe_revision: Option<BufferRevision>,
     pub(super) foreground: bool,
@@ -82,6 +86,7 @@ impl<W: Write> OutputActor<W> {
             pending_redisplays: VecDeque::with_capacity(RECENT_BOUNDARY_LIMIT),
             recent_convergences: VecDeque::with_capacity(RECENT_BOUNDARY_LIMIT),
             expected_prompt: None,
+            pending_prompt_recovery: None,
             cursor_probe_ready: false,
             cursor_probe_revision: None,
             foreground: false,
@@ -170,6 +175,9 @@ impl<W: Write> OutputActor<W> {
                 self.cursor_probe_ready = false;
             }
             ControlCommand::SetSyncCapability(capability) => self.capability = capability,
+            ControlCommand::SetBracketedPaste(enabled) => {
+                self.guard.set_bracketed_paste(enabled)?;
+            }
             ControlCommand::Probe(bytes) => self.guard.write_control(&bytes)?,
             ControlCommand::Resize(size) => {
                 self.model.resize(size)?;
@@ -212,6 +220,11 @@ impl<W: Write> OutputActor<W> {
             }
             ControlCommand::SetForeground(foreground) => {
                 self.foreground = foreground;
+                if foreground {
+                    self.model.begin_foreground();
+                } else {
+                    self.model.end_foreground();
+                }
                 self.decoder.set_foreground(foreground);
                 if foreground {
                     self.compositor.invalidate();
@@ -274,7 +287,7 @@ impl<W: Write> OutputActor<W> {
         }
     }
 
-    fn handle_child(&mut self, batch: ChildOutputBatch) -> Result<(), OutputError> {
+    pub(super) fn handle_child(&mut self, batch: ChildOutputBatch) -> Result<(), OutputError> {
         self.last_read_cycle = batch.read_cycle;
         let overlay_before = self
             .compositor
@@ -282,16 +295,32 @@ impl<W: Write> OutputActor<W> {
             .map(|key| self.model.snapshot_region(key.rect));
         let decoded = self.decoder.feed(&batch.bytes);
         let mut start = 0;
-        for boundary in decoded.boundaries {
-            self.process_child_segment(&decoded.passthrough[start..boundary.passthrough_offset])?;
+        let mut written_bytes = 0usize;
+        for boundary in &decoded.boundaries {
+            let segment = &decoded.passthrough[start..boundary.passthrough_offset];
+            self.process_child_segment(segment)?;
+            self.guard.write_child(segment)?;
+            written_bytes = written_bytes.saturating_add(segment.len());
             start = boundary.passthrough_offset;
             self.observe_boundary(
                 boundary.event,
                 batch.read_cycle,
                 batch.drain == DrainState::DrainedToEagain,
             );
+            if matches!(
+                boundary.event,
+                RenderBoundaryEvent::PromptRendered { boundary_id }
+                    if self
+                        .pending_prompt_recovery
+                        .is_some_and(|pending| boundary_id >= pending)
+            ) {
+                self.recover_prompt_terminal_state()?;
+            }
         }
-        self.process_child_segment(&decoded.passthrough[start..])?;
+        let tail = &decoded.passthrough[start..];
+        self.process_child_segment(tail)?;
+        self.guard.write_child(tail)?;
+        written_bytes = written_bytes.saturating_add(tail.len());
         if batch.drain == DrainState::DrainedToEagain {
             self.observe_drain(batch.read_cycle);
         }
@@ -303,12 +332,8 @@ impl<W: Write> OutputActor<W> {
             self.compositor.invalidate_diff_base();
         }
 
-        self.guard.write_child(&decoded.passthrough)?;
         self.report.child_batches = self.report.child_batches.saturating_add(1);
-        self.report.child_bytes = self
-            .report
-            .child_bytes
-            .saturating_add(decoded.passthrough.len() as u64);
+        self.report.child_bytes = self.report.child_bytes.saturating_add(written_bytes as u64);
         self.guard
             .observe_external_ownership(self.model.sync_ownership());
         Ok(())
