@@ -275,7 +275,8 @@ fn stale_candidate_activation_is_nonfatal() {
     );
     state.selected = Some(candidate.id);
     state.candidates = vec![candidate];
-    state.context = Some(context);
+    state.context = Some(Arc::clone(&context));
+    state.candidates_context = Some(context);
     state
         .buffer
         .set_exact("echo".into(), 4)
@@ -285,6 +286,61 @@ fn stale_candidate_activation_is_nonfatal() {
         resolve_selected_activation(&state).expect("stale activation is handled"),
         SelectedActivation::Rejected
     ));
+}
+
+#[test]
+fn same_buffer_candidates_survive_a_superseding_refresh() {
+    let directory = tempfile::tempdir().expect("directory");
+    let mut state = runtime_state(directory.path());
+    state
+        .buffer
+        .set_exact("ec".into(), 2)
+        .expect("initial buffer");
+    let candidates_context = Arc::new(
+        CompletionContext::new(
+            QueryId::new(1),
+            ShellKind::Zsh,
+            directory.path().to_owned(),
+            state.snapshot().expect("snapshot"),
+        )
+        .expect("candidate context"),
+    );
+    let candidate = Candidate::new(
+        candidates_context.query_id,
+        "echo",
+        "candidate",
+        Some(TextEdit {
+            range: 0..2,
+            replacement: "echo".into(),
+            cursor_after: CursorPlacement::End,
+        }),
+        CandidateAction::Insert,
+        CandidateSource::History,
+        CandidateKind::History,
+        Completeness::Runnable,
+        RiskLevel::Low,
+        "same-buffer-refresh",
+    );
+    state.selected = Some(candidate.id);
+    state.candidates = vec![candidate];
+    state.candidates_context = Some(candidates_context);
+
+    // A background help refresh advances the active query without changing
+    // the shell buffer. The visible row must still activate on the first key.
+    refresh_context(&mut state, QueryId::new(2));
+
+    assert_eq!(
+        match resolve_selected_activation(&state).expect("activation") {
+            SelectedActivation::Ready { activation, .. } => activation,
+            SelectedActivation::None | SelectedActivation::Rejected => {
+                panic!("same-buffer candidate was rejected")
+            }
+        },
+        Activation::ReplaceBuffer {
+            text: "echo".into(),
+            cursor: 4,
+        }
+    );
 }
 
 #[test]

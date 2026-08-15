@@ -87,8 +87,8 @@ pub(super) fn resolve_selected_activation(
     let Some(candidate) = selected_candidate(state) else {
         return Ok(SelectedActivation::None);
     };
-    let Some(context) = state.context.as_ref().cloned() else {
-        return Ok(SelectedActivation::None);
+    let Some(context) = state.candidates_context.as_ref().cloned() else {
+        return Ok(SelectedActivation::Rejected);
     };
     Ok(
         match activate_candidate(candidate, &context, &state.snapshot()?) {
@@ -150,6 +150,7 @@ pub(super) fn start_ai_request(
         log.ai_event("started");
     }
     state.candidates.clear();
+    state.candidates_context = None;
     state.selected = None;
     state.status = Some("HK-AI-WAIT requesting commands; Esc cancels".into());
     render_current(state, output)
@@ -194,7 +195,9 @@ pub(super) fn handle_provider_result(
     // the keypress: same content keeps its row, otherwise the delta lands
     // where it would have on the new list.
     let previous = state.selected;
+    let candidates_context = Arc::clone(&result.context);
     state.candidates = result.output.candidates;
+    state.candidates_context = Some(candidates_context);
     state.selected = previous
         .filter(|id| state.candidates.iter().any(|candidate| candidate.id == *id))
         .or_else(|| {
@@ -249,7 +252,7 @@ pub(super) fn handle_ai_result(
     if active != Some((result.query_id, result.generation)) {
         return Ok(());
     }
-    let Some(context) = state.context.as_ref() else {
+    let Some(context) = state.context.as_ref().cloned() else {
         return Ok(());
     };
     let _ = state.ai_query.take();
@@ -259,7 +262,9 @@ pub(super) fn handle_ai_result(
             if let Some(log) = &state.debug_log {
                 log.ai_event("succeeded");
             }
-            state.candidates = rank_and_dedupe(context, ai_result_candidates(context, commands), 5);
+            state.candidates =
+                rank_and_dedupe(&context, ai_result_candidates(&context, commands), 5);
+            state.candidates_context = Some(Arc::clone(&context));
             state.selected = None;
             state.status = None;
         }
@@ -276,9 +281,10 @@ pub(super) fn handle_ai_result(
                     | crate::ai::AiClientError::CodeAssistProject
             );
             let message = format!("{} {error}", error.code());
-            let candidate = crate::providers::ai_error_candidate(context, &message, configure);
+            let candidate = crate::providers::ai_error_candidate(&context, &message, configure);
             state.selected = None;
             state.candidates = vec![candidate];
+            state.candidates_context = Some(context);
             state.status = Some(message);
         }
     }

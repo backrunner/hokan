@@ -64,11 +64,10 @@ pub(super) fn render_current(state: &mut RuntimeState, output: &OutputHandle) ->
         }
         return Ok(());
     }
-    // Never commit a frame whose rows belong to a superseded query: their
-    // ids already fail activation's freshness check, so painting the list
-    // (and especially a selection marker) would present a choice the user
-    // cannot act on. The last committed frame stays on screen until fresh
-    // results replace it.
+    // Never commit a frame whose rows belong to a superseded query. The last
+    // committed frame stays on screen until fresh results replace it; its
+    // rows remain safely activatable through `candidates_context` only while
+    // the underlying buffer snapshot is unchanged.
     if state.pending_confirm.is_none()
         && state.candidates.first().is_some_and(|candidate| {
             Some(candidate.query_id) != state.context.as_ref().map(|context| context.query_id)

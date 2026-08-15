@@ -68,6 +68,7 @@ pub(super) fn handle_control_message(
                     SyncQuality::Mirrored
                 })?;
             state.context = None;
+            state.candidates_context = None;
             state.candidates.clear();
             state.selected = None;
             state.selection_intent = None;

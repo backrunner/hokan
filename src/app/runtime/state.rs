@@ -27,6 +27,10 @@ pub(super) struct RuntimeState {
     pub(super) buffer: EditableBuffer,
     pub(super) query_id: QueryId,
     pub(super) context: Option<Arc<CompletionContext>>,
+    /// Context that produced `candidates`. A background refresh can advance
+    /// `context` while the previous list remains visible, so activation must
+    /// validate against the list's own snapshot rather than the newest query.
+    pub(super) candidates_context: Option<Arc<CompletionContext>>,
     pub(super) candidates: Vec<Candidate>,
     pub(super) selected: Option<crate::completion::CandidateId>,
     pub(super) selection_intent: Option<SelectionIntent>,
@@ -108,6 +112,7 @@ impl RuntimeState {
             }),
             query_id: QueryId::ZERO,
             context: None,
+            candidates_context: None,
             candidates: Vec::new(),
             selected: None,
             selection_intent: None,
@@ -182,6 +187,7 @@ impl RuntimeState {
             || (self.buffer.text.trim().is_empty() && !self.history_only)
         {
             self.context = None;
+            self.candidates_context = None;
             self.candidates.clear();
             self.selected = None;
             self.overlay_visible = false;
@@ -192,9 +198,9 @@ impl RuntimeState {
         // query is in flight: queued buffer events arrive in bursts, and
         // clearing here would flap the overlay closed mid-burst — leaking
         // navigation keys to the shell and wiping selections made against
-        // the still-visible list. Stale rows lose activation eligibility
-        // through `resolve_selected_activation`, and the next provider
-        // result replaces them.
+        // the still-visible list. Their producer context remains attached to
+        // the list, so activation succeeds only while the buffer snapshot is
+        // still identical; the next provider result replaces both together.
         self.query_id = self
             .query_id
             .checked_next()
