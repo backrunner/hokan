@@ -1,6 +1,6 @@
 use std::{
     os::unix::fs::PermissionsExt as _,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, RwLock},
 };
 
@@ -11,6 +11,7 @@ use crate::{
     },
     history::HistoryIndex,
     platform::CommandPathCache,
+    project::{NodeWorkspaceCache, ProjectCache, WorkspaceMember},
     shell::AliasCache,
     specs::SpecRegistry,
 };
@@ -26,6 +27,8 @@ pub struct HistoryProvider {
     aliases: Arc<AliasCache>,
     specs: Arc<SpecRegistry>,
     help: Arc<CommandHelpCache>,
+    projects: Arc<ProjectCache>,
+    workspaces: NodeWorkspaceCache,
 }
 
 impl HistoryProvider {
@@ -43,7 +46,15 @@ impl HistoryProvider {
             aliases,
             specs,
             help,
+            projects: Arc::new(ProjectCache::default()),
+            workspaces: NodeWorkspaceCache::default(),
         }
+    }
+
+    #[must_use]
+    pub fn with_project_cache(mut self, projects: Arc<ProjectCache>) -> Self {
+        self.projects = projects;
+        self
     }
 }
 
@@ -61,6 +72,13 @@ impl CandidateProvider for HistoryProvider {
     }
 
     fn complete(&self, context: &CompletionContext) -> ProviderOutput {
+        // ProjectProvider owns the package-manager command/script surface.
+        // Whole-line history rows would otherwise outrank the current script
+        // list and reintroduce scripts from other projects. Keep history after
+        // the script token, and for explicit Ctrl-R search.
+        if self.should_defer_normal_manager_history(context) {
+            return ProviderOutput::default();
+        }
         self.prefetch_context_help(context);
         let Ok(index) = self.index.read() else {
             return ProviderOutput::default();
@@ -166,6 +184,38 @@ fn continuation_prefix(text: &str) -> String {
 }
 
 impl HistoryProvider {
+    fn should_defer_normal_manager_history(&self, context: &CompletionContext) -> bool {
+        if context.mode != CompletionMode::Normal {
+            return false;
+        }
+        if super::project::node_run_completion_position(context) {
+            return true;
+        }
+        if super::filter_position(context).is_some()
+            || super::manager_option_position(context).is_some()
+            || super::manager_has_multiple_selectors_at_completion(context)
+        {
+            return true;
+        }
+        let Some(position) = super::manager_position(context) else {
+            return false;
+        };
+        match position.position {
+            super::Position::ScriptToken | super::Position::KeywordWord => true,
+            // npm/deno expose only native commands at the first argument;
+            // keep their standalone history rows for the generic provider.
+            super::Position::ManagerWord | super::Position::CommandToken
+                if position.spec.keyword.is_none() =>
+            {
+                match self.projects.load_nearest(&position.project_dir) {
+                    Ok(Some(_)) | Err(_) => true,
+                    Ok(None) => false,
+                }
+            }
+            super::Position::ManagerWord | super::Position::CommandToken => false,
+        }
+    }
+
     fn prefetch_context_help(&self, context: &CompletionContext) {
         let Some(command) = context.command() else {
             return;
@@ -261,9 +311,156 @@ impl HistoryProvider {
         let Some(segments) = command_segment_words(command) else {
             return true;
         };
-        segments
-            .iter()
-            .all(|words| self.plausible_segment(context, words, last_exit_code, aliases))
+        let mut states = vec![HistoryFlowState {
+            cwd: context.cwd.as_ref().clone(),
+            status: HistoryCommandStatus::Success,
+            active: true,
+            background_cwd: None,
+        }];
+        let mut previous_link = None;
+        let mut previous_backgrounded = false;
+        for segment in segments {
+            if segment.backgrounded && !previous_backgrounded {
+                for state in &mut states {
+                    state.background_cwd = Some(state.cwd.clone());
+                }
+            }
+            let mut active_seen = false;
+            let mut active_plausible = false;
+            let mut inactive_plausible = false;
+            let plausibility = states
+                .iter()
+                .map(|state| {
+                    let mut segment_context = context.clone();
+                    segment_context.cwd = Arc::new(state.cwd.clone());
+                    let plausible = self.plausible_segment(
+                        &segment_context,
+                        &segment.words,
+                        last_exit_code,
+                        aliases,
+                    );
+                    if state.active {
+                        active_seen = true;
+                        active_plausible |= plausible;
+                    } else {
+                        inactive_plausible |= plausible;
+                    }
+                    plausible
+                })
+                .collect::<Vec<_>>();
+            if (active_seen && !active_plausible) || (!active_seen && !inactive_plausible) {
+                return false;
+            }
+            if active_seen {
+                states = states
+                    .into_iter()
+                    .zip(plausibility)
+                    .filter_map(|(state, plausible)| (!state.active || plausible).then_some(state))
+                    .collect();
+            }
+
+            let in_pipeline = previous_link == Some(HistorySegmentLink::Pipe)
+                || segment.next == HistorySegmentLink::Pipe;
+            let mut outcomes = Vec::new();
+            for state in states {
+                if !state.active {
+                    push_history_flow_state(&mut outcomes, state);
+                    continue;
+                }
+                if in_pipeline {
+                    for status in [HistoryCommandStatus::Success, HistoryCommandStatus::Failure] {
+                        push_history_flow_state(
+                            &mut outcomes,
+                            HistoryFlowState {
+                                cwd: state.cwd.clone(),
+                                status,
+                                active: true,
+                                background_cwd: state.background_cwd.clone(),
+                            },
+                        );
+                    }
+                    continue;
+                }
+
+                let mut segment_context = context.clone();
+                segment_context.cwd = Arc::new(state.cwd.clone());
+                match history_directory_change(&segment_context, &segment.words, aliases) {
+                    HistoryDirectoryChange::NotApplicable => {
+                        for status in [HistoryCommandStatus::Success, HistoryCommandStatus::Failure]
+                        {
+                            push_history_flow_state(
+                                &mut outcomes,
+                                HistoryFlowState {
+                                    cwd: state.cwd.clone(),
+                                    status,
+                                    active: true,
+                                    background_cwd: state.background_cwd.clone(),
+                                },
+                            );
+                        }
+                    }
+                    HistoryDirectoryChange::Failed => {
+                        push_history_flow_state(
+                            &mut outcomes,
+                            HistoryFlowState {
+                                cwd: state.cwd,
+                                status: HistoryCommandStatus::Failure,
+                                active: true,
+                                background_cwd: state.background_cwd,
+                            },
+                        );
+                    }
+                    HistoryDirectoryChange::Known(directory) => {
+                        push_history_flow_state(
+                            &mut outcomes,
+                            HistoryFlowState {
+                                cwd: directory,
+                                status: HistoryCommandStatus::Success,
+                                active: true,
+                                background_cwd: state.background_cwd.clone(),
+                            },
+                        );
+                        push_history_flow_state(
+                            &mut outcomes,
+                            HistoryFlowState {
+                                cwd: state.cwd,
+                                status: HistoryCommandStatus::Failure,
+                                active: true,
+                                background_cwd: state.background_cwd,
+                            },
+                        );
+                    }
+                    // A dynamic `cd` may have placed the remaining command in
+                    // another project. Keep the history row instead of
+                    // rejecting a script against a cwd we cannot know.
+                    HistoryDirectoryChange::Unknown => return true,
+                }
+            }
+
+            for state in &mut outcomes {
+                if segment.next == HistorySegmentLink::Background {
+                    if let Some(parent_cwd) = state.background_cwd.take() {
+                        state.cwd = parent_cwd;
+                    }
+                    state.status = HistoryCommandStatus::Success;
+                }
+                state.active = match segment.next {
+                    HistorySegmentLink::Always | HistorySegmentLink::Background => true,
+                    HistorySegmentLink::OnSuccess => state.status == HistoryCommandStatus::Success,
+                    HistorySegmentLink::OnFailure => state.status == HistoryCommandStatus::Failure,
+                    HistorySegmentLink::Pipe => state.active,
+                    HistorySegmentLink::End => false,
+                };
+            }
+            if outcomes.len() > MAX_HISTORY_FLOW_STATES {
+                return true;
+            }
+            previous_link = Some(segment.next);
+            previous_backgrounded =
+                segment.backgrounded && segment.next != HistorySegmentLink::Background;
+            states = outcomes;
+        }
+        true
     }
 
     fn plausible_segment(
@@ -361,6 +558,15 @@ impl HistoryProvider {
             return plausible;
         }
 
+        if let Some(plausible) = self.node_run_script_is_plausible(context, &cooked, command_index)
+        {
+            return plausible;
+        }
+
+        if let Some(plausible) = self.manager_script_is_plausible(context, &cooked, command_index) {
+            return plausible;
+        }
+
         if let Some(manager) = super::MANAGERS
             .iter()
             .find(|manager| manager.name == super::executable_basename(command_word))
@@ -433,6 +639,264 @@ impl HistoryProvider {
             return false;
         }
         true
+    }
+
+    fn node_run_script_is_plausible(
+        &self,
+        context: &CompletionContext,
+        words: &[&str],
+        command_index: usize,
+    ) -> Option<bool> {
+        let command = super::executable_basename(words.get(command_index).copied()?);
+        if !matches!(command, "node" | "nodejs") {
+            return None;
+        }
+        let arguments = words.get(command_index + 1..).unwrap_or_default();
+        let mut index = 0;
+        while let Some(argument) = arguments.get(index).copied() {
+            let script = if let Some(script) = argument.strip_prefix("--run=") {
+                Some(script)
+            } else if argument == "--run" {
+                Some(arguments.get(index + 1).copied()?)
+            } else {
+                None
+            };
+            if let Some(script) = script {
+                if script.is_empty()
+                    || script
+                        .chars()
+                        .any(|character| matches!(character, '$' | '`' | '*' | '?' | '[' | '{'))
+                {
+                    return None;
+                }
+                let project_dir =
+                    super::wrapper_working_directory_before(context, words, command_index);
+                return self.manifest_has_script(command, &project_dir, script);
+            }
+            if argument == "--" || argument == "-" || !argument.starts_with('-') {
+                return None;
+            }
+            if super::project::node_option_takes_separate_value(argument) {
+                if index + 1 >= arguments.len() {
+                    return None;
+                }
+                index += 2;
+            } else {
+                index += 1;
+            }
+        }
+        None
+    }
+
+    fn manager_script_is_plausible(
+        &self,
+        context: &CompletionContext,
+        words: &[&str],
+        command_index: usize,
+    ) -> Option<bool> {
+        let mut invocation = parse_manager_history_invocation(context, words, command_index)?;
+        let script = if super::is_script_keyword(invocation.manager, &invocation.command) {
+            invocation.operands.first()?.clone()
+        } else if invocation.manager.name == "yarn" && invocation.command == "workspace" {
+            let member = invocation.operands.first()?.clone();
+            let mut operands = invocation.operands.iter().skip(1);
+            let script = match operands.next() {
+                Some(word) if word == "run" => operands.next()?.clone(),
+                Some(word) => word.clone(),
+                None => return None,
+            };
+            let selector = (super::WorkspaceStyle::YarnWorkspace, member);
+            invocation.selector = Some(selector.clone());
+            invocation.selectors.push(selector);
+            invocation.selector_count = invocation.selectors.len();
+            script
+        } else if invocation.manager.keyword.is_none() && invocation.command == "run" {
+            invocation.operands.first()?.clone()
+        } else if invocation.manager.keyword.is_none()
+            && !invocation
+                .manager
+                .subcommands
+                .iter()
+                .any(|(subcommand, _)| *subcommand == invocation.command)
+        {
+            invocation.command.clone()
+        } else {
+            return None;
+        };
+        if script.starts_with('-')
+            || script
+                .chars()
+                .any(|character| matches!(character, '$' | '`' | '*' | '?' | '[' | '{'))
+        {
+            return None;
+        }
+        self.script_is_present(&invocation, &script)
+    }
+
+    fn script_is_present(
+        &self,
+        invocation: &ManagerHistoryInvocation,
+        script: &str,
+    ) -> Option<bool> {
+        if invocation.selector_count > 1 {
+            return self.multiple_selector_script_is_present(invocation, script);
+        }
+        let has_workspace_scope =
+            invocation.selector.is_some() || invocation.recursive || invocation.workspace_root;
+        if !has_workspace_scope {
+            // `--if-present` only turns a missing script into a successful
+            // no-op. A recommendation is still useful only when this project
+            // actually defines the script.
+            return self.manifest_has_script(
+                invocation.manager.name,
+                &invocation.project_dir,
+                script,
+            );
+        }
+
+        let Some(workspace) = self.workspaces.load(&invocation.project_dir) else {
+            // Recursive completion falls back to the nearest manifest when
+            // this is not actually a workspace, matching ProjectProvider.
+            return if invocation.selector.is_none() {
+                self.manifest_has_script(invocation.manager.name, &invocation.project_dir, script)
+            } else {
+                Some(false)
+            };
+        };
+
+        if invocation.workspace_root {
+            return self.workspace_root_has_script(
+                invocation.manager.name,
+                &workspace.root,
+                script,
+            );
+        }
+
+        if let Some((_, selector)) = invocation.selector.as_ref() {
+            if !literal_workspace_selector(selector) {
+                return None;
+            }
+            let selected: Vec<_> = workspace
+                .members
+                .iter()
+                .filter(|member| workspace_member_matches(&workspace.root, member, selector))
+                .collect();
+            if selected.is_empty() {
+                return Some(false);
+            }
+            return Some(
+                selected
+                    .iter()
+                    .any(|member| member.scripts.contains_key(script)),
+            );
+        }
+
+        if !invocation.recursive {
+            return self.manifest_has_script(
+                invocation.manager.name,
+                &invocation.project_dir,
+                script,
+            );
+        }
+
+        let mut found = Vec::new();
+        if invocation.include_workspace_root {
+            found.push(self.workspace_root_has_script(
+                invocation.manager.name,
+                &workspace.root,
+                script,
+            )?);
+        }
+        found.extend(
+            workspace
+                .members
+                .iter()
+                .map(|member| member.scripts.contains_key(script)),
+        );
+        if found.is_empty() {
+            return Some(false);
+        }
+        if invocation.manager.name == "npm" && !invocation.if_present {
+            Some(found.into_iter().all(std::convert::identity))
+        } else {
+            Some(found.into_iter().any(std::convert::identity))
+        }
+    }
+
+    fn multiple_selector_script_is_present(
+        &self,
+        invocation: &ManagerHistoryInvocation,
+        script: &str,
+    ) -> Option<bool> {
+        if !invocation
+            .selectors
+            .iter()
+            .all(|(_, selector)| literal_workspace_selector(selector))
+        {
+            return None;
+        }
+        let Some(workspace) = self.workspaces.load(&invocation.project_dir) else {
+            return Some(false);
+        };
+        let selected: Vec<_> = workspace
+            .members
+            .iter()
+            .filter(|member| {
+                invocation.selectors.iter().any(|(_, selector)| {
+                    workspace_member_matches(&workspace.root, member, selector)
+                })
+            })
+            .collect();
+        if selected.is_empty() {
+            return Some(false);
+        }
+        if invocation.manager.name == "npm" && !invocation.if_present {
+            Some(
+                selected
+                    .iter()
+                    .all(|member| member.scripts.contains_key(script)),
+            )
+        } else {
+            Some(
+                selected
+                    .iter()
+                    .any(|member| member.scripts.contains_key(script)),
+            )
+        }
+    }
+
+    fn manifest_has_script(&self, manager: &str, directory: &Path, script: &str) -> Option<bool> {
+        if manager == "deno" {
+            return match self.projects.load_deno_nearest(directory) {
+                Ok(Some(manifest)) => Some(manifest.tasks.contains_key(script)),
+                Ok(None) => Some(false),
+                Err(_) => Some(false),
+            };
+        }
+        match self.projects.load_nearest(directory) {
+            Ok(Some(manifest)) => Some(manifest.scripts.contains_key(script)),
+            Ok(None) => Some(false),
+            Err(_) => Some(false),
+        }
+    }
+
+    fn workspace_root_has_script(&self, manager: &str, root: &Path, script: &str) -> Option<bool> {
+        if manager == "deno" {
+            return match self.projects.load_deno_nearest(root) {
+                Ok(Some(manifest)) => Some(
+                    manifest.path.parent() == Some(root) && manifest.tasks.contains_key(script),
+                ),
+                Ok(None) => Some(false),
+                Err(_) => Some(false),
+            };
+        }
+        match self.projects.load_nearest(root) {
+            Ok(Some(manifest)) if manifest.path.parent() == Some(root) => {
+                Some(manifest.scripts.contains_key(script))
+            }
+            Ok(Some(_)) | Ok(None) => Some(false),
+            Err(_) => Some(false),
+        }
     }
 
     fn plausible_function_argument(
@@ -613,6 +1077,207 @@ fn manager_command_arguments<'a>(manager: &str, arguments: &'a [&'a str]) -> Opt
     None
 }
 
+#[derive(Clone, Debug)]
+struct ManagerHistoryOptions {
+    index: usize,
+    project_dir: std::path::PathBuf,
+    selector: Option<(super::WorkspaceStyle, String)>,
+    selectors: Vec<(super::WorkspaceStyle, String)>,
+    selector_count: usize,
+    workspace_root: bool,
+    recursive: bool,
+    include_workspace_root: bool,
+    if_present: bool,
+}
+
+impl ManagerHistoryOptions {
+    fn new(project_dir: &Path) -> Self {
+        Self {
+            index: 0,
+            project_dir: project_dir.to_owned(),
+            selector: None,
+            selectors: Vec::new(),
+            selector_count: 0,
+            workspace_root: false,
+            recursive: false,
+            include_workspace_root: false,
+            if_present: false,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ManagerHistoryInvocation {
+    manager: &'static super::ManagerSpec,
+    command: String,
+    operands: Vec<String>,
+    project_dir: std::path::PathBuf,
+    selector: Option<(super::WorkspaceStyle, String)>,
+    selectors: Vec<(super::WorkspaceStyle, String)>,
+    selector_count: usize,
+    workspace_root: bool,
+    recursive: bool,
+    include_workspace_root: bool,
+    if_present: bool,
+}
+
+fn parse_manager_history_options(
+    manager: &str,
+    arguments: &[&str],
+    directory_base: &Path,
+    mut state: ManagerHistoryOptions,
+    allow_double_dash: bool,
+) -> Option<ManagerHistoryOptions> {
+    state.index = 0;
+    while let Some(argument) = arguments.get(state.index).copied() {
+        if argument == "--" {
+            if !allow_double_dash {
+                return None;
+            }
+            state.index += 1;
+            break;
+        }
+        if let Some((kind, value)) = super::attached_manager_value(manager, argument) {
+            match kind {
+                super::ManagerValue::Directory => {
+                    state.project_dir = super::resolve_directory(directory_base, value);
+                }
+                super::ManagerValue::Workspace(style) => {
+                    state.selector_count = state.selector_count.saturating_add(1);
+                    let selector = (style, value.to_owned());
+                    state.selector = Some(selector.clone());
+                    state.selectors.push(selector);
+                }
+                super::ManagerValue::Other => {}
+            }
+            state.index += 1;
+            continue;
+        }
+        if let Some((flag, enabled)) = super::attached_manager_boolean(manager, argument) {
+            super::apply_manager_boolean(
+                manager,
+                flag,
+                enabled,
+                &mut state.workspace_root,
+                &mut state.recursive,
+                &mut state.include_workspace_root,
+                &mut state.if_present,
+            );
+            state.index += 1;
+            continue;
+        }
+        if let Some(kind) = super::manager_value_option(manager, argument) {
+            let value = arguments.get(state.index + 1).copied()?;
+            match kind {
+                super::ManagerValue::Directory => {
+                    state.project_dir = super::resolve_directory(directory_base, value);
+                }
+                super::ManagerValue::Workspace(style) => {
+                    state.selector_count = state.selector_count.saturating_add(1);
+                    let selector = (style, value.to_owned());
+                    state.selector = Some(selector.clone());
+                    state.selectors.push(selector);
+                }
+                super::ManagerValue::Other => {}
+            }
+            state.index += 2;
+            continue;
+        }
+        if argument.starts_with('-') {
+            if !super::manager_flag_without_value(manager, argument) {
+                return None;
+            }
+            super::apply_manager_flag(
+                manager,
+                argument,
+                &mut state.workspace_root,
+                &mut state.recursive,
+                &mut state.include_workspace_root,
+                &mut state.if_present,
+            );
+            state.index += 1;
+            continue;
+        }
+        break;
+    }
+    Some(state)
+}
+
+fn parse_manager_history_invocation(
+    context: &CompletionContext,
+    words: &[&str],
+    command_index: usize,
+) -> Option<ManagerHistoryInvocation> {
+    let manager_name = super::executable_basename(words.get(command_index).copied()?);
+    let manager = super::MANAGERS
+        .iter()
+        .find(|manager| manager.name == manager_name)?;
+    let arguments = words.get(command_index + 1..).unwrap_or_default();
+    let invocation_dir = super::wrapper_working_directory_before(context, words, command_index);
+    let mut options = parse_manager_history_options(
+        manager.name,
+        arguments,
+        &invocation_dir,
+        ManagerHistoryOptions::new(&invocation_dir),
+        true,
+    )?;
+    let command_offset = options.index;
+    let command = arguments.get(command_offset)?.to_string();
+    let mut operand_offset = command_offset + 1;
+    if matches!(manager.name, "npm" | "pnpm") && super::is_script_keyword(manager, &command) {
+        options = parse_manager_history_options(
+            manager.name,
+            arguments.get(operand_offset..).unwrap_or_default(),
+            &invocation_dir,
+            options,
+            false,
+        )?;
+        operand_offset += options.index;
+    }
+    Some(ManagerHistoryInvocation {
+        manager,
+        command,
+        operands: arguments
+            .get(operand_offset..)
+            .unwrap_or_default()
+            .iter()
+            .map(|word| (*word).to_owned())
+            .collect(),
+        project_dir: options.project_dir,
+        selector: options.selector,
+        selectors: options.selectors,
+        selector_count: options.selector_count,
+        workspace_root: options.workspace_root,
+        recursive: options.recursive,
+        include_workspace_root: options.include_workspace_root,
+        if_present: options.if_present,
+    })
+}
+
+fn literal_workspace_selector(selector: &str) -> bool {
+    !selector.is_empty()
+        && !selector.starts_with('!')
+        && !selector.starts_with("...")
+        && !selector
+            .chars()
+            .any(|character| matches!(character, '$' | '`' | '*' | '?' | '[' | '{'))
+}
+
+fn workspace_member_matches(root: &Path, member: &WorkspaceMember, selector: &str) -> bool {
+    let selector_path = Path::new(selector.strip_prefix("./").unwrap_or(selector));
+    member.name == selector
+        || member.directory == selector_path
+        || member
+            .directory
+            .strip_prefix(root)
+            .ok()
+            .is_some_and(|path| path == selector_path)
+        || member
+            .directory
+            .file_name()
+            .is_some_and(|name| name == std::ffi::OsStr::new(selector))
+}
+
 fn manager_subcommand_has_commands(manager: &str, command: &str) -> bool {
     matches!(
         (manager, command),
@@ -630,7 +1295,54 @@ fn allows_external_subcommands(command: &str) -> bool {
     )
 }
 
-fn command_segment_words(command: &str) -> Option<Vec<Vec<String>>> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HistorySegmentLink {
+    Always,
+    OnSuccess,
+    OnFailure,
+    Pipe,
+    Background,
+    End,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HistorySegment {
+    words: Vec<String>,
+    next: HistorySegmentLink,
+    backgrounded: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HistoryCommandStatus {
+    Success,
+    Failure,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HistoryFlowState {
+    cwd: PathBuf,
+    status: HistoryCommandStatus,
+    active: bool,
+    background_cwd: Option<PathBuf>,
+}
+
+const MAX_HISTORY_FLOW_STATES: usize = 64;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum HistoryDirectoryChange {
+    NotApplicable,
+    Failed,
+    Known(PathBuf),
+    Unknown,
+}
+
+fn push_history_flow_state(states: &mut Vec<HistoryFlowState>, state: HistoryFlowState) {
+    if !states.contains(&state) {
+        states.push(state);
+    }
+}
+
+fn command_segment_words(command: &str) -> Option<Vec<HistorySegment>> {
     let parsed = crate::parser::parse_line(command, command.len()).ok()?;
     if parsed
         .tokens
@@ -639,40 +1351,177 @@ fn command_segment_words(command: &str) -> Option<Vec<Vec<String>>> {
     {
         return None;
     }
-    let mut ranges = Vec::new();
+    let mut segments = Vec::new();
     let mut start = 0;
     for token in &parsed.tokens {
         if matches!(token.kind, crate::parser::TokenKind::Comment) {
-            ranges.push(start..token.range.start);
+            push_history_segment(
+                &mut segments,
+                &parsed.tokens,
+                start..token.range.start,
+                HistorySegmentLink::End,
+            );
             start = command.len();
             break;
         }
-        if matches!(
-            token.kind,
-            crate::parser::TokenKind::Pipe
-                | crate::parser::TokenKind::AndIf
-                | crate::parser::TokenKind::OrIf
-                | crate::parser::TokenKind::Separator
-        ) {
-            ranges.push(start..token.range.start);
+        let next = match token.kind {
+            crate::parser::TokenKind::Pipe => Some(HistorySegmentLink::Pipe),
+            crate::parser::TokenKind::AndIf => Some(HistorySegmentLink::OnSuccess),
+            crate::parser::TokenKind::OrIf => Some(HistorySegmentLink::OnFailure),
+            crate::parser::TokenKind::Separator
+                if command
+                    .get(token.range.clone())
+                    .is_some_and(|operator| operator == "&") =>
+            {
+                Some(HistorySegmentLink::Background)
+            }
+            crate::parser::TokenKind::Separator => Some(HistorySegmentLink::Always),
+            _ => None,
+        };
+        if let Some(next) = next {
+            push_history_segment(
+                &mut segments,
+                &parsed.tokens,
+                start..token.range.start,
+                next,
+            );
             start = token.range.end;
         }
     }
     if start < command.len() {
-        ranges.push(start..command.len());
+        push_history_segment(
+            &mut segments,
+            &parsed.tokens,
+            start..command.len(),
+            HistorySegmentLink::End,
+        );
     }
-    Some(
-        ranges
-            .into_iter()
-            .map(|range| {
-                crate::parser::semantic_word_tokens(&parsed.tokens, &range)
-                    .into_iter()
-                    .map(|token| token.cooked_prefix.clone())
-                    .collect::<Vec<_>>()
-            })
-            .filter(|words| !words.is_empty())
-            .collect(),
-    )
+    mark_history_background_groups(&mut segments);
+    Some(segments)
+}
+
+fn push_history_segment(
+    segments: &mut Vec<HistorySegment>,
+    tokens: &[crate::parser::Token],
+    range: std::ops::Range<usize>,
+    next: HistorySegmentLink,
+) {
+    let words = crate::parser::semantic_word_tokens(tokens, &range)
+        .into_iter()
+        .map(|token| token.cooked_prefix.clone())
+        .collect::<Vec<_>>();
+    if !words.is_empty() {
+        segments.push(HistorySegment {
+            words,
+            next,
+            backgrounded: false,
+        });
+    }
+}
+
+fn mark_history_background_groups(segments: &mut [HistorySegment]) {
+    let mut group_start = 0;
+    for index in 0..segments.len() {
+        match segments[index].next {
+            HistorySegmentLink::Background => {
+                for segment in &mut segments[group_start..=index] {
+                    segment.backgrounded = true;
+                }
+                group_start = index + 1;
+            }
+            HistorySegmentLink::Always | HistorySegmentLink::End => {
+                group_start = index + 1;
+            }
+            HistorySegmentLink::OnSuccess
+            | HistorySegmentLink::OnFailure
+            | HistorySegmentLink::Pipe => {}
+        }
+    }
+}
+
+fn history_directory_change(
+    context: &CompletionContext,
+    words: &[String],
+    aliases: &crate::shell::ShellAliases,
+) -> HistoryDirectoryChange {
+    let cooked = words.iter().map(String::as_str).collect::<Vec<_>>();
+    let analysis =
+        crate::parser::effective_command_analysis_for_shell(&cooked, false, context.shell);
+    let command_index = match analysis.state {
+        crate::parser::EffectiveCommandState::Found(index) => index,
+        crate::parser::EffectiveCommandState::WrapperCommand(_)
+        | crate::parser::EffectiveCommandState::IndeterminateWrapper(_)
+        | crate::parser::EffectiveCommandState::AwaitingCommand
+        | crate::parser::EffectiveCommandState::AwaitingWrapperValue => {
+            return HistoryDirectoryChange::NotApplicable;
+        }
+    };
+    let Some(command) = cooked.get(command_index).copied() else {
+        return HistoryDirectoryChange::NotApplicable;
+    };
+    if super::executable_basename(command) != "cd"
+        || command.contains('/')
+        || analysis.privileged
+        || analysis.opaque
+        || analysis.kind == crate::parser::EffectiveCommandKind::External
+    {
+        return HistoryDirectoryChange::NotApplicable;
+    }
+    if analysis.kind == crate::parser::EffectiveCommandKind::Shell && aliases.contains(command) {
+        return HistoryDirectoryChange::Unknown;
+    }
+    if cooked[..command_index]
+        .iter()
+        .any(|word| matches!(*word, "!" | "not" | "and" | "or"))
+    {
+        return HistoryDirectoryChange::Unknown;
+    }
+
+    let mut path = None;
+    let mut options = true;
+    for argument in cooked.get(command_index + 1..).unwrap_or_default() {
+        if options && *argument == "--" {
+            options = false;
+            continue;
+        }
+        if options && argument.starts_with('-') {
+            if *argument == "-"
+                || argument.len() == 1
+                || !argument[1..].chars().all(|flag| matches!(flag, 'L' | 'P'))
+            {
+                return HistoryDirectoryChange::Unknown;
+            }
+            continue;
+        }
+        options = false;
+        if path.replace(*argument).is_some() {
+            return HistoryDirectoryChange::Unknown;
+        }
+    }
+
+    let target = match path {
+        Some("") => return HistoryDirectoryChange::Failed,
+        Some(value) => {
+            if value
+                .chars()
+                .any(|character| matches!(character, '$' | '`' | '*' | '?' | '[' | '{'))
+                || (value.starts_with('~') && value != "~" && !value.starts_with("~/"))
+            {
+                return HistoryDirectoryChange::Unknown;
+            }
+            resolve_history_path(&context.cwd, value)
+        }
+        None => {
+            let Some(home) = std::env::home_dir() else {
+                return HistoryDirectoryChange::Failed;
+            };
+            home
+        }
+    };
+    match std::fs::canonicalize(target) {
+        Ok(directory) if directory.is_dir() => HistoryDirectoryChange::Known(directory),
+        Ok(_) | Err(_) => HistoryDirectoryChange::Failed,
+    }
 }
 
 fn resolve_history_path(base: &Path, value: &str) -> std::path::PathBuf {
@@ -731,6 +1580,20 @@ mod tests {
             .with_previous_command(previous_command.map(str::to_owned))
     }
 
+    fn context_in(directory: &Path, text: &str, mode: CompletionMode) -> CompletionContext {
+        let buffer =
+            BufferSnapshot::new(text, text.len(), BufferRevision::new(1), SyncQuality::Exact)
+                .expect("buffer");
+        CompletionContext::new(
+            QueryId::new(1),
+            ShellKind::Zsh,
+            directory.canonicalize().expect("canonical directory"),
+            buffer,
+        )
+        .expect("context")
+        .with_mode(mode)
+    }
+
     /// A PATH cache with the executables the fixtures rely on.
     fn provider_with_executables(index: HistoryIndex, names: &[&str]) -> HistoryProvider {
         provider_with_executables_and_help(index, names, Arc::new(CommandHelpCache::default()))
@@ -761,6 +1624,14 @@ mod tests {
             Arc::new(SpecRegistry::default()),
             help,
         )
+    }
+
+    fn provider_with_project(
+        index: HistoryIndex,
+        names: &[&str],
+        project_cache: Arc<ProjectCache>,
+    ) -> HistoryProvider {
+        provider_with_executables(index, names).with_project_cache(project_cache)
     }
 
     fn history_index() -> HistoryIndex {
@@ -1397,6 +2268,645 @@ mod tests {
     }
 
     #[test]
+    fn package_manager_script_history_is_filtered_by_the_current_manifest() {
+        let project = tempfile::tempdir().expect("project");
+        let other = tempfile::tempdir().expect("other project");
+        fs::write(
+            project.path().join("package.json"),
+            r#"{"scripts":{"dev":"vite","build":"vite build"}}"#,
+        )
+        .expect("package manifest");
+        let policy = HistoryPolicy::new(1024, &[]).expect("policy");
+        let mut index = HistoryIndex::default();
+        for command in [
+            "pnpm run dev",
+            "pnpm dev",
+            "npm run dev",
+            "npm run --if-present dev",
+            "yarn dev",
+            "bun dev",
+            "pnpm run dev -- --watch",
+        ] {
+            index.ingest(
+                command,
+                1_000,
+                ShellKind::Zsh,
+                Some(project.path()),
+                Some(0),
+                &policy,
+            );
+        }
+        for _ in 0..20 {
+            index.ingest(
+                "pnpm run deploy",
+                1_001,
+                ShellKind::Zsh,
+                Some(other.path()),
+                Some(0),
+                &policy,
+            );
+        }
+        for command in [
+            "pnpm run missing",
+            "pnpm missing",
+            "pnpm run --if-present missing",
+            "npm run --if-present missing",
+            "npm run missing --if-present",
+            "yarn missing",
+            "bun missing",
+        ] {
+            index.ingest(
+                command,
+                1_002,
+                ShellKind::Zsh,
+                Some(other.path()),
+                Some(0),
+                &policy,
+            );
+        }
+        let provider = provider_with_project(
+            index,
+            &["pnpm", "npm", "yarn", "bun"],
+            Arc::new(ProjectCache::default()),
+        );
+        let rows = |text: &str| {
+            provider
+                .complete(&context_in(
+                    project.path(),
+                    text,
+                    CompletionMode::HistoryOnly,
+                ))
+                .candidates
+                .into_iter()
+                .map(|candidate| candidate.display.primary)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(rows("pnpm run missing"), Vec::<String>::new());
+        assert_eq!(rows("pnpm missing"), Vec::<String>::new());
+        assert!(rows("pnpm run --if-present missing").is_empty());
+        assert!(rows("npm run --if-present missing").is_empty());
+        assert!(rows("npm run missing --if-present").is_empty());
+        assert_eq!(rows("pnpm run deploy"), Vec::<String>::new());
+        assert_eq!(rows("pnpm run dev -- --watch"), ["pnpm run dev -- --watch"]);
+        assert!(rows("npm run dev").contains(&"npm run dev".to_owned()));
+        assert!(rows("npm run --if-present dev").contains(&"npm run --if-present dev".to_owned()));
+        assert!(rows("yarn dev").contains(&"yarn dev".to_owned()));
+        assert!(rows("bun dev").contains(&"bun dev".to_owned()));
+        assert!(!rows("yarn missing").contains(&"yarn missing".to_owned()));
+        assert!(!rows("bun missing").contains(&"bun missing".to_owned()));
+    }
+
+    #[test]
+    fn renamed_package_script_invalidates_cached_history_validation() {
+        let project = tempfile::tempdir().expect("project");
+        let manifest = project.path().join("package.json");
+        fs::write(&manifest, r#"{"scripts":{"old":"echo old"}}"#).expect("old manifest");
+        let policy = HistoryPolicy::new(1024, &[]).expect("policy");
+        let mut index = HistoryIndex::default();
+        for command in ["pnpm run old", "pnpm run replacement"] {
+            index.ingest(
+                command,
+                1_000,
+                ShellKind::Zsh,
+                Some(project.path()),
+                Some(0),
+                &policy,
+            );
+        }
+        let provider = provider_with_project(index, &["pnpm"], Arc::new(ProjectCache::default()));
+        let rows = |text: &str| {
+            provider
+                .complete(&context_in(
+                    project.path(),
+                    text,
+                    CompletionMode::HistoryOnly,
+                ))
+                .candidates
+                .into_iter()
+                .map(|candidate| candidate.display.primary)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(rows("pnpm run old"), ["pnpm run old"]);
+        fs::write(
+            &manifest,
+            r#"{"scripts":{"replacement":"echo replacement"}}"#,
+        )
+        .expect("replacement manifest");
+        assert!(rows("pnpm run old").is_empty());
+        assert_eq!(rows("pnpm run replacement"), ["pnpm run replacement"]);
+    }
+
+    #[test]
+    fn invalid_manifest_fails_closed_for_literal_script_history() {
+        let project = tempfile::tempdir().expect("project");
+        fs::write(
+            project.path().join("package.json"),
+            br#"{"scripts":{"dev":"#,
+        )
+        .expect("invalid manifest");
+        let policy = HistoryPolicy::new(1024, &[]).expect("policy");
+        let mut index = HistoryIndex::default();
+        for command in [
+            "pnpm run stale",
+            "pnpm stale",
+            "npm run stale",
+            "node --run=stale",
+            "pnpm install",
+        ] {
+            index.ingest(
+                command,
+                1_000,
+                ShellKind::Zsh,
+                Some(project.path()),
+                Some(0),
+                &policy,
+            );
+        }
+        let provider = provider_with_project(
+            index,
+            &["pnpm", "npm", "node"],
+            Arc::new(ProjectCache::default()),
+        );
+        for command in [
+            "pnpm run stale",
+            "pnpm stale",
+            "npm run stale",
+            "node --run=stale",
+        ] {
+            let rows: Vec<_> = provider
+                .complete(&context_in(
+                    project.path(),
+                    command,
+                    CompletionMode::HistoryOnly,
+                ))
+                .candidates
+                .into_iter()
+                .map(|candidate| candidate.display.primary)
+                .collect();
+            assert!(rows.is_empty(), "invalid manifest leaked {command:?}");
+        }
+
+        assert!(
+            provider
+                .complete(&context_in(project.path(), "pnpm ", CompletionMode::Normal))
+                .candidates
+                .is_empty(),
+            "normal manager history must stay deferred while the manifest is invalid"
+        );
+    }
+
+    #[test]
+    fn node_run_history_uses_the_current_package_scripts() {
+        let project = tempfile::tempdir().expect("project");
+        fs::write(
+            project.path().join("package.json"),
+            r#"{"scripts":{"dev":"vite"}}"#,
+        )
+        .expect("manifest");
+        let policy = HistoryPolicy::new(1024, &[]).expect("policy");
+        let mut index = HistoryIndex::default();
+        for command in [
+            "node --run=dev",
+            "node --run dev",
+            "node --run=missing",
+            "nodejs --run missing",
+        ] {
+            index.ingest(
+                command,
+                1_000,
+                ShellKind::Zsh,
+                Some(project.path()),
+                Some(0),
+                &policy,
+            );
+        }
+        let provider = provider_with_project(
+            index,
+            &["node", "nodejs"],
+            Arc::new(ProjectCache::default()),
+        );
+        let rows = |text: &str| {
+            provider
+                .complete(&context_in(
+                    project.path(),
+                    text,
+                    CompletionMode::HistoryOnly,
+                ))
+                .candidates
+                .into_iter()
+                .map(|candidate| candidate.display.primary)
+                .collect::<Vec<_>>()
+        };
+        assert!(rows("node --run=dev").contains(&"node --run=dev".to_owned()));
+        assert!(rows("node --run dev").contains(&"node --run dev".to_owned()));
+        assert!(rows("node --run=missing").is_empty());
+        assert!(rows("nodejs --run missing").is_empty());
+    }
+
+    #[test]
+    fn deno_task_history_uses_the_current_deno_manifest() {
+        let project = tempfile::tempdir().expect("project");
+        fs::write(
+            project.path().join("deno.json"),
+            r#"{"tasks":{"dev":"deno run main.ts"}}"#,
+        )
+        .expect("deno manifest");
+        let policy = HistoryPolicy::new(1024, &[]).expect("policy");
+        let mut index = HistoryIndex::default();
+        for command in ["deno task dev", "deno task missing"] {
+            index.ingest(
+                command,
+                1_000,
+                ShellKind::Zsh,
+                Some(project.path()),
+                Some(0),
+                &policy,
+            );
+        }
+        let provider = provider_with_project(index, &["deno"], Arc::new(ProjectCache::default()));
+        let rows = |text: &str| {
+            provider
+                .complete(&context_in(
+                    project.path(),
+                    text,
+                    CompletionMode::HistoryOnly,
+                ))
+                .candidates
+                .into_iter()
+                .map(|candidate| candidate.display.primary)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(rows("deno task dev"), ["deno task dev"]);
+        assert!(rows("deno task missing").is_empty());
+    }
+
+    #[test]
+    fn package_manager_directory_options_validate_the_selected_manifest() {
+        let root = tempfile::tempdir().expect("root");
+        let app = root.path().join("app");
+        fs::create_dir(&app).expect("app directory");
+        fs::write(app.join("package.json"), r#"{"scripts":{"dev":"vite"}}"#).expect("app manifest");
+        let policy = HistoryPolicy::new(1024, &[]).expect("policy");
+        let mut index = HistoryIndex::default();
+        for command in [
+            "pnpm -C app run dev",
+            "pnpm -Capp run dev",
+            "pnpm run -C app dev",
+            "npm --prefix app run dev",
+            "npm --prefix=app run dev",
+            "npm run --prefix app dev",
+            "yarn --cwd app run dev",
+            "bun --cwd app run dev",
+            "pnpm -C app run missing",
+            "npm --prefix app run missing",
+        ] {
+            index.ingest(
+                command,
+                1_000,
+                ShellKind::Zsh,
+                Some(root.path()),
+                Some(0),
+                &policy,
+            );
+        }
+        let provider = provider_with_project(
+            index,
+            &["pnpm", "npm", "yarn", "bun"],
+            Arc::new(ProjectCache::default()),
+        );
+        let rows = |text: &str| {
+            provider
+                .complete(&context_in(root.path(), text, CompletionMode::HistoryOnly))
+                .candidates
+                .into_iter()
+                .map(|candidate| candidate.display.primary)
+                .collect::<Vec<_>>()
+        };
+        for command in [
+            "pnpm -C app run dev",
+            "pnpm -Capp run dev",
+            "pnpm run -C app dev",
+            "npm --prefix app run dev",
+            "npm --prefix=app run dev",
+            "npm run --prefix app dev",
+            "yarn --cwd app run dev",
+            "bun --cwd app run dev",
+        ] {
+            assert!(
+                rows(command).contains(&command.to_owned()),
+                "valid selected-project script was filtered for {command:?}"
+            );
+        }
+        assert!(rows("pnpm -C app run missing").is_empty());
+        assert!(rows("npm --prefix app run missing").is_empty());
+    }
+
+    #[test]
+    fn compound_history_uses_the_directory_selected_by_cd() {
+        let root = tempfile::tempdir().expect("root");
+        let app = root.path().join("app");
+        let dashed = root.path().join("-app");
+        fs::create_dir(&app).expect("app directory");
+        fs::create_dir(&dashed).expect("dashed directory");
+        fs::write(
+            root.path().join("package.json"),
+            r#"{"scripts":{"root-script":"echo root"}}"#,
+        )
+        .expect("root manifest");
+        for directory in [&app, &dashed] {
+            fs::write(
+                directory.join("package.json"),
+                r#"{"scripts":{"dev":"vite"}}"#,
+            )
+            .expect("app manifest");
+        }
+        let policy = HistoryPolicy::new(1024, &[]).expect("policy");
+        let mut index = HistoryIndex::default();
+        for command in [
+            "cd app && pnpm dev",
+            "cd -P app; pnpm dev",
+            "cd -- -app && pnpm dev",
+            "cd app && pnpm missing",
+            "cd missing || pnpm root-script",
+            "cd missing || pnpm dev",
+            "cd app || pnpm root-script; pnpm dev",
+            "cd app || pnpm root-script; pnpm missing",
+            "cd missing && pnpm root-script",
+            "cd missing && pnpm dev",
+        ] {
+            index.ingest(
+                command,
+                1_000,
+                ShellKind::Zsh,
+                Some(root.path()),
+                Some(0),
+                &policy,
+            );
+        }
+        let provider = provider_with_project(index, &["pnpm"], Arc::new(ProjectCache::default()));
+        let rows = |text: &str| {
+            provider
+                .complete(&context_in(root.path(), text, CompletionMode::HistoryOnly))
+                .candidates
+                .into_iter()
+                .map(|candidate| candidate.display.primary)
+                .collect::<Vec<_>>()
+        };
+        for command in [
+            "cd app && pnpm dev",
+            "cd -P app; pnpm dev",
+            "cd -- -app && pnpm dev",
+            "cd missing || pnpm root-script",
+            "cd app || pnpm root-script; pnpm dev",
+            "cd missing && pnpm root-script",
+        ] {
+            assert!(
+                rows(command).contains(&command.to_owned()),
+                "valid compound history was filtered for {command:?}"
+            );
+        }
+        assert!(!rows("cd app && pnpm missing").contains(&"cd app && pnpm missing".to_owned()));
+        assert!(!rows("cd missing || pnpm dev").contains(&"cd missing || pnpm dev".to_owned()));
+        assert!(
+            !rows("cd app || pnpm root-script; pnpm missing")
+                .contains(&"cd app || pnpm root-script; pnpm missing".to_owned()),
+            "cwd from a successful cd must survive a skipped || branch"
+        );
+        assert!(!rows("cd missing && pnpm dev").contains(&"cd missing && pnpm dev".to_owned()));
+    }
+
+    #[test]
+    fn pipeline_and_background_cd_do_not_change_history_validation_cwd() {
+        let root = tempfile::tempdir().expect("root");
+        let app = root.path().join("app");
+        fs::create_dir(&app).expect("app directory");
+        fs::write(
+            root.path().join("package.json"),
+            r#"{"scripts":{"root-script":"echo root"}}"#,
+        )
+        .expect("root manifest");
+        fs::write(app.join("package.json"), r#"{"scripts":{"dev":"vite"}}"#).expect("app manifest");
+        let policy = HistoryPolicy::new(1024, &[]).expect("policy");
+        let mut index = HistoryIndex::default();
+        for command in [
+            "cd app | pnpm root-script",
+            "cd app | pnpm dev",
+            "cd app & pnpm root-script",
+            "cd app & pnpm dev",
+            "cd app && pnpm dev & pnpm root-script",
+            "cd app && pnpm dev & pnpm dev",
+            "cd app & cd app & pnpm root-script",
+            "cd app & cd app & pnpm dev",
+        ] {
+            index.ingest(
+                command,
+                1_000,
+                ShellKind::Zsh,
+                Some(root.path()),
+                Some(0),
+                &policy,
+            );
+        }
+        let provider = provider_with_project(index, &["pnpm"], Arc::new(ProjectCache::default()));
+        let rows = |text: &str| {
+            provider
+                .complete(&context_in(root.path(), text, CompletionMode::HistoryOnly))
+                .candidates
+                .into_iter()
+                .map(|candidate| candidate.display.primary)
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            rows("cd app | pnpm root-script").contains(&"cd app | pnpm root-script".to_owned())
+        );
+        assert!(
+            rows("cd app & pnpm root-script").contains(&"cd app & pnpm root-script".to_owned())
+        );
+        assert!(
+            rows("cd app && pnpm dev & pnpm root-script")
+                .contains(&"cd app && pnpm dev & pnpm root-script".to_owned()),
+            "the background group must use app internally and restore root afterward"
+        );
+        assert!(
+            rows("cd app & cd app & pnpm root-script")
+                .contains(&"cd app & cd app & pnpm root-script".to_owned()),
+            "each consecutive background group must restore the parent cwd"
+        );
+        for command in [
+            "cd app | pnpm dev",
+            "cd app & pnpm dev",
+            "cd app && pnpm dev & pnpm dev",
+            "cd app & cd app & pnpm dev",
+        ] {
+            assert!(
+                !rows(command).contains(&command.to_owned()),
+                "invalid background or pipeline script leaked for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_cd_history_fails_open_instead_of_using_the_wrong_manifest() {
+        let root = tempfile::tempdir().expect("root");
+        fs::write(root.path().join("package.json"), r#"{"scripts":{}}"#).expect("root manifest");
+        let provider = provider_with_project(
+            HistoryIndex::default(),
+            &["pnpm"],
+            Arc::new(ProjectCache::default()),
+        );
+        for command in [
+            "cd - && pnpm dev",
+            "cd $PROJECT && pnpm dev",
+            "cd old new; pnpm dev",
+        ] {
+            assert!(
+                provider.plausible_command(
+                    &context_in(root.path(), command, CompletionMode::HistoryOnly),
+                    command,
+                ),
+                "dynamic cwd was incorrectly validated for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn wrapped_manager_history_still_uses_the_current_manifest() {
+        let project = tempfile::tempdir().expect("project");
+        fs::write(
+            project.path().join("package.json"),
+            r#"{"scripts":{"dev":"vite"}}"#,
+        )
+        .expect("manifest");
+        let provider = provider_with_project(
+            HistoryIndex::default(),
+            &["corepack", "pnpm", "npm", "sudo", "env"],
+            Arc::new(ProjectCache::default()),
+        );
+        for command in [
+            "corepack pnpm run dev",
+            "sudo pnpm dev",
+            "env -C . npm run dev",
+        ] {
+            assert!(
+                provider.plausible_command(
+                    &context_in(project.path(), command, CompletionMode::HistoryOnly),
+                    command,
+                ),
+                "valid wrapped script was filtered for {command:?}"
+            );
+        }
+        for command in [
+            "corepack pnpm run missing",
+            "sudo pnpm missing",
+            "env -C . npm run missing",
+        ] {
+            assert!(
+                !provider.plausible_command(
+                    &context_in(project.path(), command, CompletionMode::HistoryOnly),
+                    command,
+                ),
+                "invalid wrapped script leaked for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_script_history_respects_member_and_recursive_semantics() {
+        let root = tempfile::tempdir().expect("workspace");
+        let app = root.path().join("packages/app");
+        let api = root.path().join("packages/api");
+        fs::create_dir_all(&app).expect("app");
+        fs::create_dir_all(&api).expect("api");
+        fs::write(
+            root.path().join("package.json"),
+            r#"{"scripts":{"root-only":"echo root"},"workspaces":["packages/*"]}"#,
+        )
+        .expect("root manifest");
+        fs::write(
+            app.join("package.json"),
+            r#"{"name":"app","scripts":{"dev":"vite"}}"#,
+        )
+        .expect("app manifest");
+        fs::write(
+            api.join("package.json"),
+            r#"{"name":"api","scripts":{"build":"tsc"}}"#,
+        )
+        .expect("api manifest");
+        let policy = HistoryPolicy::new(1024, &[]).expect("policy");
+        let mut index = HistoryIndex::default();
+        for command in [
+            "pnpm --filter app run dev",
+            "pnpm --filter app --filter api run dev",
+            "npm --workspace app run dev",
+            "npm --workspace app --workspace api run dev",
+            "npm --workspace app --workspace api --if-present run dev",
+            "yarn workspace app run dev",
+            "pnpm -r run dev",
+            "npm --workspaces run dev",
+            "npm --workspaces --if-present run dev",
+            "pnpm -w run root-only",
+            "pnpm --filter app run missing",
+            "pnpm --filter app --filter api run missing",
+            "pnpm --filter app run --if-present missing",
+            "npm --workspace app run --if-present missing",
+            "npm --workspace app --workspace api run missing",
+            "npm --workspace app --workspace api --if-present run missing",
+        ] {
+            index.ingest(
+                command,
+                1_000,
+                ShellKind::Zsh,
+                Some(root.path()),
+                Some(0),
+                &policy,
+            );
+        }
+        let provider = provider_with_project(
+            index,
+            &["pnpm", "npm", "yarn"],
+            Arc::new(ProjectCache::default()),
+        );
+        let rows = |text: &str| {
+            provider
+                .complete(&context_in(root.path(), text, CompletionMode::HistoryOnly))
+                .candidates
+                .into_iter()
+                .map(|candidate| candidate.display.primary)
+                .collect::<Vec<_>>()
+        };
+        for command in [
+            "pnpm --filter app run dev",
+            "pnpm --filter app --filter api run dev",
+            "npm --workspace app run dev",
+            "npm --workspace app --workspace api --if-present run dev",
+            "yarn workspace app run dev",
+            "pnpm -r run dev",
+            "npm --workspaces --if-present run dev",
+            "pnpm -w run root-only",
+        ] {
+            assert!(
+                rows(command).contains(&command.to_owned()),
+                "valid workspace script was filtered for {command:?}"
+            );
+        }
+        assert!(rows("pnpm --filter app run missing").is_empty());
+        assert!(rows("pnpm --filter app --filter api run missing").is_empty());
+        assert!(rows("pnpm --filter app run --if-present missing").is_empty());
+        assert!(rows("npm --workspace app run --if-present missing").is_empty());
+        assert!(rows("npm --workspace app --workspace api run missing").is_empty());
+        assert!(rows("npm --workspace app --workspace api --if-present run missing").is_empty());
+        assert!(
+            !rows("npm --workspaces run dev").contains(&"npm --workspaces run dev".to_owned()),
+            "npm without --if-present must require every selected workspace"
+        );
+        assert!(
+            !rows("npm --workspace app --workspace api run dev")
+                .contains(&"npm --workspace app --workspace api run dev".to_owned()),
+            "npm multi-workspace scripts must require every selected workspace"
+        );
+    }
+
+    #[test]
     fn package_manager_nested_subcommand_typos_are_filtered() {
         let policy = HistoryPolicy::new(1024, &[]).expect("policy");
         let mut index = HistoryIndex::default();
@@ -1480,6 +2990,18 @@ mod tests {
             &["pnpm", "npm", "yarn", "bun", "deno"],
         );
         for command in [
+            "pnpm install",
+            "npm install",
+            "yarn install",
+            "bun install",
+            "deno test",
+        ] {
+            assert!(
+                available.plausible_command(&context(command, None), command),
+                "installed manager history was filtered for {command:?}"
+            );
+        }
+        for command in [
             "pnpm dev",
             "npm run build",
             "yarn test",
@@ -1488,8 +3010,8 @@ mod tests {
             "sudo pnpm dev",
         ] {
             assert!(
-                available.plausible_command(&context(command, None), command),
-                "installed manager history was filtered for {command:?}"
+                !available.plausible_command(&context(command, None), command),
+                "script history without a current manifest leaked for {command:?}"
             );
         }
         assert!(!available.plausible_command(&context("pnpn dev", None), "pnpn dev"));

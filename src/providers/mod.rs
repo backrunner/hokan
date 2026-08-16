@@ -1594,6 +1594,7 @@ pub(crate) fn manager_position(context: &CompletionContext) -> Option<ManagerPos
     let ManagerScanResult::Ready(scan) = scan_manager(context)? else {
         return None;
     };
+    let position = manager_position_from_scan(&scan)?;
     if scan.selector.is_some()
         || scan.multiple_selectors
         || (scan.spec.name == "yarn"
@@ -1601,6 +1602,18 @@ pub(crate) fn manager_position(context: &CompletionContext) -> Option<ManagerPos
     {
         return None;
     }
+    Some(ManagerPosition {
+        spec: scan.spec,
+        position,
+        project_dir: scan.project_dir,
+        workspace_root: scan.workspace_root,
+        recursive: scan.recursive,
+        include_workspace_root: scan.include_workspace_root,
+        if_present: scan.if_present,
+    })
+}
+
+fn manager_position_from_scan(scan: &ManagerScan<'_>) -> Option<Position> {
     let position = if scan.active_index == 0 {
         Position::ManagerWord
     } else if scan.command_index == scan.active_index {
@@ -1625,15 +1638,34 @@ pub(crate) fn manager_position(context: &CompletionContext) -> Option<ManagerPos
             return None;
         }
     };
-    Some(ManagerPosition {
-        spec: scan.spec,
-        position,
-        project_dir: scan.project_dir,
-        workspace_root: scan.workspace_root,
-        recursive: scan.recursive,
-        include_workspace_root: scan.include_workspace_root,
-        if_present: scan.if_present,
-    })
+    Some(position)
+}
+
+pub(crate) fn manager_has_multiple_selectors_at_completion(context: &CompletionContext) -> bool {
+    let Some(ManagerScanResult::Ready(scan)) = scan_manager(context) else {
+        return false;
+    };
+    if !scan.multiple_selectors {
+        return false;
+    }
+    if manager_position_from_scan(&scan).is_some() {
+        return true;
+    }
+    // Once a script value has been entered, `manager_position_from_scan` no
+    // longer reports a slot for trailing arguments. Keep whole-line history
+    // deferred there as well, otherwise a duplicate selector can reintroduce
+    // a stale script after ProjectProvider has intentionally gone quiet.
+    let Some(command) = scan.words.get(scan.command_index).copied() else {
+        return false;
+    };
+    let script_command = is_script_keyword(scan.spec, command)
+        || (scan.spec.keyword.is_none()
+            && !scan
+                .spec
+                .subcommands
+                .iter()
+                .any(|(subcommand, _)| *subcommand == command));
+    script_command && scan.active_index > scan.operand_index
 }
 
 pub(crate) fn manager_command(context: &CompletionContext) -> Option<&str> {

@@ -44,7 +44,7 @@ pub(super) fn route_terminal_input(
 ) -> crate::Result<()> {
     let routed = router.route(bytes, Instant::now());
     for reply in routed.replies {
-        if handle_terminal_reply(reply, output)? {
+        if handle_terminal_reply(reply, state, output)? {
             render_current(state, output)?;
         }
     }

@@ -59,8 +59,16 @@ impl InputDecoder {
         let mut events = Vec::new();
         loop {
             if self.paste_mode {
+                let previous_len = self.paste_raw.len();
                 self.paste_raw.append(&mut self.pending);
-                if let Some(end) = find_subslice(&self.paste_raw, PASTE_END) {
+                // Every earlier byte was already searched on the previous
+                // feed. Only a suffix which overlaps the newly appended bytes
+                // can contain the first terminator, keeping one-byte paste
+                // streams linear instead of repeatedly rescanning up to 1 MiB.
+                let search_start = previous_len.saturating_sub(PASTE_END.len() - 1);
+                if let Some(end) = find_subslice(&self.paste_raw[search_start..], PASTE_END)
+                    .map(|end| search_start + end)
+                {
                     let consumed = end + PASTE_END.len();
                     let raw: Vec<_> = self.paste_raw.drain(..consumed).collect();
                     self.pending = std::mem::take(&mut self.paste_raw);
@@ -337,6 +345,30 @@ mod tests {
             assert_eq!(events.len(), 1, "sequence {raw:?}");
             assert_eq!(events[0].kind, expected, "sequence {raw:?}");
             assert_eq!(events[0].raw, raw, "sequence {raw:?}");
+        }
+    }
+
+    #[test]
+    fn unknown_special_key_protocols_round_trip_at_every_split() {
+        for fixture in [
+            b"\x1bOP".as_slice(),
+            b"\x1b[15;5~".as_slice(),
+            b"\x1b[1;5A".as_slice(),
+            b"\x1b[57366;5u".as_slice(),
+            b"\x1b[27;5;99~".as_slice(),
+            b"\x1b[<0;10;5M".as_slice(),
+            b"\x9b1;5A".as_slice(),
+        ] {
+            for split in 0..=fixture.len() {
+                let mut decoder = InputDecoder::default();
+                let mut events = decoder.feed(&fixture[..split]);
+                events.extend(decoder.feed(&fixture[split..]));
+                if let Some(event) = decoder.flush_ambiguous() {
+                    events.push(event);
+                }
+                let raw: Vec<_> = events.into_iter().flat_map(|event| event.raw).collect();
+                assert_eq!(raw, fixture, "split {split} for {fixture:?}");
+            }
         }
     }
 

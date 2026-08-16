@@ -12,6 +12,13 @@ pub enum TerminalQueryKind {
     SynchronizedOutput,
 }
 
+impl TerminalQueryKind {
+    /// Explicit name for the private DECXCPR behavior used by Hokan. The enum
+    /// variant keeps its original public name for source compatibility.
+    #[allow(non_upper_case_globals)]
+    pub const CursorPositionPrivate: Self = Self::CursorPosition;
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RegisteredQuery {
     pub id: QueryId,
@@ -61,10 +68,9 @@ pub struct TerminalReplyRouter {
     late: Vec<LateQuery>,
     candidate: Vec<u8>,
     candidate_started: Option<Instant>,
-    /// Once a foreground child owns the PTY, a timed-out Hokan query must not
-    /// keep filtering the child's own terminal replies.  A query which was
-    /// already written before the hand-off is still matched in order; only
-    /// the grace-period filter for late replies is removed.
+    /// Whether the foreground child currently owns the PTY. Late Hokan
+    /// replies are quarantined only while the shell owns input; a foreground
+    /// TUI can issue the same private terminal queries itself.
     foreground: bool,
 }
 
@@ -98,7 +104,11 @@ impl TerminalReplyRouter {
         });
 
         let bytes = match kind {
-            TerminalQueryKind::CursorPosition => b"\x1b[6n" as &'static [u8],
+            // Standard CPR replies (`CSI row;col R`) collide byte-for-byte
+            // with xterm's modified F3 keys (`CSI 1;modifier R`). DECXCPR
+            // adds the private `?` marker, so user shortcuts can never be
+            // consumed as Hokan's cursor response.
+            TerminalQueryKind::CursorPositionPrivate => b"\x1b[?6n" as &'static [u8],
             TerminalQueryKind::SynchronizedOutput => b"\x1b[?2026$p",
         };
         Ok(RegisteredQuery { id, bytes })
@@ -108,21 +118,18 @@ impl TerminalReplyRouter {
     ///
     /// Hokan probes are emitted just before a command is handed to the child,
     /// so an outstanding probe may legitimately finish after that hand-off.
-    /// Keeping that one outstanding registration preserves ordering, while
-    /// dropping the late-reply quarantine prevents a TUI/SSH client's CPR or
-    /// DECRQM response from being mistaken for an expired Hokan probe.
+    /// Keeping that one outstanding registration preserves ordering. Expired
+    /// probes are released at the hand-off because a foreground TUI can issue
+    /// the same terminal queries and their replies are indistinguishable.
     pub fn set_foreground(&mut self, foreground: bool) -> Vec<u8> {
         self.foreground = foreground;
         if !foreground {
             return Vec::new();
         }
+        // A late candidate belongs to the foreground program once the hand-off
+        // has happened. Only a partial reply for the one query that is still
+        // outstanding remains ordered across the hand-off.
         self.late.clear();
-
-        // A partial reply for the one query that is still outstanding must
-        // remain ordered across the hand-off. A candidate held only by the
-        // expired-query quarantine, however, now belongs to the foreground
-        // program and must be released instead of resurfacing at the next
-        // Hokan probe after that program exits.
         let belongs_to_outstanding = self.outstanding.is_some_and(|query| {
             matches!(
                 classify(query.kind, &self.candidate),
@@ -150,11 +157,6 @@ impl TerminalReplyRouter {
         if let Some(outstanding) = self.outstanding
             && now >= outstanding.deadline
         {
-            let partial_reply = !self.candidate.is_empty()
-                && matches!(
-                    classify(outstanding.kind, &self.candidate),
-                    CandidateState::Potential
-                );
             routed.replies.push(TerminalReply::Timeout {
                 query_id: outstanding.id,
                 kind: outstanding.kind,
@@ -162,9 +164,6 @@ impl TerminalReplyRouter {
             self.outstanding = None;
             if !self.foreground {
                 self.remember_late(outstanding.kind, now);
-            }
-            if partial_reply {
-                self.candidate_started = Some(now);
             }
         }
         self.flush_stale_candidate(now, &mut routed);
@@ -194,8 +193,7 @@ impl TerminalReplyRouter {
         }
         self.candidate.push(byte);
         if self.candidate.len() > MAX_REPLY_BYTES {
-            routed.input.append(&mut self.candidate);
-            self.candidate_started = None;
+            self.release_candidate_preserving_fresh_escape(now, routed);
             return;
         }
 
@@ -244,7 +242,29 @@ impl TerminalReplyRouter {
         }
 
         if !potential {
-            routed.input.append(&mut self.candidate);
+            self.release_candidate_preserving_fresh_escape(now, routed);
+        }
+    }
+
+    fn release_candidate_preserving_fresh_escape(
+        &mut self,
+        now: Instant,
+        routed: &mut RoutedInput,
+    ) {
+        // The byte which invalidated one candidate may itself start the next
+        // terminal reply. This matters for `ESC ESC [ ? ... R`: the first Esc
+        // belongs to the user while the second begins a valid DECXCPR reply.
+        // Release the invalid prefix, then keep the trailing Esc for the next
+        // bytes instead of leaking the whole reply into the child.
+        let fresh_escape = self.candidate.last() == Some(&0x1b);
+        if fresh_escape {
+            self.candidate.pop();
+        }
+        routed.input.append(&mut self.candidate);
+        if fresh_escape {
+            self.candidate.push(0x1b);
+            self.candidate_started = Some(now);
+        } else {
             self.candidate_started = None;
         }
     }
@@ -274,10 +294,18 @@ impl TerminalReplyRouter {
                 CandidateState::Potential
             )
         });
-        let late_prefix_expired = self.candidate_started.is_some_and(|started| {
+        let prefix_expired = self.candidate_started.is_some_and(|started| {
             now.saturating_duration_since(started) >= LATE_REPLY_PREFIX_TIMEOUT
         });
-        if !outstanding_potential && (!late_potential || late_prefix_expired) {
+        // A bare Escape/Ctrl-[ belongs to the user even if it is also a prefix
+        // of Hokan's outstanding terminal reply. Bound that ambiguity to the
+        // same short window used for late replies instead of delaying the key
+        // until the full query timeout. The outstanding query remains
+        // registered, so a subsequent complete reply can still be consumed.
+        let escape_expired = self.candidate == b"\x1b" && prefix_expired;
+        let outstanding_blocks = outstanding_potential && !escape_expired;
+        let late_blocks = late_potential && !prefix_expired;
+        if !outstanding_blocks && !late_blocks {
             routed.input.append(&mut self.candidate);
             self.candidate_started = None;
         }
@@ -299,13 +327,13 @@ enum CandidateState {
 
 fn classify(kind: TerminalQueryKind, bytes: &[u8]) -> CandidateState {
     match kind {
-        TerminalQueryKind::CursorPosition => classify_cpr(bytes),
+        TerminalQueryKind::CursorPositionPrivate => classify_cpr(bytes),
         TerminalQueryKind::SynchronizedOutput => classify_sync_status(bytes),
     }
 }
 
 fn classify_cpr(bytes: &[u8]) -> CandidateState {
-    const PREFIX: &[u8] = b"\x1b[";
+    const PREFIX: &[u8] = b"\x1b[?";
     if bytes.len() <= PREFIX.len() {
         return if PREFIX.starts_with(bytes) {
             CandidateState::Potential
@@ -395,13 +423,13 @@ mod tests {
 
     #[test]
     fn cpr_is_consumed_for_every_chunk_split() {
-        let reply = b"\x1b[12;34R";
+        let reply = b"\x1b[?12;34R";
         for split in 0..=reply.len() {
             let now = Instant::now();
             let mut router = TerminalReplyRouter::default();
             let registration = router
                 .register(
-                    TerminalQueryKind::CursorPosition,
+                    TerminalQueryKind::CursorPositionPrivate,
                     now,
                     Duration::from_secs(1),
                 )
@@ -419,6 +447,19 @@ mod tests {
                 }]
             );
         }
+    }
+
+    #[test]
+    fn cursor_position_compatibility_name_uses_private_query_bytes() {
+        let mut router = TerminalReplyRouter::default();
+        let query = router
+            .register(
+                TerminalQueryKind::CursorPosition,
+                Instant::now(),
+                Duration::from_secs(1),
+            )
+            .expect("query should register");
+        assert_eq!(query.bytes, b"\x1b[?6n");
     }
 
     #[test]
@@ -458,7 +499,7 @@ mod tests {
         let mut malformed = TerminalReplyRouter::default();
         malformed
             .register(
-                TerminalQueryKind::CursorPosition,
+                TerminalQueryKind::CursorPositionPrivate,
                 now,
                 Duration::from_secs(1),
             )
@@ -470,23 +511,23 @@ mod tests {
         let mut timed_out = TerminalReplyRouter::default();
         let registration = timed_out
             .register(
-                TerminalQueryKind::CursorPosition,
+                TerminalQueryKind::CursorPositionPrivate,
                 now,
                 Duration::from_millis(1),
             )
             .expect("query should register");
-        assert!(timed_out.route(b"\x1b[12", now).input.is_empty());
+        assert!(timed_out.route(b"\x1b[?12", now).input.is_empty());
         let routed = timed_out.expire(now + Duration::from_millis(2));
         assert!(routed.input.is_empty());
         assert_eq!(
             routed.replies,
             vec![TerminalReply::Timeout {
                 query_id: registration.id,
-                kind: TerminalQueryKind::CursorPosition,
+                kind: TerminalQueryKind::CursorPositionPrivate,
             }]
         );
         let released = timed_out.expire(now + Duration::from_millis(2) + LATE_REPLY_PREFIX_TIMEOUT);
-        assert_eq!(released.input, b"\x1b[12");
+        assert_eq!(released.input, b"\x1b[?12");
     }
 
     #[test]
@@ -511,12 +552,12 @@ mod tests {
         let now = started + Duration::from_millis(2);
         let cursor = router
             .register(
-                TerminalQueryKind::CursorPosition,
+                TerminalQueryKind::CursorPositionPrivate,
                 now,
                 Duration::from_secs(1),
             )
             .expect("cursor query");
-        let routed = router.route(b"\x1b[?2026;2$y\x1b[12;34Rhello", now);
+        let routed = router.route(b"\x1b[?2026;2$y\x1b[?12;34Rhello", now);
         assert_eq!(routed.input, b"hello");
         assert_eq!(
             routed.replies,
@@ -552,13 +593,18 @@ mod tests {
         let mut router = TerminalReplyRouter::default();
         router
             .register(
-                TerminalQueryKind::CursorPosition,
+                TerminalQueryKind::CursorPositionPrivate,
                 started,
                 Duration::from_millis(1),
             )
             .expect("cursor query");
-        router.expire(started + Duration::from_millis(2));
         assert!(router.set_foreground(true).is_empty());
+        router.expire(started + Duration::from_millis(2));
+
+        let child_reply = b"\x1b[?12;34Rpayload";
+        let routed = router.route(child_reply, started + Duration::from_millis(2));
+        assert_eq!(routed.input, child_reply);
+        assert!(routed.replies.is_empty());
 
         let child_reply = b"\x1b[12;34Rpayload";
         let routed = router.route(child_reply, started + Duration::from_millis(2));
@@ -567,20 +613,54 @@ mod tests {
     }
 
     #[test]
-    fn foreground_handoff_releases_a_partial_expired_reply() {
+    fn late_replies_are_released_after_a_foreground_handoff() {
+        for (kind, hokan_reply, child_reply) in [
+            (
+                TerminalQueryKind::CursorPositionPrivate,
+                b"\x1b[?12;34R".as_slice(),
+                b"\x1b[?7;9R".as_slice(),
+            ),
+            (
+                TerminalQueryKind::SynchronizedOutput,
+                b"\x1b[?2026;2$y".as_slice(),
+                b"\x1b[?2026;1$y".as_slice(),
+            ),
+        ] {
+            let started = Instant::now();
+            let mut router = TerminalReplyRouter::default();
+            router
+                .register(kind, started, Duration::from_millis(1))
+                .expect("terminal query");
+            router.expire(started + Duration::from_millis(2));
+            assert!(router.set_foreground(true).is_empty());
+
+            let mut replies = hokan_reply.to_vec();
+            replies.extend_from_slice(child_reply);
+            replies.extend_from_slice(b"payload");
+            let routed = router.route(&replies, started + Duration::from_millis(2));
+            let mut expected = hokan_reply.to_vec();
+            expected.extend_from_slice(child_reply);
+            expected.extend_from_slice(b"payload");
+            assert_eq!(routed.input, expected);
+            assert!(routed.replies.is_empty());
+        }
+    }
+
+    #[test]
+    fn foreground_handoff_keeps_a_partial_private_reply_ordered() {
         let started = Instant::now();
         let mut router = TerminalReplyRouter::default();
         router
             .register(
-                TerminalQueryKind::CursorPosition,
+                TerminalQueryKind::CursorPositionPrivate,
                 started,
                 Duration::from_millis(1),
             )
             .expect("cursor query");
-        assert!(router.route(b"\x1b[12", started).input.is_empty());
+        assert!(router.route(b"\x1b[?12", started).input.is_empty());
         router.expire(started + Duration::from_millis(2));
 
-        assert_eq!(router.set_foreground(true), b"\x1b[12");
+        assert_eq!(router.set_foreground(true), b"\x1b[?12");
         let routed = router.route(b";34Rpayload", started + Duration::from_millis(2));
         assert_eq!(routed.input, b";34Rpayload");
         assert!(routed.replies.is_empty());
@@ -592,14 +672,16 @@ mod tests {
         let mut router = TerminalReplyRouter::default();
         let query = router
             .register(
-                TerminalQueryKind::CursorPosition,
+                TerminalQueryKind::CursorPositionPrivate,
                 started,
                 Duration::from_secs(1),
             )
             .expect("cursor query");
-        assert!(router.route(b"\x1b[12", started).input.is_empty());
+        assert!(router.route(b"\x1b[?12", started).input.is_empty());
         assert!(router.set_foreground(true).is_empty());
-        let routed = router.route(b";34R", started);
+        let delayed = started + LATE_REPLY_PREFIX_TIMEOUT;
+        assert!(router.expire(delayed).input.is_empty());
+        let routed = router.route(b";34R", delayed);
         assert_eq!(routed.input, b"");
         assert_eq!(
             routed.replies,
@@ -608,5 +690,155 @@ mod tests {
                 position: CellPos::new(11, 33),
             }]
         );
+    }
+
+    #[test]
+    fn outstanding_probe_releases_a_bare_escape_after_the_prefix_window() {
+        let started = Instant::now();
+        let mut router = TerminalReplyRouter::default();
+        let query = router
+            .register(
+                TerminalQueryKind::CursorPositionPrivate,
+                started,
+                Duration::from_secs(1),
+            )
+            .expect("cursor query");
+        assert!(router.route(b"\x1b", started).input.is_empty());
+
+        let released = router.expire(started + LATE_REPLY_PREFIX_TIMEOUT);
+        assert_eq!(released.input, b"\x1b");
+        assert!(released.replies.is_empty());
+
+        let routed = router.route(b"\x1b[?12;34R", started + LATE_REPLY_PREFIX_TIMEOUT);
+        assert!(routed.input.is_empty());
+        assert_eq!(
+            routed.replies,
+            vec![TerminalReply::CursorPosition {
+                query_id: query.id,
+                position: CellPos::new(11, 33),
+            }]
+        );
+    }
+
+    #[test]
+    fn query_timeout_does_not_restart_the_escape_prefix_window() {
+        let started = Instant::now();
+        let mut router = TerminalReplyRouter::default();
+        router
+            .register(
+                TerminalQueryKind::CursorPositionPrivate,
+                started,
+                Duration::from_millis(16),
+            )
+            .expect("cursor query");
+        assert!(router.route(b"\x1b", started).input.is_empty());
+
+        let timed_out = router.expire(started + Duration::from_millis(16));
+        assert!(timed_out.input.is_empty());
+        assert!(matches!(
+            timed_out.replies.as_slice(),
+            [TerminalReply::Timeout { .. }]
+        ));
+
+        let released = router.expire(started + LATE_REPLY_PREFIX_TIMEOUT);
+        assert_eq!(released.input, b"\x1b");
+    }
+
+    #[test]
+    fn fresh_escape_after_an_invalid_candidate_can_start_a_reply() {
+        for prefix in [b"\x1b".as_slice(), b"\x1b[?12".as_slice()] {
+            let started = Instant::now();
+            let mut router = TerminalReplyRouter::default();
+            let query = router
+                .register(
+                    TerminalQueryKind::CursorPositionPrivate,
+                    started,
+                    Duration::from_secs(1),
+                )
+                .expect("cursor query");
+            let mut bytes = prefix.to_vec();
+            bytes.extend_from_slice(b"\x1b[?3;4R");
+
+            let routed = router.route(&bytes, started);
+            assert_eq!(routed.input, prefix);
+            assert_eq!(
+                routed.replies,
+                vec![TerminalReply::CursorPosition {
+                    query_id: query.id,
+                    position: CellPos::new(2, 3),
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn keyboard_protocol_sequences_never_collide_with_private_cursor_reports() {
+        let started = Instant::now();
+        let mut router = TerminalReplyRouter::default();
+        let query = router
+            .register(
+                TerminalQueryKind::CursorPositionPrivate,
+                started,
+                Duration::from_secs(1),
+            )
+            .expect("cursor query");
+
+        for key in [
+            b"\x00".as_slice(),
+            b"\x03".as_slice(),
+            b"\x11".as_slice(),
+            b"\x13".as_slice(),
+            b"\x1a".as_slice(),
+            b"\x1c".as_slice(),
+            b"\x1bx".as_slice(),
+            b"\x1b[Z".as_slice(),
+            b"\x1b[1;5A".as_slice(),
+            b"\x1b[1;3D".as_slice(),
+            b"\x1b[1;2H".as_slice(),
+            b"\x1b[1;6F".as_slice(),
+            b"\x1b[1;1R".as_slice(),
+            b"\x1b[1;2R".as_slice(),
+            b"\x1b[1;3R".as_slice(),
+            b"\x1b[1;4R".as_slice(),
+            b"\x1b[1;5R".as_slice(),
+            b"\x1b[1;6R".as_slice(),
+            b"\x1b[1;7R".as_slice(),
+            b"\x1b[1;8R".as_slice(),
+            b"\x1b[13;2u".as_slice(),
+            b"\x1b[32;5u".as_slice(),
+            b"\x1b[97;1:2u".as_slice(),
+            b"\x1b[97;1:3u".as_slice(),
+            b"\x1b[27;5;99~".as_slice(),
+        ] {
+            let mut forwarded = Vec::new();
+            for byte in key {
+                let routed = router.route(std::slice::from_ref(byte), started);
+                forwarded.extend(routed.input);
+                assert!(routed.replies.is_empty());
+            }
+            assert_eq!(forwarded, key);
+        }
+
+        let routed = router.route(b"\x1b[?12;34R", started);
+        assert!(routed.input.is_empty());
+        assert_eq!(
+            routed.replies,
+            vec![TerminalReply::CursorPosition {
+                query_id: query.id,
+                position: CellPos::new(11, 33),
+            }]
+        );
+
+        let mut late = TerminalReplyRouter::default();
+        late.register(
+            TerminalQueryKind::CursorPositionPrivate,
+            started,
+            Duration::from_millis(1),
+        )
+        .expect("cursor query");
+        late.expire(started + Duration::from_millis(2));
+        let routed = late.route(b"\x1b[1;5R", started + Duration::from_millis(2));
+        assert_eq!(routed.input, b"\x1b[1;5R");
+        assert!(routed.replies.is_empty());
     }
 }

@@ -5,7 +5,11 @@ use std::{
     time::Instant,
 };
 
-use super::{super::buffer::EditableBuffer, worker::ProviderWorker};
+use super::{
+    super::buffer::EditableBuffer,
+    cursor_probe::{CursorProbeBackend, PendingTmuxCursor},
+    worker::ProviderWorker,
+};
 use crate::{
     completion::{BufferSnapshot, Candidate, CompletionContext, CompletionMode, SyncQuality},
     diagnostics::DebugLog,
@@ -51,6 +55,10 @@ pub(super) struct RuntimeState {
     pub(super) status: Option<String>,
     pub(super) escape_deadline: Option<Instant>,
     pub(super) need_cpr: bool,
+    pub(super) cursor_probe_backend: CursorProbeBackend,
+    pub(super) cursor_probe_generation: u64,
+    pub(super) pending_tmux_cursor: Option<PendingTmuxCursor>,
+    pub(super) tmux_cursor_retry_at: Option<Instant>,
     pub(super) pending_command: Option<String>,
     /// Last command recorded as executed in this session; feeds the
     /// transition bigram signal on the next completion query.
@@ -131,6 +139,10 @@ impl RuntimeState {
             status: None,
             escape_deadline: None,
             need_cpr: false,
+            cursor_probe_backend: CursorProbeBackend::TerminalPrivate,
+            cursor_probe_generation: 0,
+            pending_tmux_cursor: None,
+            tmux_cursor_retry_at: None,
             pending_command: None,
             previous_command: None,
             workspace_probe: crate::project::WorkspaceProbe::default(),

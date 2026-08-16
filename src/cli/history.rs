@@ -116,6 +116,7 @@ fn import(
             exit_code: None,
             imported: true,
             occurrences: 1,
+            cwd_occurrences: None,
         });
         imported = imported.saturating_add(1);
     }

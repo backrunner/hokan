@@ -9,7 +9,10 @@ use std::{
 use fs2::FileExt;
 
 use super::*;
-use crate::shell::ShellKind;
+use crate::{
+    history::{HistoryIndex, HistoryPolicy, is_failed_exit},
+    shell::ShellKind,
+};
 
 fn event(command: &str) -> HistoryEventV1 {
     HistoryEventV1 {
@@ -21,7 +24,19 @@ fn event(command: &str) -> HistoryEventV1 {
         exit_code: Some(0),
         imported: false,
         occurrences: 1,
+        cwd_occurrences: Some(1),
     }
+}
+
+#[test]
+fn legacy_events_default_to_unknown_cwd_occurrences() {
+    let mut value = serde_json::to_value(event("pnpm dev")).expect("serialize event");
+    value
+        .as_object_mut()
+        .expect("event object")
+        .remove("cwd_occurrences");
+    let decoded: HistoryEventV1 = serde_json::from_value(value).expect("decode legacy event");
+    assert_eq!(decoded.cwd_occurrences, None);
 }
 
 #[test]
@@ -145,6 +160,113 @@ fn compaction_aggregates_and_survives_the_rename_truncate_crash_window() {
             .map(|event| event.occurrences)
             .sum::<u64>(),
         3
+    );
+}
+
+#[test]
+fn compaction_preserves_per_directory_command_counts() {
+    let directory = tempfile::tempdir().expect("directory");
+    let store = HistoryStore::open(directory.path()).expect("store");
+    let mut first = event("pnpm dev");
+    first.cwd = Some(PathBuf::from("/project-a"));
+    first.timestamp_ms = 1;
+    let mut second = first.clone();
+    second.timestamp_ms = 2;
+    let mut other = event("pnpm dev");
+    other.cwd = Some(PathBuf::from("/project-b"));
+    other.timestamp_ms = 3;
+    store
+        .append_many(&[first, second, other])
+        .expect("append events");
+    store.compact().expect("compact");
+
+    let mut events = store.read().expect("read").events;
+    events.sort_by(|left, right| left.cwd.cmp(&right.cwd));
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].cwd, Some(PathBuf::from("/project-a")));
+    assert_eq!(events[0].occurrences, 2);
+    assert_eq!(events[0].cwd_occurrences, Some(2));
+    assert_eq!(events[1].cwd, Some(PathBuf::from("/project-b")));
+    assert_eq!(events[1].occurrences, 1);
+    assert_eq!(events[1].cwd_occurrences, Some(1));
+}
+
+#[test]
+fn compaction_extends_the_conservative_count_from_legacy_snapshots() {
+    let directory = tempfile::tempdir().expect("directory");
+    let store = HistoryStore::open(directory.path()).expect("store");
+    let mut legacy = event("pnpm dev");
+    legacy.occurrences = 100;
+    legacy.cwd_occurrences = None;
+    let current = event("pnpm dev");
+    store
+        .append_many(&[legacy, current])
+        .expect("append events");
+    store.compact().expect("compact");
+
+    let events = store.read().expect("read").events;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].occurrences, 101);
+    assert_eq!(
+        events[0].cwd_occurrences,
+        Some(2),
+        "the legacy row proves one local run and the new row adds another"
+    );
+}
+
+#[test]
+fn compaction_keeps_successful_and_failed_counts_separate() {
+    let directory = tempfile::tempdir().expect("directory");
+    let project = tempfile::tempdir().expect("project");
+    let project_root = project.path().canonicalize().expect("canonical project");
+    let store = HistoryStore::open(directory.path()).expect("store");
+
+    let mut successful = event("pnpm dev");
+    successful.cwd = Some(project_root.clone());
+    successful.occurrences = 3;
+    successful.cwd_occurrences = Some(3);
+    let mut failed = successful.clone();
+    failed.timestamp_ms = 2;
+    failed.exit_code = Some(1);
+    failed.occurrences = 5;
+    failed.cwd_occurrences = Some(5);
+    store
+        .append_many(&[successful, failed])
+        .expect("append events");
+
+    let report = store.compact().expect("compact");
+    assert_eq!(report.records_after, 2);
+    assert_eq!(report.logical_events, 8);
+    let events = store.read().expect("read").events;
+    let successful = events
+        .iter()
+        .find(|event| !is_failed_exit(event.exit_code))
+        .expect("successful aggregate");
+    let failed = events
+        .iter()
+        .find(|event| is_failed_exit(event.exit_code))
+        .expect("failed aggregate");
+    assert_eq!(successful.occurrences, 3);
+    assert_eq!(successful.cwd_occurrences, Some(3));
+    assert_eq!(failed.occurrences, 5);
+    assert_eq!(failed.cwd_occurrences, Some(5));
+
+    let policy = HistoryPolicy::new(1024, &[]).expect("policy");
+    let mut index = HistoryIndex::default();
+    for event in &events {
+        index.ingest_event(event, &policy);
+    }
+    assert_eq!(
+        index.search("pnpm dev", &project_root, 2, 1)[0]
+            .record
+            .count,
+        3,
+        "failed occurrences must not inflate global frequency"
+    );
+    assert_eq!(
+        index.usage_frecency_in_project("pnpm dev", &project_root, 2),
+        156,
+        "project frequency must count only the three successful runs"
     );
 }
 

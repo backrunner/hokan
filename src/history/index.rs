@@ -94,6 +94,12 @@ pub struct HistoryMatch {
     pub failed_penalty: i16,
 }
 
+#[derive(Clone, Debug, Default)]
+struct DirectoryUsage {
+    count: u64,
+    last_used_ms: i64,
+}
+
 struct RankedRecord<'a> {
     record: &'a HistoryRecord,
     quality: i16,
@@ -104,6 +110,14 @@ struct RankedRecord<'a> {
 #[derive(Clone, Debug, Default)]
 pub struct HistoryIndex {
     records: HashMap<String, HistoryRecord>,
+    /// Successful usage counts for each normalized command, partitioned by
+    /// the directory in which it was executed. Imported history normally has
+    /// no cwd and therefore does not contribute to project-local ranking.
+    cwd_usage: HashMap<String, HashMap<PathBuf, DirectoryUsage>>,
+    /// Canonicalizing every event in a large history log is expensive. Cache
+    /// the result per distinct cwd while retaining nonexistent old paths as
+    /// they were recorded.
+    cwd_normalizations: HashMap<PathBuf, PathBuf>,
     /// Bigram of consecutive executed commands per shell stream:
     /// previous skeleton -> next skeleton -> observed count.
     transitions: HashMap<String, HashMap<String, u64>>,
@@ -134,17 +148,58 @@ impl HistoryIndex {
         exit_code: Option<i32>,
         policy: &HistoryPolicy,
     ) -> bool {
+        self.ingest_weighted_with_cwd_scope(
+            command,
+            timestamp_ms,
+            shell,
+            cwd,
+            occurrences,
+            occurrences,
+            exit_code,
+            policy,
+        )
+    }
+
+    pub fn ingest_event(&mut self, event: &HistoryEventV1, policy: &HistoryPolicy) -> bool {
+        self.ingest_weighted_with_cwd_scope(
+            &event.command,
+            event.timestamp_ms,
+            event.shell,
+            event.cwd.as_deref(),
+            event.occurrences,
+            event
+                .cwd_occurrences
+                .unwrap_or(1)
+                .clamp(1, event.occurrences.max(1)),
+            event.exit_code,
+            policy,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ingest_weighted_with_cwd_scope(
+        &mut self,
+        command: &str,
+        timestamp_ms: i64,
+        shell: ShellKind,
+        cwd: Option<&Path>,
+        occurrences: u64,
+        cwd_occurrences: u64,
+        exit_code: Option<i32>,
+        policy: &HistoryPolicy,
+    ) -> bool {
         if occurrences == 0 {
             return false;
         }
         if !policy.allows(command) {
             return false;
         }
-        self.record_transition(shell, command);
         let normalized = normalize(command);
+        let normalized_cwd = cwd.map(|cwd| self.normalized_cwd(cwd));
+        self.record_transition(shell, command);
         let record = self
             .records
-            .entry(normalized)
+            .entry(normalized.clone())
             .or_insert_with(|| HistoryRecord {
                 command: command.trim().to_owned(),
                 count: 0,
@@ -159,6 +214,18 @@ impl HistoryIndex {
         // that keeps failing is not a command worth recommending more.
         if !is_failed_exit(exit_code) {
             record.count = record.count.saturating_add(occurrences);
+        }
+        if let Some(cwd) = normalized_cwd.as_deref() {
+            let usage = self
+                .cwd_usage
+                .entry(normalized)
+                .or_default()
+                .entry(cwd.to_owned())
+                .or_default();
+            if !is_failed_exit(exit_code) {
+                usage.count = usage.count.saturating_add(cwd_occurrences);
+            }
+            usage.last_used_ms = usage.last_used_ms.max(timestamp_ms);
         }
         if timestamp_ms >= record.last_used_ms {
             record.command = command.trim().to_owned();
@@ -185,6 +252,16 @@ impl HistoryIndex {
                 .entry(skeleton)
                 .or_insert(0) += 1;
         }
+    }
+
+    fn normalized_cwd(&mut self, cwd: &Path) -> PathBuf {
+        if let Some(normalized) = self.cwd_normalizations.get(cwd) {
+            return normalized.clone();
+        }
+        let normalized = normalize_history_cwd(cwd);
+        self.cwd_normalizations
+            .insert(cwd.to_owned(), normalized.clone());
+        normalized
     }
 
     /// Score how strongly `candidate` follows `previous` in the recorded
@@ -214,24 +291,43 @@ impl HistoryIndex {
         let Some(record) = self.records.get(&normalize(command)) else {
             return 0;
         };
-        let age_hours = now_ms.saturating_sub(record.last_used_ms).max(0) / 3_600_000;
-        let recency = 150_i64.saturating_sub(age_hours.min(150));
-        let frequency = (record.count.min(50) * 2) as i64;
-        (recency + frequency).min(200) as i16
+        frecency_score(record.last_used_ms, record.count, now_ms)
+    }
+
+    /// Usage-based frecency of an exact command line, limited to executions
+    /// whose cwd is the project root or one of its descendants. History rows
+    /// without a cwd are deliberately excluded because their project cannot
+    /// be established reliably. Project discovery supplies a canonical root,
+    /// matching the canonical cwd keys retained by this index.
+    #[must_use]
+    pub fn usage_frecency_in_project(
+        &self,
+        command: &str,
+        project_root: &Path,
+        now_ms: i64,
+    ) -> i16 {
+        let normalized = normalize(command);
+        let Some(usages) = self.cwd_usage.get(&normalized) else {
+            return 0;
+        };
+        let mut count = 0_u64;
+        let mut last_used_ms = i64::MIN;
+        for (cwd, usage) in usages {
+            if cwd == project_root || cwd.starts_with(project_root) {
+                count = count.saturating_add(usage.count);
+                last_used_ms = last_used_ms.max(usage.last_used_ms);
+            }
+        }
+        if last_used_ms == i64::MIN || count == 0 {
+            return 0;
+        }
+        frecency_score(last_used_ms, count, now_ms)
     }
 
     pub fn merge_events_absolute(&mut self, events: &[HistoryEventV1], policy: &HistoryPolicy) {
         let mut incoming = Self::default();
         for event in events {
-            incoming.ingest_weighted(
-                &event.command,
-                event.timestamp_ms,
-                event.shell,
-                event.cwd.as_deref(),
-                event.occurrences,
-                event.exit_code,
-                policy,
-            );
+            incoming.ingest_event(event, policy);
         }
         for (normalized, incoming) in incoming.records {
             match self.records.get_mut(&normalized) {
@@ -246,6 +342,14 @@ impl HistoryIndex {
                 None => {
                     self.records.insert(normalized, incoming);
                 }
+            }
+        }
+        for (normalized, incoming_usages) in incoming.cwd_usage {
+            let usages = self.cwd_usage.entry(normalized).or_default();
+            for (cwd, incoming_usage) in incoming_usages {
+                let usage = usages.entry(cwd).or_default();
+                usage.count = usage.count.max(incoming_usage.count);
+                usage.last_used_ms = usage.last_used_ms.max(incoming_usage.last_used_ms);
             }
         }
         // Transitions are additive, so an absolute merge must rebuild them
@@ -353,6 +457,17 @@ fn compare_ranked(left: &RankedRecord<'_>, right: &RankedRecord<'_>) -> Ordering
 
 fn normalize(command: &str) -> String {
     command.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn frecency_score(last_used_ms: i64, count: u64, now_ms: i64) -> i16 {
+    let age_hours = now_ms.saturating_sub(last_used_ms).max(0) / 3_600_000;
+    let recency = 150_i64.saturating_sub(age_hours.min(150));
+    let frequency = (count.min(50) * 2) as i64;
+    (recency + frequency).min(200) as i16
+}
+
+fn normalize_history_cwd(cwd: &Path) -> PathBuf {
+    std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_owned())
 }
 
 fn looks_sensitive(command: &str) -> bool {
@@ -500,6 +615,64 @@ mod tests {
     }
 
     #[test]
+    fn project_frecency_uses_only_cwds_inside_the_project() {
+        let policy = HistoryPolicy::new(1024, &[]).expect("policy");
+        let project = tempfile::tempdir().expect("project");
+        let nested = project.path().join("packages/app");
+        let other = tempfile::tempdir().expect("other");
+        std::fs::create_dir_all(&nested).expect("nested");
+        let project_root = project.path().canonicalize().expect("canonical project");
+        let nested = nested.canonicalize().expect("canonical nested");
+        let other = other.path().canonicalize().expect("canonical other");
+        let mut index = HistoryIndex::default();
+
+        for round in 0..10 {
+            index.ingest(
+                "pnpm dev",
+                1_000 + round,
+                ShellKind::Zsh,
+                Some(&nested),
+                Some(0),
+                &policy,
+            );
+        }
+        for round in 0..100 {
+            index.ingest(
+                "pnpm build",
+                2_000 + round,
+                ShellKind::Zsh,
+                Some(&other),
+                Some(0),
+                &policy,
+            );
+        }
+        // Imported rows have no cwd and must not acquire an invented project.
+        index.ingest("pnpm deploy", 3_000, ShellKind::Zsh, None, Some(0), &policy);
+        index.ingest(
+            "pnpm broken",
+            3_000,
+            ShellKind::Zsh,
+            Some(&project_root),
+            Some(1),
+            &policy,
+        );
+
+        let dev = index.usage_frecency_in_project("pnpm dev", &project_root, 3_000);
+        let build = index.usage_frecency_in_project("pnpm build", &project_root, 3_000);
+        assert!(dev > build, "local usage must beat another project's usage");
+        assert_eq!(
+            index.usage_frecency_in_project("pnpm deploy", &project_root, 3_000),
+            0,
+            "cwd-less imports cannot affect project ranking"
+        );
+        assert_eq!(
+            index.usage_frecency_in_project("pnpm broken", &project_root, 3_000),
+            0,
+            "a command that only failed cannot gain project frequency"
+        );
+    }
+
+    #[test]
     fn sigint_and_unknown_exit_codes_are_not_failures() {
         let policy = HistoryPolicy::new(1024, &[]).expect("policy");
         let mut index = HistoryIndex::default();
@@ -596,6 +769,7 @@ mod tests {
             exit_code: Some(0),
             imported: false,
             occurrences: 1,
+            cwd_occurrences: None,
         };
         let mut index = HistoryIndex::default();
         index.merge_events_absolute(
@@ -639,11 +813,70 @@ mod tests {
             exit_code: Some(0),
             imported: false,
             occurrences: 3,
+            cwd_occurrences: None,
         };
         index.merge_events_absolute(&[event], &policy);
         assert_eq!(
             index.search("git", Path::new("/"), 100, 1)[0].record.count,
             3
+        );
+    }
+
+    #[test]
+    fn absolute_merge_does_not_double_project_counts() {
+        let policy = HistoryPolicy::new(1024, &[]).expect("policy");
+        let project = tempfile::tempdir().expect("project");
+        let project_root = project.path().canonicalize().expect("canonical project");
+        let event = HistoryEventV1 {
+            event_id: None,
+            timestamp_ms: 100,
+            command: "pnpm dev".into(),
+            cwd: Some(project_root.clone()),
+            shell: ShellKind::Zsh,
+            exit_code: Some(0),
+            imported: false,
+            occurrences: 3,
+            cwd_occurrences: Some(3),
+        };
+        let mut index = HistoryIndex::default();
+        index.merge_events_absolute(std::slice::from_ref(&event), &policy);
+        index.merge_events_absolute(&[event], &policy);
+        assert_eq!(
+            index.usage_frecency_in_project("pnpm dev", &project_root, 100),
+            156,
+            "three occurrences score as 150 recency + 6 frequency"
+        );
+    }
+
+    #[test]
+    fn legacy_cross_directory_compaction_uses_a_conservative_project_count() {
+        let policy = HistoryPolicy::new(1024, &[]).expect("policy");
+        let project = tempfile::tempdir().expect("project");
+        let project_root = project.path().canonicalize().expect("canonical project");
+        let legacy = HistoryEventV1 {
+            event_id: None,
+            timestamp_ms: 100,
+            command: "pnpm dev".into(),
+            cwd: Some(project_root.clone()),
+            shell: ShellKind::Zsh,
+            exit_code: Some(0),
+            imported: false,
+            occurrences: 100,
+            cwd_occurrences: None,
+        };
+        let mut index = HistoryIndex::default();
+        index.ingest_event(&legacy, &policy);
+        assert_eq!(
+            index.usage_frecency_in_project("pnpm dev", &project_root, 100),
+            152,
+            "legacy global occurrences only prove one run in the recorded cwd"
+        );
+        assert_eq!(
+            index.search("pnpm dev", &project_root, 100, 1)[0]
+                .record
+                .count,
+            100,
+            "global history frequency remains backward compatible"
         );
     }
 

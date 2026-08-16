@@ -1,4 +1,5 @@
 mod control;
+mod cursor_probe;
 mod engine;
 mod history;
 mod input;
@@ -18,6 +19,7 @@ use std::{
 };
 
 use control::*;
+use cursor_probe::*;
 use engine::*;
 use history::*;
 use input::*;
@@ -36,7 +38,7 @@ use crate::{
         TerminalSize,
     },
 };
-use crossbeam_channel::{Receiver, select, unbounded};
+use crossbeam_channel::{Receiver, never, select, unbounded};
 use portable_pty::ExitStatus;
 
 pub(super) const ESCAPE_TIMEOUT: Duration = Duration::from_millis(24);
@@ -165,6 +167,14 @@ pub fn run_session(options: SessionOptions) -> crate::Result<u8> {
     );
     let mut decoder = InputDecoder::default();
     let mut reply_router = TerminalReplyRouter::default();
+    let tmux_cursor_probe = TmuxCursorProbe::start_from_env();
+    let mut tmux_cursor_results = tmux_cursor_probe
+        .as_ref()
+        .map(|probe| probe.results().clone())
+        .unwrap_or_else(never);
+    if tmux_cursor_probe.is_some() {
+        state.cursor_probe_backend = CursorProbeBackend::Tmux;
+    }
 
     let sync_query = reply_router.register(
         TerminalQueryKind::SynchronizedOutput,
@@ -240,6 +250,26 @@ pub fn run_session(options: SessionOptions) -> crate::Result<u8> {
                     handle_ai_result(result, &mut state, output.handle())?;
                 }
             }
+            recv(tmux_cursor_results) -> message => {
+                match message {
+                    Ok(result) => {
+                        if handle_tmux_cursor_result(result, &mut state, output.handle())? {
+                            render_current(&mut state, output.handle())?;
+                        }
+                    }
+                    Err(_) => {
+                        // A panicked or otherwise failed helper must not leave a
+                        // disconnected receiver permanently ready in `select!`.
+                        tmux_cursor_results = never();
+                        state.pending_tmux_cursor = None;
+                        state.tmux_cursor_retry_at = None;
+                        if state.cursor_probe_backend == CursorProbeBackend::Tmux {
+                            state.cursor_probe_backend = CursorProbeBackend::TerminalPrivate;
+                            state.need_cpr = state.editing && !state.foreground_process;
+                        }
+                    }
+                }
+            }
             default(LOOP_TICK) => {}
         }
 
@@ -265,13 +295,13 @@ pub fn run_session(options: SessionOptions) -> crate::Result<u8> {
                 )?;
             }
         }
-        // Keep terminal-reply ownership aligned with the shell state.  In
-        // particular, a timed-out Hokan probe must stop quarantining bytes as
-        // soon as a TUI/SSH child takes the foreground PTY.
+        // Keep terminal-reply ownership aligned with the shell state. Expired
+        // Hokan replies are released when a foreground child takes the PTY,
+        // because the child can issue the same terminal queries itself.
         let mut routed_input = reply_router.set_foreground(state.foreground_process);
         let expired = reply_router.expire(now);
         for reply in expired.replies {
-            if handle_terminal_reply(reply, output.handle())? {
+            if handle_terminal_reply(reply, &mut state, output.handle())? {
                 render_current(&mut state, output.handle())?;
             }
         }
@@ -287,7 +317,12 @@ pub fn run_session(options: SessionOptions) -> crate::Result<u8> {
             &config,
             &ai_sender,
         )?;
-        maybe_probe_cursor(&mut state, &mut reply_router, output.handle())?;
+        maybe_probe_cursor(
+            &mut state,
+            &mut reply_router,
+            tmux_cursor_probe.as_ref(),
+            output.handle(),
+        )?;
         state.refresh_help_results(&worker)?;
         flush_scheduled_frame(&mut state, output.handle())?;
         flush_pending_history(&mut state, &history_store)?;

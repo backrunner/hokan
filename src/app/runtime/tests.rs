@@ -17,7 +17,9 @@ use crate::config::Config;
 use crate::history::{HistoryCursor, HistoryIndex, HistoryPolicy, HistoryStore};
 use crate::platform::CommandPathCache;
 use crate::shell::{ControlMessage, ShellEvent, ShellKind};
-use crate::terminal::{BufferRevision, QueryId, RiskLevel, TerminalSize};
+use crate::terminal::{
+    BufferRevision, QueryId, RiskLevel, TerminalQueryKind, TerminalReply, TerminalSize,
+};
 
 fn runtime_state(directory: &Path) -> RuntimeState {
     RuntimeState::new(
@@ -34,6 +36,69 @@ fn runtime_state(directory: &Path) -> RuntimeState {
         Arc::new(crate::specs::SpecRegistry::default()),
         Arc::new(crate::providers::CommandHelpCache::default()),
     )
+}
+
+#[test]
+fn private_cursor_timeout_fails_closed_without_standard_cpr() {
+    let directory = tempfile::tempdir().expect("directory");
+    let mut state = runtime_state(directory.path());
+    state.need_cpr = true;
+    let (output, join) = test_output();
+
+    handle_terminal_reply(
+        TerminalReply::Timeout {
+            query_id: QueryId::new(1),
+            kind: TerminalQueryKind::CursorPositionPrivate,
+        },
+        &mut state,
+        &output,
+    )
+    .expect("cursor timeout");
+
+    assert_eq!(state.cursor_probe_backend, CursorProbeBackend::Unavailable);
+    assert!(!state.need_cpr);
+    output.restore_and_exit().expect("shutdown");
+    join.join().expect("actor joins").expect("actor exits");
+}
+
+#[test]
+fn stale_tmux_cursor_result_is_retried_with_a_cooldown() {
+    let directory = tempfile::tempdir().expect("directory");
+    let mut state = runtime_state(directory.path());
+    state.editing = true;
+    state.cursor_probe_backend = CursorProbeBackend::Tmux;
+    let (output, join) = test_output();
+    let output_state = output.state().expect("output state");
+    state.pending_tmux_cursor = Some(PendingTmuxCursor {
+        generation: 1,
+        buffer_revision: BufferRevision::new(1),
+        screen_revision: output_state.screen_revision,
+        screen_epoch: output_state.screen_epoch,
+        terminal_size: state.terminal_size,
+    });
+
+    let started = Instant::now();
+    assert!(
+        !handle_tmux_cursor_result(
+            TmuxCursorResult {
+                generation: 1,
+                position: Some(crate::terminal::CellPos::new(0, 0)),
+            },
+            &mut state,
+            &output,
+        )
+        .expect("stale result")
+    );
+
+    assert!(state.pending_tmux_cursor.is_none());
+    assert!(state.need_cpr);
+    assert!(
+        state
+            .tmux_cursor_retry_at
+            .is_some_and(|retry_at| { retry_at >= started + TMUX_CURSOR_RETRY_DELAY })
+    );
+    output.restore_and_exit().expect("shutdown");
+    join.join().expect("actor joins").expect("actor exits");
 }
 
 #[test]

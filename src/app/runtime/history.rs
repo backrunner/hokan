@@ -32,6 +32,7 @@ pub(super) fn record_history(
         exit_code,
         imported: false,
         occurrences: 1,
+        cwd_occurrences: Some(1),
     };
     {
         let mut index = history
@@ -94,15 +95,7 @@ pub(super) fn sync_history(
             {
                 continue;
             }
-            index.ingest_weighted(
-                &event.command,
-                event.timestamp_ms,
-                event.shell,
-                event.cwd.as_deref(),
-                event.occurrences,
-                event.exit_code,
-                policy,
-            );
+            index.ingest_event(event, policy);
         }
     }
     state.history_cursor = delta.cursor;

@@ -6,7 +6,10 @@ use std::{
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::mpsc::{self, Receiver},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc::{self, Receiver},
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -28,12 +31,16 @@ use tempfile::TempDir;
 const TIMEOUT: Duration = Duration::from_secs(30);
 const READ_POLL: Duration = Duration::from_millis(5);
 const SYNC_QUERY: &[u8] = b"\x1b[?2026$p";
-const CPR_QUERY: &[u8] = b"\x1b[6n";
+const HOKAN_CPR_QUERY: &[u8] = b"\x1b[?6n";
+const STANDARD_CPR_QUERY: &[u8] = b"\x1b[6n";
+const KITTY_KEYBOARD_QUERY: &[u8] = b"\x1b[?u";
+const DEVICE_ATTRIBUTES_QUERY: &[u8] = b"\x1b[c";
 const PASTE_START: &[u8] = b"\x1b[200~";
 const PASTE_END: &[u8] = b"\x1b[201~";
 const ENABLE_BRACKETED_PASTE: &[u8] = b"\x1b[?2004h";
 const DISABLE_BRACKETED_PASTE: &[u8] = b"\x1b[?2004l";
 const RESTORE_PRESENTATION: &[u8] = b"\x1b[?2004l\x1b[0m\x1b[?25h";
+static TMUX_SOCKET_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Source tag glyphs as rendered with the default `nerd_fonts = true`.
 const TAG_SPEC: &str = "\u{f02d}";
@@ -247,7 +254,7 @@ impl TerminalSession {
         Self::spawn_command(home, work, command, 2)
     }
 
-    fn spawn_in_tmux_36() -> Self {
+    fn spawn_in_tmux() -> Self {
         let (home, work) = fixture_directories();
         let tmux_config = home.path().join("tmux.conf");
         fs::write(
@@ -255,7 +262,11 @@ impl TerminalSession {
             "set -g status off\nset -g destroy-unattached on\nset -g exit-empty on\n",
         )
         .expect("tmux fixture config");
-        let socket = format!("hokan-test-{}", std::process::id());
+        let socket = format!(
+            "hokan-test-{}-{}",
+            std::process::id(),
+            TMUX_SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        );
         let mut command = CommandBuilder::new("tmux");
         command.arg("-L");
         command.arg(socket);
@@ -270,6 +281,8 @@ impl TerminalSession {
         command.arg("--shell");
         command.arg("zsh");
         configure_command(&mut command, &home, &work);
+        command.env_remove("TMUX");
+        command.env_remove("TMUX_PANE");
         Self::spawn_command(home, work, command, 2)
     }
 
@@ -364,8 +377,14 @@ impl TerminalSession {
         for &byte in chunk {
             self.terminal.process(std::slice::from_ref(&byte));
             self.probe_tail.push(byte);
-            if self.probe_tail.len() > SYNC_QUERY.len().max(CPR_QUERY.len()) {
-                let trim = self.probe_tail.len() - SYNC_QUERY.len().max(CPR_QUERY.len());
+            let max_query_len = SYNC_QUERY
+                .len()
+                .max(HOKAN_CPR_QUERY.len())
+                .max(STANDARD_CPR_QUERY.len())
+                .max(KITTY_KEYBOARD_QUERY.len())
+                .max(DEVICE_ATTRIBUTES_QUERY.len());
+            if self.probe_tail.len() > max_query_len {
+                let trim = self.probe_tail.len() - max_query_len;
                 self.probe_tail.drain(..trim);
             }
             if self.probe_tail.ends_with(SYNC_QUERY) {
@@ -373,7 +392,19 @@ impl TerminalSession {
                 self.write(reply.as_bytes());
                 self.sync_replies += 1;
                 self.probe_tail.clear();
-            } else if self.probe_tail.ends_with(CPR_QUERY) {
+            } else if self.probe_tail.ends_with(KITTY_KEYBOARD_QUERY) {
+                self.write(b"\x1b[?7u");
+                self.probe_tail.clear();
+            } else if self.probe_tail.ends_with(DEVICE_ATTRIBUTES_QUERY) {
+                self.write(b"\x1b[?1;2c");
+                self.probe_tail.clear();
+            } else if self.probe_tail.ends_with(HOKAN_CPR_QUERY) {
+                let (row, col) = self.terminal.screen().cursor_position();
+                let reply = format!("\x1b[?{};{}R", row + 1, col + 1);
+                self.write(reply.as_bytes());
+                self.cpr_replies += 1;
+                self.probe_tail.clear();
+            } else if self.probe_tail.ends_with(STANDARD_CPR_QUERY) {
                 let (row, col) = self.terminal.screen().cursor_position();
                 let reply = format!("\x1b[{};{}R", row + 1, col + 1);
                 self.write(reply.as_bytes());
@@ -1292,13 +1323,14 @@ fn termination_signals_restore_the_terminal_after_an_active_overlay() {
 }
 
 #[test]
-fn tmux_36_uses_fallback_even_when_the_outer_terminal_supports_mode_2026() {
+fn tmux_36_uses_out_of_band_cursor_probe() {
     if !command_exists("zsh") || !tmux_is_36() {
         return;
     }
-    let mut terminal = TerminalSession::spawn_in_tmux_36();
+    let mut terminal = TerminalSession::spawn_in_tmux();
     terminal.wait_for_screen("HK> ");
     terminal.settle(Duration::from_millis(500));
+    let probe_start = terminal.transcript.len();
     terminal.write(b"ls ");
     terminal.wait_for_screen(TAG_SPEC);
     terminal.write(b"\x1b[B\x1b[A");
@@ -1311,6 +1343,78 @@ fn tmux_36_uses_fallback_even_when_the_outer_terminal_supports_mode_2026() {
             .any(|window| window == b"\x1b[?2026h"),
         "tmux 3.6b must not receive pane-level synchronized update frames"
     );
+    assert!(
+        !terminal.transcript[probe_start..]
+            .windows(STANDARD_CPR_QUERY.len())
+            .any(|window| window == STANDARD_CPR_QUERY),
+        "Hokan must never issue an ambiguous standard CPR query under tmux"
+    );
+
+    terminal.exit_shell();
+    terminal.wait_until_exit();
+}
+
+#[test]
+fn tmux_forwards_every_modified_f3_encoding_to_a_foreground_tui() {
+    if !command_exists("zsh") || !command_exists("python3") || !command_exists("tmux") {
+        return;
+    }
+    let mut terminal = TerminalSession::spawn_in_tmux();
+    terminal.wait_for_screen("HK> ");
+    terminal.settle(Duration::from_millis(300));
+
+    let fixture = terminal._work.path().join("tmux-f3.py");
+    fs::write(
+        &fixture,
+        r#"import os
+import sys
+import termios
+import tty
+
+fd = sys.stdin.fileno()
+expected = int(sys.argv[1])
+saved = termios.tcgetattr(fd)
+tty.setraw(fd)
+try:
+    os.write(1, b"TMUX_F3_READY\r\n")
+    payload = bytearray()
+    while len(payload) < expected:
+        payload.extend(os.read(fd, expected - len(payload)))
+    os.write(1, b"TMUX_F3_INPUT=" + payload.hex().encode() + b"\r\n")
+finally:
+    termios.tcsetattr(fd, termios.TCSANOW, saved)
+"#,
+    )
+    .expect("tmux F3 fixture");
+
+    let input_chunks = [
+        b"\x1b[1;1R".as_slice(),
+        b"\x1b[1;2R".as_slice(),
+        b"\x1b[1;3R".as_slice(),
+        b"\x1b[1;4R".as_slice(),
+        b"\x1b[1;5R".as_slice(),
+        b"\x1b[1;6R".as_slice(),
+        b"\x1b[1;7R".as_slice(),
+        b"\x1b[1;8R".as_slice(),
+    ];
+    let input = input_chunks.concat();
+    let expected_hex = input
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let command_start = terminal.transcript.len();
+    terminal.write(format!("python3 ./tmux-f3.py {}\r", input.len()).as_bytes());
+    terminal.wait_for_bytes_since(command_start, b"TMUX_F3_READY");
+    for chunk in input_chunks {
+        for byte in chunk.chunks(1) {
+            terminal.write(byte);
+        }
+    }
+    terminal.wait_for_bytes_since(
+        command_start,
+        format!("TMUX_F3_INPUT={expected_hex}").as_bytes(),
+    );
+    terminal.wait_for_bytes_since(command_start, b"HK> ");
 
     terminal.exit_shell();
     terminal.wait_until_exit();
@@ -1466,17 +1570,17 @@ tty.setraw(fd)
 try:
     os.write(1, b"\x1b[?2026h\x1b[?25l\x1b[?2004h\x1b[>7u\x1b[?u\x1b[c")
     os.write(1, b"\x1b[?1003h\x1b[?1004h\x1b[?1006h\x1b[?2031h")
-    os.write(1, b"\x1b[>4;2m\x1b]11;?\x07\x1b[?996n\x1b[6n")
+    os.write(1, b"\x1b[>4;2m\x1b]11;?\x07\x1b[?996n\x1b[6n\x1b[?6n\x1b[?2026$p")
     reply = bytearray()
     deadline = time.monotonic() + 5
-    while not reply.endswith(b"R"):
+    while reply.count(b"R") < 2 or not reply.endswith(b"$y"):
         remaining = deadline - time.monotonic()
         if remaining <= 0 or not select.select([fd], [], [], remaining)[0]:
-            raise RuntimeError("CPR timeout")
+            raise RuntimeError("terminal reply timeout")
         reply.extend(os.read(fd, 1))
-    if not (reply.startswith(b"\x1b[") and b";" in reply):
-        raise RuntimeError("invalid CPR")
-    os.write(1, b"\r\nTUI_CPR_OK\r\nTUI_INPUT_READY\r\n")
+    if not (reply.startswith(b"\x1b[?7u\x1b[?1;2c\x1b[") and b"R\x1b[?" in reply):
+        raise RuntimeError("invalid terminal replies")
+    os.write(1, b"\r\nTUI_PROTOCOL_OK\r\nTUI_INPUT_READY\r\n")
     payload = bytearray()
     while len(payload) < expected:
         payload.extend(os.read(fd, expected - len(payload)))
@@ -1487,13 +1591,70 @@ finally:
     )
     .expect("Kimi-style TUI fixture");
 
-    let input = [
-        b"\x1b[I".as_slice(),
-        b"\x1b[<0;10;5M".as_slice(),
-        b"\x1b[97;3u".as_slice(),
-        "\x1b[200~粘贴中文🙂e\u{301}👩‍💻\x1b[201~".as_bytes(),
-    ]
-    .concat();
+    // Codex/Grok-style TUIs receive shortcuts through classic control bytes,
+    // Kitty CSI-u, or xterm modifyOtherKeys depending on the outer terminal.
+    // Keep every encoding byte-exact across the foreground hand-off, including
+    // when escape sequences arrive in separate writes.
+    let mut input_chunks: Vec<Vec<u8>> = (0_u8..=0x1f).map(|byte| vec![byte]).collect();
+    input_chunks.extend(
+        [
+            b"\x7f".as_slice(),
+            b"\x80".as_slice(),
+            b"\x9b".as_slice(),
+            b"\xff".as_slice(),
+            b"\x1bx".as_slice(),
+            b"\x1bOP".as_slice(),
+            b"\x1bOQ".as_slice(),
+            b"\x1bOR".as_slice(),
+            b"\x1bOS".as_slice(),
+            b"\x1b[15~".as_slice(),
+            b"\x1b[17~".as_slice(),
+            b"\x1b[18~".as_slice(),
+            b"\x1b[19~".as_slice(),
+            b"\x1b[20~".as_slice(),
+            b"\x1b[21~".as_slice(),
+            b"\x1b[23~".as_slice(),
+            b"\x1b[24~".as_slice(),
+            b"\x1b[1;5P".as_slice(),
+            b"\x1b[15;2~".as_slice(),
+            b"\x1b[Z".as_slice(),
+            b"\x1bOA".as_slice(),
+            b"\x1bOB".as_slice(),
+            b"\x1bOC".as_slice(),
+            b"\x1bOD".as_slice(),
+            b"\x1bOp".as_slice(),
+            b"\x1bOq".as_slice(),
+            b"\x1b[1;5A".as_slice(),
+            b"\x1b[1;3D".as_slice(),
+            b"\x1b[1;2H".as_slice(),
+            b"\x1b[1;6F".as_slice(),
+            b"\x1b[1;1R".as_slice(),
+            b"\x1b[1;2R".as_slice(),
+            b"\x1b[1;3R".as_slice(),
+            b"\x1b[1;4R".as_slice(),
+            b"\x1b[1;5R".as_slice(),
+            b"\x1b[1;6R".as_slice(),
+            b"\x1b[1;7R".as_slice(),
+            b"\x1b[1;8R".as_slice(),
+            b"\x1b[13;2u".as_slice(),
+            b"\x1b[32;5u".as_slice(),
+            b"\x1b[97;1:2u".as_slice(),
+            b"\x1b[97;1:3u".as_slice(),
+            b"\x1b[99;5u".as_slice(),
+            b"\x1b[46;5u".as_slice(),
+            b"\x1b[27;5;99~".as_slice(),
+            b"\x1b[I".as_slice(),
+            b"\x1b[O".as_slice(),
+            b"\x1b[<0;10;5M".as_slice(),
+            b"\x1b[<0;10;5m".as_slice(),
+            b"\x1b[M !!".as_slice(),
+            b"\x1b[97;3u".as_slice(),
+            "\x1b[200~粘贴中文🙂e\u{301}👩‍💻\x1b[201~".as_bytes(),
+        ]
+        .into_iter()
+        .map(<[u8]>::to_vec),
+    );
+    let input = input_chunks.concat();
     let expected_hex = input
         .iter()
         .map(|byte| format!("{byte:02x}"))
@@ -1503,9 +1664,13 @@ finally:
     let mut terminal = TerminalSession::spawn_hokan(home, work, 2);
     let command_start = terminal.transcript.len();
     terminal.write(format!("python3 ./tui.py {}\r", input.len()).as_bytes());
-    terminal.wait_for_bytes_since(command_start, b"TUI_CPR_OK");
+    terminal.wait_for_bytes_since(command_start, b"TUI_PROTOCOL_OK");
     terminal.wait_for_bytes_since(command_start, b"TUI_INPUT_READY");
-    terminal.write(&input);
+    for chunk in &input_chunks {
+        for byte in chunk.chunks(1) {
+            terminal.write(byte);
+        }
+    }
     terminal.wait_for_bytes_since(
         command_start,
         format!("TUI_INPUT={expected_hex}").as_bytes(),
@@ -1534,6 +1699,48 @@ finally:
 
     terminal.write("printf '终端恢复🙂e\u{301}👩‍💻\\n'\r".as_bytes());
     terminal.wait_for_screen("终端恢复🙂e\u{301}👩‍💻");
+    terminal.exit_shell();
+    terminal.wait_until_exit();
+}
+
+#[test]
+fn foreground_job_control_handles_ctrl_z_fg_and_ctrl_c() {
+    if !command_exists("zsh") || !command_exists("sleep") {
+        return;
+    }
+    let mut terminal = TerminalSession::spawn();
+    terminal.wait_for_screen("HK> ");
+    terminal.settle(Duration::from_millis(300));
+
+    let fixture = terminal._work.path().join("job-control.sh");
+    fs::write(
+        &fixture,
+        "#!/bin/sh\nprintf 'JOB_RUNNING\\n'\nexec sleep 30\n",
+    )
+    .expect("job-control fixture");
+
+    let command_start = terminal.transcript.len();
+    terminal.write(b"sh ./job-control.sh\r");
+    terminal.wait_for_bytes_since(command_start, b"JOB_RUNNING");
+
+    let suspend_start = terminal.transcript.len();
+    terminal.write(b"\x1a");
+    terminal.wait_for_bytes_since(suspend_start, b"HK> ");
+    terminal.settle(Duration::from_millis(100));
+
+    let jobs_start = terminal.transcript.len();
+    terminal.write(b"jobs -s\r");
+    terminal.wait_for_bytes_since(jobs_start, b"job-control.sh");
+    terminal.wait_for_bytes_since(jobs_start, b"HK> ");
+
+    terminal.write(b"fg\r");
+    terminal.settle(Duration::from_millis(200));
+    let interrupt_start = terminal.transcript.len();
+    terminal.write(b"\x03");
+    terminal.wait_for_bytes_since(interrupt_start, b"HK> ");
+
+    terminal.write(b"printf 'JOB_CONTROL_OK\\n'\r");
+    terminal.wait_for_screen("JOB_CONTROL_OK");
     terminal.exit_shell();
     terminal.wait_until_exit();
 }

@@ -174,15 +174,22 @@ impl ProjectProvider {
         let folded_prefix = position.prefix.to_lowercase();
         let now_ms = crate::history_now_ms();
         let invocation = context.command().unwrap_or("node");
+        let project_root = manifest.path.parent().unwrap_or(manifest.path.as_path());
         let candidates = manifest
             .scripts
             .iter()
             .filter(|(name, _)| name.to_lowercase().starts_with(&folded_prefix))
             .map(|(name, command)| {
                 let escaped = escape_for_shell(name, QuoteContext::Unquoted, context.shell);
-                let replacement = format!("--run={escaped}");
-                let display =
-                    resulting_primary(context, &replacement, &format!("{invocation} --run={name}"));
+                let (replacement, canonical) = if position.attached {
+                    (
+                        format!("--run={escaped}"),
+                        format!("{invocation} --run={name}"),
+                    )
+                } else {
+                    (escaped, format!("{invocation} --run {name}"))
+                };
+                let display = resulting_primary(context, &replacement, &canonical);
                 let mut candidate = Candidate::new(
                     context.query_id,
                     &display,
@@ -202,7 +209,8 @@ impl ProjectProvider {
                 candidate.display.annotation = Some(origin.clone());
                 candidate.score.cwd_affinity = 100;
                 if let Ok(index) = self.history.read() {
-                    candidate.score.frecency = index.usage_frecency(&display, now_ms);
+                    candidate.score.frecency =
+                        index.usage_frecency_in_project(&display, project_root, now_ms);
                 }
                 candidate
             })
@@ -335,6 +343,7 @@ impl ProjectProvider {
                     &name,
                     &recursive.command,
                     &origin,
+                    &workspace.root,
                     now_ms,
                 );
                 candidate.risk = recursive.risk;
@@ -390,6 +399,7 @@ impl ProjectProvider {
             .display()
             .to_string();
         let now_ms = crate::history_now_ms();
+        let project_root = manifest.path.parent().unwrap_or(manifest.path.as_path());
         let mut candidates: Vec<_> = manifest
             .scripts
             .iter()
@@ -402,7 +412,16 @@ impl ProjectProvider {
                             .any(|(subcommand, _)| *subcommand == name.as_str()))
             })
             .map(|(name, script)| {
-                self.script_candidate(context, spec, position, name, script, &relative, now_ms)
+                self.script_candidate(
+                    context,
+                    spec,
+                    position,
+                    name,
+                    script,
+                    &relative,
+                    project_root,
+                    now_ms,
+                )
             })
             .collect();
         if spec.name == "deno" {
@@ -436,13 +455,23 @@ impl ProjectProvider {
             .display()
             .to_string();
         let now_ms = now_ms.unwrap_or_else(crate::history_now_ms);
+        let project_root = manifest.path.parent().unwrap_or(manifest.path.as_path());
         ProviderOutput {
             candidates: manifest
                 .tasks
                 .iter()
                 .filter(|(name, _)| script_name_matches(context, position, name))
                 .map(|(name, command)| {
-                    self.script_candidate(context, spec, position, name, command, &relative, now_ms)
+                    self.script_candidate(
+                        context,
+                        spec,
+                        position,
+                        name,
+                        command,
+                        &relative,
+                        project_root,
+                        now_ms,
+                    )
                 })
                 .collect(),
             diagnostics: Vec::new(),
@@ -458,6 +487,7 @@ impl ProjectProvider {
         name: &str,
         command: &str,
         origin: &str,
+        project_root: &std::path::Path,
         now_ms: i64,
     ) -> Candidate {
         let escaped = escape_for_shell(name, QuoteContext::Unquoted, context.shell);
@@ -500,7 +530,8 @@ impl ProjectProvider {
         // Scripts the user actually runs win: order by recorded usage of the
         // exact command line (e.g. `pnpm dev` × 40 above `pnpm build` × 2).
         if let Ok(index) = self.history.read() {
-            candidate.score.frecency = index.usage_frecency(&display, now_ms);
+            candidate.score.frecency =
+                index.usage_frecency_in_project(&display, project_root, now_ms);
         }
         candidate
     }
@@ -514,6 +545,22 @@ impl ProjectProvider {
     ) -> ProviderOutput {
         let now_ms = crate::history_now_ms();
         let invocation = context.command().unwrap_or(spec.name);
+        let project_dir = crate::providers::manager_project_dir(context)
+            .unwrap_or_else(|| context.cwd.as_ref().clone());
+        let history_root = if spec.name == "deno" {
+            self.cache
+                .load_deno_nearest(&project_dir)
+                .ok()
+                .flatten()
+                .and_then(|manifest| manifest.path.parent().map(std::path::Path::to_owned))
+        } else {
+            self.cache
+                .load_nearest(&project_dir)
+                .ok()
+                .flatten()
+                .and_then(|manifest| manifest.path.parent().map(std::path::Path::to_owned))
+        }
+        .unwrap_or_else(|| std::fs::canonicalize(&project_dir).unwrap_or(project_dir));
         let candidates = spec
             .subcommands
             .iter()
@@ -544,7 +591,8 @@ impl ProjectProvider {
                     format!("project:{}:{name}", spec.name),
                 );
                 if let Ok(index) = self.history.read() {
-                    candidate.score.frecency = index.usage_frecency(&display, now_ms);
+                    candidate.score.frecency =
+                        index.usage_frecency_in_project(&display, &history_root, now_ms);
                 }
                 candidate.score.spec_priority =
                     i16::try_from(spec.subcommands.len().saturating_sub(index)).unwrap_or_default();
@@ -721,6 +769,7 @@ impl ProjectProvider {
                         name,
                         script,
                         &relative,
+                        &workspace.root,
                         now_ms,
                         position,
                         explicit_run,
@@ -739,6 +788,7 @@ impl ProjectProvider {
         name: &str,
         script: &str,
         origin: &str,
+        project_root: &std::path::Path,
         now_ms: i64,
         position: Position,
         explicit_run: bool,
@@ -777,7 +827,8 @@ impl ProjectProvider {
         candidate.display.annotation = Some(origin.to_owned());
         candidate.score.cwd_affinity = 100;
         if let Ok(index) = self.history.read() {
-            candidate.score.frecency = index.usage_frecency(&display, now_ms);
+            candidate.score.frecency =
+                index.usage_frecency_in_project(&display, project_root, now_ms);
         }
         candidate
     }
@@ -865,6 +916,11 @@ fn token_name_matches(context: &CompletionContext, name: &str) -> bool {
 struct NodeRunPosition<'a> {
     prefix: &'a str,
     project_dir: std::path::PathBuf,
+    attached: bool,
+}
+
+pub(crate) fn node_run_completion_position(context: &CompletionContext) -> bool {
+    node_run_position(context).is_some()
 }
 
 fn node_run_position(context: &CompletionContext) -> Option<NodeRunPosition<'_>> {
@@ -877,18 +933,29 @@ fn node_run_position(context: &CompletionContext) -> Option<NodeRunPosition<'_>>
     if !matches!(command, "node" | "nodejs") {
         return None;
     }
-    let prefix = context.parsed.current_prefix.strip_prefix("--run=")?;
+    let current = context.parsed.current_prefix.as_str();
+    let attached_prefix = current.strip_prefix("--run=");
+    let (words, position) = crate::providers::argument_progress(context)?;
+    let before = words.get(1..=position).unwrap_or_default();
+    let (prefix, options, attached) = if let Some(prefix) = attached_prefix {
+        (prefix, before, true)
+    } else {
+        let (run, options) = before.split_last()?;
+        if *run != "--run" {
+            return None;
+        }
+        (current, options, false)
+    };
     if prefix
         .chars()
         .any(|character| matches!(character, '$' | '`' | '*' | '?' | '[' | '{'))
     {
         return None;
     }
-    let (words, position) = crate::providers::argument_progress(context)?;
-    let before = words.get(1..=position).unwrap_or_default();
-    node_options_allow_run(before).then(|| NodeRunPosition {
+    node_options_allow_run(options).then(|| NodeRunPosition {
         prefix,
         project_dir: crate::providers::invocation_working_directory(context),
+        attached,
     })
 }
 
@@ -935,7 +1002,7 @@ fn node_options_allow_run(arguments: &[&str]) -> bool {
     true
 }
 
-fn node_option_takes_separate_value(word: &str) -> bool {
+pub(crate) fn node_option_takes_separate_value(word: &str) -> bool {
     matches!(
         word,
         "-C" | "--conditions"
@@ -1456,7 +1523,7 @@ mod tests {
     }
 
     #[test]
-    fn node_run_completes_only_attached_package_script_values() {
+    fn node_run_completes_attached_and_separate_package_script_values() {
         let directory = tempfile::tempdir().expect("project");
         fs::write(
             directory.path().join("package.json"),
@@ -1511,16 +1578,26 @@ mod tests {
         );
         assert_eq!(rows("nodejs --run=te", 32), ["nodejs --run=test"]);
         assert_eq!(
-            rows("env -C app node --run=bu", 33),
+            rows("node --run bu", 33),
+            ["node --run build", "node --run 'build docs'"]
+        );
+        assert_eq!(
+            rows("env -C app node --run=bu", 34),
             ["env -C app node --run=bundle"]
         );
+        assert_eq!(
+            rows("env -C app node --run bu", 35),
+            ["env -C app node --run bundle"]
+        );
         for text in [
-            "node --run bu",
             "node app.js --run=bu",
+            "node app.js --run bu",
             "node --eval code --run=bu",
+            "node --eval code --run bu",
             "node --run=missing",
+            "node --run missing",
         ] {
-            assert!(rows(text, 34).is_empty(), "unexpected row for {text:?}");
+            assert!(rows(text, 36).is_empty(), "unexpected row for {text:?}");
         }
     }
 
@@ -2084,6 +2161,9 @@ mod tests {
     #[test]
     fn scripts_are_ordered_by_recorded_usage() {
         let directory = tempfile::tempdir().expect("project");
+        let other = tempfile::tempdir().expect("other project");
+        let project_cwd = directory.path().canonicalize().expect("canonical project");
+        let other_cwd = other.path().canonicalize().expect("canonical other");
         fs::write(
             directory.path().join("package.json"),
             r#"{"scripts":{"build":"vite build","dev":"vite dev"}}"#,
@@ -2091,19 +2171,70 @@ mod tests {
         .expect("manifest");
         let policy = crate::history::HistoryPolicy::new(1024, &[]).expect("policy");
         let mut index = HistoryIndex::default();
-        // `pnpm dev` was used many times, `pnpm build` once — dev must rank
-        // above build even though alphabetical order says otherwise.
-        index.ingest("pnpm build", 1_000, ShellKind::Zsh, None, Some(0), &policy);
-        for round in 0..30 {
+        // `dev` is more frequent in this project, while `build` is more
+        // frequent elsewhere. Project-local history must still put dev first.
+        for round in 0..2 {
             index.ingest(
-                "pnpm dev",
-                2_000 + round,
+                "pnpm build",
+                1_000 + round,
                 ShellKind::Zsh,
-                None,
+                Some(&project_cwd),
                 Some(0),
                 &policy,
             );
         }
+        for round in 0..10 {
+            index.ingest(
+                "pnpm dev",
+                1_100 + round,
+                ShellKind::Zsh,
+                Some(&project_cwd),
+                Some(0),
+                &policy,
+            );
+            index.ingest(
+                "npm run dev",
+                1_100 + round,
+                ShellKind::Zsh,
+                Some(&project_cwd),
+                Some(0),
+                &policy,
+            );
+        }
+        for round in 0..100 {
+            index.ingest(
+                "pnpm build",
+                1_200 + round,
+                ShellKind::Zsh,
+                Some(&other_cwd),
+                Some(0),
+                &policy,
+            );
+            index.ingest(
+                "pnpm install",
+                1_300 + round,
+                ShellKind::Zsh,
+                Some(&other_cwd),
+                Some(0),
+                &policy,
+            );
+            index.ingest(
+                "npm run other-only",
+                3_000 + round,
+                ShellKind::Zsh,
+                Some(&other_cwd),
+                Some(0),
+                &policy,
+            );
+        }
+        index.ingest(
+            "pnpm deploy",
+            1_400,
+            ShellKind::Zsh,
+            Some(&other_cwd),
+            Some(0),
+            &policy,
+        );
         let mut engine = CompletionEngine::new(100, 12);
         engine.register(ProjectProvider::new(
             Arc::new(ProjectCache::default()),
@@ -2113,7 +2244,7 @@ mod tests {
         let context = CompletionContext::new(
             QueryId::new(1),
             ShellKind::Zsh,
-            PathBuf::from(directory.path()),
+            project_cwd,
             BufferSnapshot::new("pnpm ", 5, BufferRevision::new(1), SyncQuality::Exact)
                 .expect("buffer"),
         )
@@ -2126,6 +2257,149 @@ mod tests {
             .collect();
         assert_eq!(&names[..2], ["pnpm dev", "pnpm build"]);
         assert!(names.contains(&"pnpm install"));
+    }
+
+    #[test]
+    fn combined_engine_keeps_cross_project_history_out_of_script_completion() {
+        let directory = tempfile::tempdir().expect("project");
+        let other = tempfile::tempdir().expect("other project");
+        fs::write(
+            directory.path().join("package.json"),
+            r#"{"scripts":{"build":"vite build","dev":"vite dev"}}"#,
+        )
+        .expect("manifest");
+        let project_cwd = directory.path().canonicalize().expect("canonical project");
+        let other_cwd = other.path().canonicalize().expect("canonical other");
+        let policy = crate::history::HistoryPolicy::new(1024, &[]).expect("policy");
+        let mut index = HistoryIndex::default();
+        for round in 0..10 {
+            index.ingest(
+                "pnpm dev",
+                1_000 + round,
+                ShellKind::Zsh,
+                Some(&project_cwd),
+                Some(0),
+                &policy,
+            );
+            index.ingest(
+                "node --run dev",
+                1_000 + round,
+                ShellKind::Zsh,
+                Some(&project_cwd),
+                Some(0),
+                &policy,
+            );
+        }
+        for round in 0..100 {
+            index.ingest(
+                "pnpm other-only",
+                2_000 + round,
+                ShellKind::Zsh,
+                Some(&other_cwd),
+                Some(0),
+                &policy,
+            );
+            index.ingest(
+                "node --run other-only",
+                2_000 + round,
+                ShellKind::Zsh,
+                Some(&other_cwd),
+                Some(0),
+                &policy,
+            );
+        }
+        for command in [
+            "pnpm --filter api --filter web other-only",
+            "npm --workspace api --workspace web run other-only",
+        ] {
+            index.ingest(
+                command,
+                3_000,
+                ShellKind::Zsh,
+                Some(&other_cwd),
+                Some(0),
+                &policy,
+            );
+        }
+        let history = Arc::new(RwLock::new(index));
+        let projects = Arc::new(ProjectCache::default());
+        let commands = command_cache(directory.path(), &["pnpm", "npm", "node"]);
+        let help = Arc::new(CommandHelpCache::default());
+        help.seed(
+            "pnpm",
+            crate::providers::command_help::CommandHelp::default(),
+        );
+        let mut engine = CompletionEngine::new(100, 12);
+        engine.register(ProjectProvider::new(
+            Arc::clone(&projects),
+            Arc::clone(&commands),
+            Arc::clone(&history),
+        ));
+        engine.register(
+            crate::providers::HistoryProvider::new(
+                history,
+                commands,
+                Arc::new(crate::shell::AliasCache::default()),
+                Arc::new(crate::specs::SpecRegistry::default()),
+                help,
+            )
+            .with_project_cache(projects),
+        );
+        let context_for = |query_id, text: &str| {
+            CompletionContext::new(
+                QueryId::new(query_id),
+                ShellKind::Zsh,
+                project_cwd.clone(),
+                BufferSnapshot::new(
+                    text,
+                    text.len(),
+                    BufferRevision::new(query_id),
+                    SyncQuality::Exact,
+                )
+                .expect("buffer"),
+            )
+            .expect("context")
+        };
+        for (text, expected, stale) in [
+            ("pnpm ", ["pnpm dev", "pnpm build"], "pnpm other-only"),
+            (
+                "npm run ",
+                ["npm run dev", "npm run build"],
+                "npm run other-only",
+            ),
+            (
+                "node --run ",
+                ["node --run dev", "node --run build"],
+                "node --run other-only",
+            ),
+        ] {
+            let output = engine.complete(&context_for(1, text));
+            let names: Vec<_> = output
+                .candidates
+                .iter()
+                .map(|candidate| candidate.display.primary.as_str())
+                .collect();
+            for expected in expected {
+                assert!(names.contains(&expected));
+            }
+            assert!(!names.contains(&stale));
+            assert!(
+                output
+                    .candidates
+                    .iter()
+                    .all(|candidate| candidate.source != CandidateSource::History),
+                "whole-line history must not compete in the script selection slot"
+            );
+        }
+        for text in [
+            "pnpm --filter api --filter web ",
+            "npm --workspace api --workspace web run ",
+        ] {
+            assert!(
+                engine.complete(&context_for(2, text)).candidates.is_empty(),
+                "multiple selectors must not leak a whole-line history row"
+            );
+        }
     }
 
     #[test]

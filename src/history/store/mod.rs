@@ -36,6 +36,11 @@ pub struct HistoryEventV1 {
     pub imported: bool,
     #[serde(default = "one_occurrence")]
     pub occurrences: u64,
+    /// Occurrences that can be attributed to this exact cwd. Older snapshots
+    /// lack this field because compaction used to merge a command across every
+    /// directory; one execution can still be attributed conservatively.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd_occurrences: Option<u64>,
 }
 
 const fn one_occurrence() -> u64 {

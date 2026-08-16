@@ -1,6 +1,14 @@
 use std::time::Instant;
 
-use super::{TERMINAL_QUERY_TIMEOUT, output_error, state::RuntimeState};
+use super::{
+    TERMINAL_QUERY_TIMEOUT,
+    cursor_probe::{
+        CursorProbeBackend, PendingTmuxCursor, TMUX_CURSOR_RETRY_DELAY, TmuxCursorProbe,
+        TmuxCursorResult,
+    },
+    output_error,
+    state::RuntimeState,
+};
 use crate::terminal::{
     FrameRequest, FrameTicket, OutputHandle, OverlayRow, OverlayView, RenderReadiness,
     SanitizedText, SurfaceKey, SyncOutputCapability, TerminalQueryKind, TerminalReply,
@@ -209,6 +217,7 @@ pub(super) fn hide_overlay_if_query_suppressed(
 
 pub(super) fn handle_terminal_reply(
     reply: TerminalReply,
+    state: &mut RuntimeState,
     output: &OutputHandle,
 ) -> crate::Result<bool> {
     match reply {
@@ -230,9 +239,17 @@ pub(super) fn handle_terminal_reply(
                 .map_err(output_error)?;
         }
         TerminalReply::Timeout {
-            kind: TerminalQueryKind::CursorPosition,
+            kind: TerminalQueryKind::CursorPositionPrivate,
             ..
         } => {
+            // Standard CPR cannot be a fallback: `CSI 1;modifier R` is also
+            // the xterm/Kitty encoding for modified F3. A terminal which does
+            // not answer DECXCPR therefore fails closed instead of making
+            // keyboard input indistinguishable from protocol traffic.
+            state.cursor_probe_backend = CursorProbeBackend::Unavailable;
+            state.pending_tmux_cursor = None;
+            state.tmux_cursor_retry_at = None;
+            state.need_cpr = false;
             output.invalidate_anchor().map_err(output_error)?;
         }
     }
@@ -242,9 +259,10 @@ pub(super) fn handle_terminal_reply(
 pub(super) fn maybe_probe_cursor(
     state: &mut RuntimeState,
     router: &mut TerminalReplyRouter,
+    tmux_probe: Option<&TmuxCursorProbe>,
     output: &OutputHandle,
 ) -> crate::Result<()> {
-    if !state.need_cpr || router.has_outstanding() {
+    if !state.need_cpr {
         return Ok(());
     }
     let output_state = output.state().map_err(output_error)?;
@@ -252,12 +270,103 @@ pub(super) fn maybe_probe_cursor(
     {
         return Ok(());
     }
-    let query = router.register(
-        TerminalQueryKind::CursorPosition,
-        Instant::now(),
-        TERMINAL_QUERY_TIMEOUT,
-    )?;
-    output.probe(query.bytes).map_err(output_error)?;
-    state.need_cpr = false;
+    match state.cursor_probe_backend {
+        CursorProbeBackend::TerminalPrivate => {
+            if router.has_outstanding() {
+                return Ok(());
+            }
+            let query = router.register(
+                TerminalQueryKind::CursorPositionPrivate,
+                Instant::now(),
+                TERMINAL_QUERY_TIMEOUT,
+            )?;
+            output.probe(query.bytes).map_err(output_error)?;
+            state.need_cpr = false;
+        }
+        CursorProbeBackend::Tmux => {
+            if state.pending_tmux_cursor.is_some() {
+                return Ok(());
+            }
+            let now = Instant::now();
+            if state
+                .tmux_cursor_retry_at
+                .is_some_and(|retry_at| now < retry_at)
+            {
+                return Ok(());
+            }
+            state.tmux_cursor_retry_at = None;
+            let Some(tmux_probe) = tmux_probe else {
+                state.cursor_probe_backend = CursorProbeBackend::TerminalPrivate;
+                return Ok(());
+            };
+            let generation = state
+                .cursor_probe_generation
+                .checked_add(1)
+                .ok_or_else(|| {
+                    crate::Error::TerminalProtocol("cursor probe id exhausted".into())
+                })?;
+            if !tmux_probe.schedule(generation, state.terminal_size) {
+                state.cursor_probe_backend = CursorProbeBackend::TerminalPrivate;
+                return Ok(());
+            }
+            state.cursor_probe_generation = generation;
+            state.pending_tmux_cursor = Some(PendingTmuxCursor {
+                generation,
+                buffer_revision: state.buffer.revision,
+                screen_revision: output_state.screen_revision,
+                screen_epoch: output_state.screen_epoch,
+                terminal_size: state.terminal_size,
+            });
+            state.need_cpr = false;
+        }
+        CursorProbeBackend::Unavailable => state.need_cpr = false,
+    }
     Ok(())
+}
+
+pub(super) fn handle_tmux_cursor_result(
+    result: TmuxCursorResult,
+    state: &mut RuntimeState,
+    output: &OutputHandle,
+) -> crate::Result<bool> {
+    let Some(pending) = state.pending_tmux_cursor.take() else {
+        return Ok(false);
+    };
+    if pending.generation != result.generation {
+        state.pending_tmux_cursor = Some(pending);
+        return Ok(false);
+    }
+    let output_state = output.state().map_err(output_error)?;
+    let still_current = state.cursor_probe_backend == CursorProbeBackend::Tmux
+        && state.editing
+        && !state.foreground_process
+        && state.buffer.revision == pending.buffer_revision
+        && state.terminal_size == pending.terminal_size
+        && output_state.screen_revision == pending.screen_revision
+        && output_state.screen_epoch == pending.screen_epoch
+        && output_state.cursor_probe_ready
+        && !output_state.foreground
+        && !output_state.alternate_screen;
+    if !still_current {
+        if state.editing && !state.foreground_process {
+            state.need_cpr = true;
+            state.tmux_cursor_retry_at = Some(Instant::now() + TMUX_CURSOR_RETRY_DELAY);
+        }
+        return Ok(false);
+    }
+
+    let Some(position) = result.position else {
+        // A stale/injected TMUX environment or unavailable tmux binary must
+        // not disable a terminal which can answer DECXCPR directly. Try the
+        // keyboard-safe terminal probe once before declaring anchoring
+        // unavailable; standard CPR is never used.
+        state.cursor_probe_backend = CursorProbeBackend::TerminalPrivate;
+        state.tmux_cursor_retry_at = None;
+        state.need_cpr = true;
+        return Ok(false);
+    };
+
+    state.tmux_cursor_retry_at = None;
+    output.confirm_cursor(position).map_err(output_error)?;
+    Ok(true)
 }

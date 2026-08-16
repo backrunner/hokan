@@ -30,6 +30,7 @@ fn history_worker_process() {
                     exit_code: Some(0),
                     imported: false,
                     occurrences: 1,
+                    cwd_occurrences: None,
                 }
             })
             .collect();

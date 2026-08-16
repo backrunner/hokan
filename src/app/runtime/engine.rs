@@ -57,15 +57,7 @@ pub(super) fn load_history(
         (report, cursor) = store.read_with_cursor()?;
     }
     for event in report.events {
-        index.ingest_weighted(
-            &event.command,
-            event.timestamp_ms,
-            event.shell,
-            event.cwd.as_deref(),
-            event.occurrences,
-            event.exit_code,
-            &policy,
-        );
+        index.ingest_event(&event, &policy);
     }
     if config.history.enabled
         && let Some(path) = default_history_path(shell)
@@ -146,8 +138,12 @@ pub(super) fn build_engine(
         Arc::clone(&commands),
     ));
     engine.register(
-        ProjectProvider::new(projects, Arc::clone(&commands), Arc::clone(&history))
-            .with_help(Arc::clone(&help)),
+        ProjectProvider::new(
+            Arc::clone(&projects),
+            Arc::clone(&commands),
+            Arc::clone(&history),
+        )
+        .with_help(Arc::clone(&help)),
     );
     engine.register(ToolchainProvider::new(Arc::clone(&commands)));
     engine.register(crate::providers::GitProvider::new(
@@ -165,13 +161,16 @@ pub(super) fn build_engine(
         Arc::clone(&help),
     ));
     if config.history.enabled {
-        engine.register(HistoryProvider::new(
-            Arc::clone(&history),
-            Arc::clone(&commands),
-            Arc::clone(&aliases),
-            Arc::clone(&specs),
-            Arc::clone(&help),
-        ));
+        engine.register(
+            HistoryProvider::new(
+                Arc::clone(&history),
+                Arc::clone(&commands),
+                Arc::clone(&aliases),
+                Arc::clone(&specs),
+                Arc::clone(&help),
+            )
+            .with_project_cache(projects),
+        );
     }
     // Full-line history continuation must run before providers that scan a
     // function directory, process table, or network interfaces. A slow local

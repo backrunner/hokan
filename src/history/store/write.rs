@@ -297,19 +297,33 @@ fn ensure_event_log_capacity(file: &File, append_bytes: usize) -> crate::Result<
 }
 
 fn aggregate_events(events: Vec<HistoryEventV1>) -> Vec<HistoryEventV1> {
-    let mut aggregated: HashMap<String, HistoryEventV1> = HashMap::new();
-    for event in events {
-        let key = normalize_command(&event.command);
+    let mut aggregated: HashMap<(String, Option<PathBuf>, bool), HistoryEventV1> = HashMap::new();
+    for mut event in events {
+        event.occurrences = event.occurrences.max(1);
+        event.cwd_occurrences = event.cwd.as_ref().map(|_| {
+            event
+                .cwd_occurrences
+                .unwrap_or(1)
+                .clamp(1, event.occurrences)
+        });
+        let key = (
+            normalize_command(&event.command),
+            event.cwd.clone(),
+            crate::history::is_failed_exit(event.exit_code),
+        );
         match aggregated.get_mut(&key) {
             Some(existing) => {
-                existing.occurrences = existing
-                    .occurrences
-                    .saturating_add(event.occurrences.max(1));
+                let cwd_occurrences = existing
+                    .cwd_occurrences
+                    .zip(event.cwd_occurrences)
+                    .map(|(existing, incoming)| existing.saturating_add(incoming));
+                existing.occurrences = existing.occurrences.saturating_add(event.occurrences);
                 if event.timestamp_ms >= existing.timestamp_ms {
                     let occurrences = existing.occurrences;
                     *existing = event;
                     existing.occurrences = occurrences;
                 }
+                existing.cwd_occurrences = cwd_occurrences;
             }
             None => {
                 aggregated.insert(key, event);
@@ -320,6 +334,7 @@ fn aggregate_events(events: Vec<HistoryEventV1>) -> Vec<HistoryEventV1> {
     events.sort_by(|left, right| {
         left.command
             .cmp(&right.command)
+            .then_with(|| left.cwd.cmp(&right.cwd))
             .then_with(|| left.timestamp_ms.cmp(&right.timestamp_ms))
     });
     events
