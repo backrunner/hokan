@@ -13,7 +13,7 @@ use crate::completion::{
     Activation, BufferSnapshot, Candidate, CandidateAction, CandidateKind, CandidateSource,
     Completeness, CompletionContext, CursorPlacement, ProviderOutput, SyncQuality, TextEdit,
 };
-use crate::config::Config;
+use crate::config::{Config, ConfigPaths};
 use crate::history::{HistoryCursor, HistoryIndex, HistoryPolicy, HistoryStore};
 use crate::platform::CommandPathCache;
 use crate::shell::{ControlMessage, ShellEvent, ShellKind};
@@ -143,6 +143,43 @@ fn complete_executable_still_schedules_a_provider_query() {
     output.restore_and_exit().expect("shutdown");
     join.join().expect("actor joins").expect("actor exits");
     drop(worker);
+}
+
+#[test]
+fn runtime_engine_runs_dynamic_help_before_competing_command_sources() {
+    let directory = tempfile::tempdir().expect("directory");
+    let paths = ConfigPaths {
+        config_file: directory.path().join("config.toml"),
+        credentials_file: directory.path().join("credentials.toml"),
+        specs_directory: directory.path().join("specs"),
+        state_directory: directory.path().join("state"),
+        cache_directory: directory.path().join("cache"),
+    };
+    let history = Arc::new(RwLock::new(HistoryIndex::default()));
+    let config = Arc::new(Config::default());
+    let (engine, _, _, _) = build_engine(&paths, &config, history, None);
+    let providers = engine.provider_ids();
+    let help = providers
+        .iter()
+        .position(|provider| *provider == "command_help")
+        .expect("command-help provider");
+
+    for provider in [
+        "session_command",
+        "path_command",
+        "history",
+        "alias",
+        "filesystem",
+    ] {
+        let position = providers
+            .iter()
+            .position(|candidate| *candidate == provider)
+            .unwrap_or_else(|| panic!("{provider} provider"));
+        assert!(
+            help < position,
+            "command help must run before {provider}: {providers:?}"
+        );
+    }
 }
 
 #[test]
@@ -497,6 +534,19 @@ fn live_config_keeps_structural_values_until_restart() {
     assert_eq!(live.history, current.history);
     assert_eq!(live.logging, current.logging);
     assert_eq!(restart, vec!["core", "history", "logging"]);
+}
+
+#[test]
+fn config_reload_status_avoids_empty_success_but_preserves_restart_warnings() {
+    assert_eq!(config_reload_status(&[], false), None);
+    assert_eq!(
+        config_reload_status(&[], true).as_deref(),
+        Some("HK-CFG-RELOAD applied provider and UI configuration")
+    );
+    assert_eq!(
+        config_reload_status(&["core", "history"], false).as_deref(),
+        Some("HK-CFG-RESTART restart required for core, history changes")
+    );
 }
 
 fn selection_candidate(state: &RuntimeState, primary: &str) -> Candidate {

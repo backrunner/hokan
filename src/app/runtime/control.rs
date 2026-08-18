@@ -190,18 +190,27 @@ pub(super) fn handle_config_reload(
             {
                 state.schedule_query(worker)?;
             }
-            state.status = Some(if restart_required.is_empty() {
-                "HK-CFG-RELOAD applied provider and UI configuration".into()
-            } else {
-                format!(
-                    "HK-CFG-RESTART restart required for {} changes",
-                    restart_required.join(", ")
-                )
-            });
+            // A routine success must not create a status-only overlay that
+            // looks like an empty recommendation list. Restart warnings are
+            // actionable, so preserve them even when no rows are available.
+            state.status = config_reload_status(&restart_required, !state.candidates.is_empty());
             render_current(state, output)?;
         }
     }
     Ok(())
+}
+
+pub(super) fn config_reload_status(
+    restart_required: &[&str],
+    has_candidates: bool,
+) -> Option<String> {
+    if !restart_required.is_empty() {
+        return Some(format!(
+            "HK-CFG-RESTART restart required for {} changes",
+            restart_required.join(", ")
+        ));
+    }
+    has_candidates.then(|| "HK-CFG-RELOAD applied provider and UI configuration".into())
 }
 
 pub(super) fn merge_live_config(

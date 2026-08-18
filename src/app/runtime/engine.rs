@@ -154,6 +154,15 @@ pub(super) fn build_engine(
     engine.register(crate::providers::SshHostProvider::new(Arc::clone(
         &commands,
     )));
+    // Dynamic help is a semantic command surface. It must run before the
+    // session/PATH rows and slower generic providers, otherwise the local
+    // query budget can finalize on `hokan-leave` or history and hide the
+    // executable's documented subcommands.
+    engine.register(CommandHelpProvider::new(
+        Arc::clone(&specs),
+        Arc::clone(&commands),
+        Arc::clone(&help),
+    ));
     engine.register(crate::providers::SessionCommandProvider);
     engine.register(PathCommandProvider::new(Arc::clone(&commands)));
     engine.register(PythonModuleProvider::new(
@@ -179,11 +188,6 @@ pub(super) fn build_engine(
     engine.register(crate::providers::AliasProvider::new(Arc::clone(&aliases)));
     engine.register(ProcessProvider);
     engine.register(NetworkInterfaceProvider::new(Arc::clone(&commands)));
-    engine.register(CommandHelpProvider::new(
-        Arc::clone(&specs),
-        Arc::clone(&commands),
-        Arc::clone(&help),
-    ));
     // Directory scans have the largest local latency budget. Keep semantic,
     // PATH, and history providers ahead of them so a large cwd cannot starve
     // the rows that already know what the active slot means.

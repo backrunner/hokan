@@ -40,6 +40,9 @@ const MAN_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_ENTRIES: usize = 200;
 const MAX_DESCRIPTION_CHARS: usize = 72;
 const MAX_CONCURRENT_FETCHES: usize = 4;
+// Nested CLIs are common (`hokan config ai`, `git remote add`, ...). Keep
+// recursive probing bounded, but do not stop at an arbitrary three levels.
+const MAX_HELP_SCOPE_DEPTH: usize = 8;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CommandHelp {
@@ -654,7 +657,7 @@ fn lookup_help_scope(
                 word,
                 consumed: scope_consumed,
             } => {
-                if !supports_scoped_help(command) || scope.len() >= 3 {
+                if !supports_scoped_help(command) || scope.len() >= MAX_HELP_SCOPE_DEPTH {
                     return HelpLookup::None;
                 }
                 consumed += scope_consumed;
@@ -858,6 +861,7 @@ fn supports_scoped_help(command: &str) -> bool {
                 | "go"
                 | "helm"
                 | "heroku"
+                | "hokan"
                 | "istioctl"
                 | "kubectl"
                 | "launchctl"
@@ -1016,7 +1020,7 @@ pub(crate) fn scoped_history_arguments_are_plausible(
                 if remaining.is_empty() || known_non_failure {
                     return Some(true);
                 }
-                if !supports_scoped_help(command) || scope.len() >= 3 {
+                if !supports_scoped_help(command) || scope.len() >= MAX_HELP_SCOPE_DEPTH {
                     return Some(true);
                 }
                 scope.push(word.to_owned());
@@ -2347,7 +2351,9 @@ fn shorten(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{ffi::OsString, fs, os::unix::fs::PermissionsExt, path::PathBuf, sync::Arc};
+    use std::{
+        ffi::OsString, fs, os::unix::fs::PermissionsExt, path::PathBuf, sync::Arc, time::Duration,
+    };
 
     use super::*;
     use crate::{
@@ -3567,6 +3573,59 @@ work on the current change
     }
 
     #[test]
+    fn cached_hokan_help_precedes_the_session_command_at_the_budget_boundary() {
+        let directory = tempfile::tempdir().expect("command directory");
+        let path = directory.path().join("hokan");
+        fs::write(&path, b"#!/bin/sh\n").expect("fake command");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).expect("command mode");
+        let commands = Arc::new(CommandPathCache::from_path(Some(&OsString::from(
+            directory.path(),
+        ))));
+        let cache = Arc::new(CommandHelpCache::default());
+        cache.seed(
+            "hokan",
+            parse_help_output("hokan", "Commands:\n  config   Configure Hokan\n"),
+        );
+        cache.seed_scope(
+            "hokan",
+            &["config"],
+            parse_help_output_for_scope(
+                "hokan",
+                &["config".to_owned()],
+                "Commands:\n  ai   Configure AI\n",
+            ),
+        );
+
+        // With a zero local budget the next provider is intentionally not
+        // allowed to run once a useful row exists. The semantic help provider
+        // must therefore precede the matching `hokan-leave` session row.
+        let mut engine = CompletionEngine::new(100, 20).with_local_timeout(Duration::ZERO);
+        engine.register(CommandHelpProvider::new(
+            Arc::new(SpecRegistry::load(None)),
+            Arc::clone(&commands),
+            Arc::clone(&cache),
+        ));
+        engine.register(crate::providers::SessionCommandProvider);
+        engine.register(crate::providers::PathCommandProvider::new(commands));
+
+        let rows: Vec<_> = engine
+            .complete(&context("hokan", 1))
+            .candidates
+            .into_iter()
+            .map(|candidate| candidate.display.primary)
+            .collect();
+        assert_eq!(rows, ["hokan config"]);
+
+        let rows: Vec<_> = engine
+            .complete(&context("hokan config a", 2))
+            .candidates
+            .into_iter()
+            .map(|candidate| candidate.display.primary)
+            .collect();
+        assert_eq!(rows, ["hokan config ai"]);
+    }
+
+    #[test]
     fn standalone_prompt_clis_offer_help_rows_without_a_space() {
         let directory = tempfile::tempdir().expect("command directory");
         let path = directory.path().join("codex");
@@ -3665,7 +3724,16 @@ work on the current change
             parse_help_output_for_scope(
                 "gh",
                 &["pr".to_owned(), "create".to_owned()],
-                "Options:\n  --fill     Use commit information for title and body\n",
+                "Commands:\n  deep     Continue into a fourth level\nOptions:\n  --fill     Use commit information for title and body\n",
+            ),
+        );
+        cache.seed_scope(
+            "gh",
+            &["pr", "create", "deep"],
+            parse_help_output_for_scope(
+                "gh",
+                &["pr".to_owned(), "create".to_owned(), "deep".to_owned()],
+                "Options:\n  --final     Finish the nested operation\n",
             ),
         );
         let mut engine = CompletionEngine::new(100, 20);
@@ -3704,6 +3772,14 @@ work on the current change
             .map(|candidate| candidate.display.primary)
             .collect();
         assert_eq!(rows, ["gh pr create --fill"]);
+
+        let rows: Vec<_> = engine
+            .complete(&context("gh pr create deep --f", 44))
+            .candidates
+            .into_iter()
+            .map(|candidate| candidate.display.primary)
+            .collect();
+        assert_eq!(rows, ["gh pr create deep --final"]);
     }
 
     #[test]

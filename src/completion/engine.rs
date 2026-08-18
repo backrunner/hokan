@@ -63,6 +63,14 @@ impl CompletionEngine {
         self.providers.push(Arc::new(provider));
     }
 
+    #[cfg(test)]
+    pub(crate) fn provider_ids(&self) -> Vec<&'static str> {
+        self.providers
+            .iter()
+            .map(|provider| provider.id())
+            .collect()
+    }
+
     #[must_use]
     pub fn complete(&self, context: &CompletionContext) -> ProviderOutput {
         let mut final_output = ProviderOutput::default();

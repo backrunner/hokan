@@ -73,6 +73,7 @@ impl CandidateProvider for FilesystemProvider {
                 };
             }
         };
+        let file_next_slot = required_file_followup_slot(context, slot.kind);
         let show_hidden = self.show_hidden || basename.starts_with('.');
         let mut candidates = Vec::new();
         let mut partial = false;
@@ -123,6 +124,11 @@ impl CandidateProvider for FilesystemProvider {
                 continue;
             }
             let executable = crate::platform::is_executable(&path);
+            let next_slot = if directory {
+                Some(SlotKind::Path)
+            } else {
+                file_next_slot
+            };
             let mut candidate = Candidate::new(
                 context.query_id,
                 &logical,
@@ -138,26 +144,18 @@ impl CandidateProvider for FilesystemProvider {
                     replacement,
                     cursor_after: CursorPlacement::End,
                 }),
-                if directory {
-                    CandidateAction::InsertAndContinue {
-                        next_slot: SlotKind::Path,
-                    }
-                } else {
-                    CandidateAction::Insert
-                },
+                next_slot.map_or(CandidateAction::Insert, |next_slot| {
+                    CandidateAction::InsertAndContinue { next_slot }
+                }),
                 CandidateSource::Filesystem,
                 if directory {
                     CandidateKind::Directory
                 } else {
                     CandidateKind::File
                 },
-                if directory {
-                    Completeness::NeedsInput {
-                        slot: SlotKind::Path,
-                    }
-                } else {
-                    Completeness::Runnable
-                },
+                next_slot.map_or(Completeness::Runnable, |slot| Completeness::NeedsInput {
+                    slot,
+                }),
                 RiskLevel::Low,
                 format!("fs:{}", path.display()),
             );
@@ -813,6 +811,7 @@ fn attached_short_flags(command: &str) -> &'static [&'static str] {
         ];
     }
     match command {
+        "cp" | "mv" => &["-t", "-S"],
         "git" | "make" => &["-C"],
         "pnpm" => &["-C", "-F"],
         "npm" => &["-w"],
@@ -986,6 +985,69 @@ fn default_path_slot(command: &str, words: &[&str], argument_position: usize) ->
         "git" if git_path_slot(words, argument_position) => Some(SlotKind::Path),
         _ => None,
     }
+}
+
+/// A selected file is not always a complete command. `cp` and `mv` require a
+/// source plus a destination (or one source with `--target-directory`). Mark
+/// the first source as a continuation so Enter fills it back into the shell
+/// instead of submitting a command that is known to be missing an operand.
+fn required_file_followup_slot(
+    context: &CompletionContext,
+    slot_kind: SlotKind,
+) -> Option<SlotKind> {
+    if !matches!(slot_kind, SlotKind::File | SlotKind::Path) {
+        return None;
+    }
+    let command = super::executable_basename(context.command()?);
+    if !matches!(command, "cp" | "mv") {
+        return None;
+    }
+    let (words, argument_position) = argument_progress(context)?;
+    let completed = positional_arguments_before(command, &words, argument_position, &[])?;
+    let required = if target_directory_before_active(command, &words, argument_position) {
+        1
+    } else {
+        2
+    };
+    (completed.saturating_add(1) < required).then_some(SlotKind::Path)
+}
+
+fn target_directory_before_active(command: &str, words: &[&str], argument_position: usize) -> bool {
+    let before = words.get(1..=argument_position).unwrap_or_default();
+    let mut options = true;
+    let mut index = 0;
+    while let Some(word) = before.get(index).copied() {
+        if options && word == "--" {
+            options = false;
+            index += 1;
+            continue;
+        }
+        if !options {
+            index += 1;
+            continue;
+        }
+        if let Some(attached) = attached_flag_value(command, word) {
+            if matches!(
+                attached.flag.trim_end_matches('='),
+                "-t" | "--target-directory"
+            ) && !attached.value.is_empty()
+            {
+                return true;
+            }
+            index += 1;
+            continue;
+        }
+        if flag_value_slot(command, word).is_some() {
+            let has_value = index + 1 < before.len();
+            if matches!(word, "-t" | "--target-directory") && has_value {
+                return true;
+            }
+            index += if has_value { 2 } else { 1 };
+            continue;
+        }
+        index += 1;
+    }
+    false
 }
 
 fn cargo_positional_path_slot(words: &[&str], argument_position: usize) -> bool {
@@ -2030,6 +2092,9 @@ fn flag_value_slot(command: &str, flag: &str) -> Option<SlotKind> {
         return Some(slot);
     }
     match (command, flag) {
+        ("cp" | "mv", "-t" | "--target-directory") => Some(SlotKind::Directory),
+        ("cp" | "mv", "-S" | "--suffix") => Some(SlotKind::Value),
+        ("cp", "--no-preserve" | "--sparse") => Some(SlotKind::Value),
         ("git", "-C" | "--git-dir" | "--work-tree") => Some(SlotKind::Directory),
         ("git", "-F" | "--file") => Some(SlotKind::Path),
         (
@@ -2713,6 +2778,136 @@ mod tests {
                 .iter()
                 .any(|candidate| candidate.display.primary == "plain.txt")
         );
+    }
+
+    #[test]
+    fn cp_and_mv_first_file_candidates_require_a_destination() {
+        let directory = tempfile::tempdir().expect("directory");
+        fs::write(directory.path().join("source.txt"), b"source").expect("source file");
+        let provider = provider(Arc::new(SpecRegistry::default()));
+
+        for buffer in [
+            "cp ",
+            "cp -R ",
+            "cp -S .backup ",
+            "cp -S -tdir ",
+            "cp --no-preserve -tdir ",
+            "cp --sparse -tdir ",
+            "mv ",
+            "mv --suffix=-tdir ",
+            "sudo mv ",
+        ] {
+            let candidate = provider
+                .complete(&context(directory.path(), buffer, 1))
+                .candidates
+                .into_iter()
+                .find(|candidate| candidate.display.primary == "source.txt")
+                .unwrap_or_else(|| panic!("source candidate missing for {buffer:?}"));
+            assert_eq!(
+                candidate.action,
+                CandidateAction::InsertAndContinue {
+                    next_slot: SlotKind::Path
+                },
+                "first operand must fill without executing for {buffer:?}"
+            );
+            assert_eq!(
+                candidate.completeness,
+                Completeness::NeedsInput {
+                    slot: SlotKind::Path
+                },
+                "first operand must still require a destination for {buffer:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cp_and_mv_destination_file_candidates_are_runnable() {
+        let directory = tempfile::tempdir().expect("directory");
+        fs::write(directory.path().join("source.txt"), b"source").expect("source file");
+        fs::write(directory.path().join("target.txt"), b"target").expect("target file");
+        let provider = provider(Arc::new(SpecRegistry::default()));
+
+        for buffer in [
+            "cp source.txt ",
+            "cp source.txt -R ",
+            "cp -- -tdir ",
+            "mv source.txt ",
+            "sudo mv source.txt ",
+        ] {
+            let candidate = provider
+                .complete(&context(directory.path(), buffer, 2))
+                .candidates
+                .into_iter()
+                .find(|candidate| candidate.display.primary == "target.txt")
+                .unwrap_or_else(|| panic!("destination candidate missing for {buffer:?}"));
+            assert_eq!(
+                candidate.action,
+                CandidateAction::Insert,
+                "destination file should complete the invocation for {buffer:?}"
+            );
+            assert_eq!(
+                candidate.completeness,
+                Completeness::Runnable,
+                "destination file should be runnable for {buffer:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cp_and_mv_target_directory_forms_need_only_a_source() {
+        let directory = tempfile::tempdir().expect("directory");
+        fs::write(directory.path().join("source.txt"), b"source").expect("source file");
+        fs::create_dir(directory.path().join("dest")).expect("destination directory");
+        let provider = provider(Arc::new(SpecRegistry::default()));
+
+        for buffer in [
+            "cp -t dest ",
+            "cp --target-directory=dest -S .backup ",
+            "mv -tdest ",
+            "mv --target-directory dest ",
+        ] {
+            let candidate = provider
+                .complete(&context(directory.path(), buffer, 3))
+                .candidates
+                .into_iter()
+                .find(|candidate| candidate.display.primary == "source.txt")
+                .unwrap_or_else(|| panic!("source candidate missing for {buffer:?}"));
+            assert_eq!(
+                candidate.action,
+                CandidateAction::Insert,
+                "target-directory form is complete after its first source for {buffer:?}"
+            );
+            assert_eq!(
+                candidate.completeness,
+                Completeness::Runnable,
+                "target-directory form should be runnable for {buffer:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cp_and_mv_non_path_option_values_do_not_offer_filesystem_rows() {
+        let directory = tempfile::tempdir().expect("directory");
+        fs::write(directory.path().join("source.txt"), b"source").expect("source file");
+        let provider = provider(Arc::new(SpecRegistry::default()));
+
+        for buffer in [
+            "cp -S ",
+            "cp -S.backup",
+            "cp --suffix ",
+            "cp --no-preserve ",
+            "cp --sparse=",
+            "mv -S ",
+            "mv --suffix=-backup",
+        ] {
+            assert!(
+                provider
+                    .complete(&context(directory.path(), buffer, 4))
+                    .candidates
+                    .is_empty(),
+                "non-path option value leaked filesystem rows for {buffer:?}"
+            );
+        }
     }
 
     #[test]
