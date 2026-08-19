@@ -19,6 +19,7 @@ pub(super) const TMUX_CURSOR_RETRY_DELAY: Duration = Duration::from_millis(50);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CursorProbeBackend {
     TerminalPrivate,
+    TerminalStandardGuarded,
     Tmux,
     Unavailable,
 }

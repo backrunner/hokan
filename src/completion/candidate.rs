@@ -146,7 +146,8 @@ pub enum Completeness {
 ///
 /// ```text
 /// match_quality + source_trust + spec_priority + cwd_affinity + frecency
-///     + transition + context - risk_penalty - incomplete_penalty - failed_penalty
+///     + transition + history_overlap + context - risk_penalty
+///     - incomplete_penalty - failed_penalty
 /// ```
 ///
 /// Signal ranges:
@@ -155,7 +156,7 @@ pub enum Completeness {
 ///   can refine equally relevant rows but never make a weak fuzzy match beat
 ///   a direct completion.
 /// - `continuation_priority`: 0 or 1 — a hard non-executable argument tier for
-///   a history row that genuinely continues the text already in the buffer.
+///   a history-backed row that genuinely continues the text already in the buffer.
 ///   This keeps a full-line continuation above a same-prefix file or directory
 ///   row without affecting executable-name completion in nested command slots.
 /// - `command_priority`: 0 or 1 — a hard command-position tier. A PATH command
@@ -169,6 +170,8 @@ pub enum Completeness {
 /// - `frecency`: 0..=200 — provider-set (history recency + frequency).
 /// - `transition`: 0..=200 — provider-set bigram boost: how often the
 ///   candidate's skeleton followed the previous executed command.
+/// - `history_overlap`: 0 or 100 — set centrally when history and another
+///   provider independently produce the same completed command line.
 /// - `context`: 0..=100 (40 per matched workspace rule) — set centrally by
 ///   ranking from the detected workspace markers (git, package.json,
 ///   Cargo.toml, Makefile, justfile).
@@ -187,6 +190,7 @@ pub struct ScoreSignals {
     pub cwd_affinity: i16,
     pub frecency: i16,
     pub transition: i16,
+    pub history_overlap: i16,
     pub context: i16,
     pub risk_penalty: i16,
     pub incomplete_penalty: i16,
@@ -202,6 +206,7 @@ impl ScoreSignals {
             + self.cwd_affinity as i32
             + self.frecency as i32
             + self.transition as i32
+            + self.history_overlap as i32
             + self.context as i32
             - self.risk_penalty as i32
             - self.incomplete_penalty as i32

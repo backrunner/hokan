@@ -39,9 +39,10 @@ fn runtime_state(directory: &Path) -> RuntimeState {
 }
 
 #[test]
-fn private_cursor_timeout_fails_closed_without_standard_cpr() {
+fn private_cursor_timeout_uses_guarded_standard_fallback() {
     let directory = tempfile::tempdir().expect("directory");
     let mut state = runtime_state(directory.path());
+    state.editing = true;
     state.need_cpr = true;
     let (output, join) = test_output();
 
@@ -54,6 +55,22 @@ fn private_cursor_timeout_fails_closed_without_standard_cpr() {
         &output,
     )
     .expect("cursor timeout");
+
+    assert_eq!(
+        state.cursor_probe_backend,
+        CursorProbeBackend::TerminalStandardGuarded
+    );
+    assert!(state.need_cpr);
+
+    handle_terminal_reply(
+        TerminalReply::Timeout {
+            query_id: QueryId::new(2),
+            kind: TerminalQueryKind::CursorPositionStandardGuarded,
+        },
+        &mut state,
+        &output,
+    )
+    .expect("guarded cursor timeout");
 
     assert_eq!(state.cursor_probe_backend, CursorProbeBackend::Unavailable);
     assert!(!state.need_cpr);

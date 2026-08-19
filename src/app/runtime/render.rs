@@ -242,10 +242,20 @@ pub(super) fn handle_terminal_reply(
             kind: TerminalQueryKind::CursorPositionPrivate,
             ..
         } => {
-            // Standard CPR cannot be a fallback: `CSI 1;modifier R` is also
-            // the xterm/Kitty encoding for modified F3. A terminal which does
-            // not answer DECXCPR therefore fails closed instead of making
-            // keyboard input indistinguishable from protocol traffic.
+            // Prefer keyboard-safe DECXCPR, but retain compatibility with
+            // terminals that only implement standard CPR. The fallback is
+            // guarded by a status DSR so a modified F3 sequence cannot be
+            // mistaken for the cursor reply.
+            state.cursor_probe_backend = CursorProbeBackend::TerminalStandardGuarded;
+            state.pending_tmux_cursor = None;
+            state.tmux_cursor_retry_at = None;
+            state.need_cpr = state.editing && !state.foreground_process;
+            output.invalidate_anchor().map_err(output_error)?;
+        }
+        TerminalReply::Timeout {
+            kind: TerminalQueryKind::CursorPositionStandardGuarded,
+            ..
+        } => {
             state.cursor_probe_backend = CursorProbeBackend::Unavailable;
             state.pending_tmux_cursor = None;
             state.tmux_cursor_retry_at = None;
@@ -277,6 +287,18 @@ pub(super) fn maybe_probe_cursor(
             }
             let query = router.register(
                 TerminalQueryKind::CursorPositionPrivate,
+                Instant::now(),
+                TERMINAL_QUERY_TIMEOUT,
+            )?;
+            output.probe(query.bytes).map_err(output_error)?;
+            state.need_cpr = false;
+        }
+        CursorProbeBackend::TerminalStandardGuarded => {
+            if router.has_outstanding() {
+                return Ok(());
+            }
+            let query = router.register(
+                TerminalQueryKind::CursorPositionStandardGuarded,
                 Instant::now(),
                 TERMINAL_QUERY_TIMEOUT,
             )?;
@@ -358,8 +380,8 @@ pub(super) fn handle_tmux_cursor_result(
     let Some(position) = result.position else {
         // A stale/injected TMUX environment or unavailable tmux binary must
         // not disable a terminal which can answer DECXCPR directly. Try the
-        // keyboard-safe terminal probe once before declaring anchoring
-        // unavailable; standard CPR is never used.
+        // keyboard-safe terminal probe once before falling through to the
+        // guarded standard-CPR compatibility path.
         state.cursor_probe_backend = CursorProbeBackend::TerminalPrivate;
         state.tmux_cursor_retry_at = None;
         state.need_cpr = true;

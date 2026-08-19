@@ -9,6 +9,7 @@ const LATE_REPLY_PREFIX_TIMEOUT: Duration = Duration::from_millis(32);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TerminalQueryKind {
     CursorPosition,
+    CursorPositionStandardGuarded,
     SynchronizedOutput,
 }
 
@@ -109,6 +110,11 @@ impl TerminalReplyRouter {
             // adds the private `?` marker, so user shortcuts can never be
             // consumed as Hokan's cursor response.
             TerminalQueryKind::CursorPositionPrivate => b"\x1b[?6n" as &'static [u8],
+            // Some terminals implement standard CPR but not DECXCPR. Prefix
+            // the fallback with a status DSR whose `CSI 0 n` response cannot
+            // be produced by a modified function key, then require both
+            // replies as one guarded cursor report.
+            TerminalQueryKind::CursorPositionStandardGuarded => b"\x1b[5n\x1b[6n",
             TerminalQueryKind::SynchronizedOutput => b"\x1b[?2026$p",
         };
         Ok(RegisteredQuery { id, bytes })
@@ -328,24 +334,32 @@ enum CandidateState {
 fn classify(kind: TerminalQueryKind, bytes: &[u8]) -> CandidateState {
     match kind {
         TerminalQueryKind::CursorPositionPrivate => classify_cpr(bytes),
+        TerminalQueryKind::CursorPositionStandardGuarded => classify_guarded_standard_cpr(bytes),
         TerminalQueryKind::SynchronizedOutput => classify_sync_status(bytes),
     }
 }
 
 fn classify_cpr(bytes: &[u8]) -> CandidateState {
-    const PREFIX: &[u8] = b"\x1b[?";
-    if bytes.len() <= PREFIX.len() {
-        return if PREFIX.starts_with(bytes) {
+    classify_cpr_with_prefix(bytes, b"\x1b[?")
+}
+
+fn classify_guarded_standard_cpr(bytes: &[u8]) -> CandidateState {
+    classify_cpr_with_prefix(bytes, b"\x1b[0n\x1b[")
+}
+
+fn classify_cpr_with_prefix(bytes: &[u8], prefix: &[u8]) -> CandidateState {
+    if bytes.len() <= prefix.len() {
+        return if prefix.starts_with(bytes) {
             CandidateState::Potential
         } else {
             CandidateState::Invalid
         };
     }
-    if !bytes.starts_with(PREFIX) {
+    if !bytes.starts_with(prefix) {
         return CandidateState::Invalid;
     }
 
-    let body = &bytes[PREFIX.len()..];
+    let body = &bytes[prefix.len()..];
     if body.last() == Some(&b'R') {
         let numbers = &body[..body.len() - 1];
         let Some(separator) = numbers.iter().position(|byte| *byte == b';') else {
@@ -460,6 +474,73 @@ mod tests {
             )
             .expect("query should register");
         assert_eq!(query.bytes, b"\x1b[?6n");
+    }
+
+    #[test]
+    fn guarded_standard_cpr_is_consumed_for_every_chunk_split() {
+        let reply = b"\x1b[0n\x1b[12;34R";
+        for split in 0..=reply.len() {
+            let now = Instant::now();
+            let mut router = TerminalReplyRouter::default();
+            let registration = router
+                .register(
+                    TerminalQueryKind::CursorPositionStandardGuarded,
+                    now,
+                    Duration::from_secs(1),
+                )
+                .expect("query should register");
+            assert_eq!(registration.bytes, b"\x1b[5n\x1b[6n");
+            let first = router.route(&reply[..split], now);
+            let second = router.route(&reply[split..], now);
+            assert!(first.input.is_empty());
+            assert!(second.input.is_empty());
+            let replies: Vec<_> = first.replies.into_iter().chain(second.replies).collect();
+            assert_eq!(
+                replies,
+                vec![TerminalReply::CursorPosition {
+                    query_id: registration.id,
+                    position: CellPos::new(11, 33),
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn guarded_standard_cpr_never_consumes_modified_f3() {
+        let started = Instant::now();
+        let mut router = TerminalReplyRouter::default();
+        let query = router
+            .register(
+                TerminalQueryKind::CursorPositionStandardGuarded,
+                started,
+                Duration::from_secs(1),
+            )
+            .expect("cursor query");
+
+        for key in [
+            b"\x1b[1;1R".as_slice(),
+            b"\x1b[1;2R".as_slice(),
+            b"\x1b[1;3R".as_slice(),
+            b"\x1b[1;4R".as_slice(),
+            b"\x1b[1;5R".as_slice(),
+            b"\x1b[1;6R".as_slice(),
+            b"\x1b[1;7R".as_slice(),
+            b"\x1b[1;8R".as_slice(),
+        ] {
+            let routed = router.route(key, started);
+            assert_eq!(routed.input, key);
+            assert!(routed.replies.is_empty());
+        }
+
+        let routed = router.route(b"\x1b[0n\x1b[12;34R", started);
+        assert!(routed.input.is_empty());
+        assert_eq!(
+            routed.replies,
+            vec![TerminalReply::CursorPosition {
+                query_id: query.id,
+                position: CellPos::new(11, 33),
+            }]
+        );
     }
 
     #[test]

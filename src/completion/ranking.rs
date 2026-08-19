@@ -9,6 +9,15 @@ use crate::{
     terminal::RiskLevel,
 };
 
+const HISTORY_OVERLAP_BONUS: i16 = 100;
+
+#[derive(Debug, Eq, Hash, PartialEq)]
+enum DedupeKey {
+    ResultingBuffer(String),
+    Edit(usize, usize, String),
+    Display(String),
+}
+
 pub fn rank_and_dedupe(
     context: &CompletionContext,
     candidates: Vec<Candidate>,
@@ -64,7 +73,7 @@ pub fn rank_and_dedupe(
             .map(|candidate| candidate.source)
             .collect()
     };
-    let mut deduped: HashMap<(usize, usize, String), Candidate> = HashMap::new();
+    let mut deduped: HashMap<DedupeKey, Candidate> = HashMap::new();
     for mut candidate in candidates {
         if candidate.query_id != context.query_id || !has_valid_edit(context, &candidate) {
             continue;
@@ -155,30 +164,15 @@ pub fn rank_and_dedupe(
             workspace_bonus(context.workspace, &candidate.display.primary),
         );
         candidate.score.risk_penalty = risk_penalty(candidate.risk);
-        candidate.score.incomplete_penalty = match candidate.completeness {
-            Completeness::Runnable => 0,
-            // Directories are always NeedsInput because descending into them IS
-            // the interaction — the penalty would sink them below files.
-            Completeness::NeedsInput { .. } if candidate.kind == CandidateKind::Directory => 0,
-            Completeness::NeedsInput { .. } => 60,
-            Completeness::ActionOnly => 80,
-        };
-        let key = candidate.edit.as_ref().map_or_else(
-            || (usize::MAX, usize::MAX, candidate.display.primary.clone()),
-            |edit| (edit.range.start, edit.range.end, edit.replacement.clone()),
-        );
+        candidate.score.incomplete_penalty = incomplete_penalty(&candidate);
+        // Providers edit at different scopes: history replaces the whole line,
+        // while help, project, and filesystem providers usually replace only
+        // the active token. Deduplicate the command the edit actually produces
+        // so equivalent rows merge even when their TextEdits differ.
+        let key = dedupe_key(context, &candidate);
         match deduped.get_mut(&key) {
             Some(existing) => {
-                if ranking_key(&candidate) > ranking_key(existing) {
-                    let stricter = stricter_risk(existing.risk, candidate.risk);
-                    *existing = candidate;
-                    existing.risk = stricter;
-                } else {
-                    existing.risk = stricter_risk(existing.risk, candidate.risk);
-                }
-                // The merge may have raised the risk level; keep the displayed
-                // score in sync with the risk the merged row now carries.
-                existing.score.risk_penalty = risk_penalty(existing.risk);
+                merge_duplicate(existing, candidate);
             }
             None => {
                 deduped.insert(key, candidate);
@@ -213,6 +207,63 @@ pub fn rank_and_dedupe(
     });
     candidates.truncate(limit);
     candidates
+}
+
+fn dedupe_key(context: &CompletionContext, candidate: &Candidate) -> DedupeKey {
+    candidate.edit.as_ref().map_or_else(
+        || DedupeKey::Display(candidate.display.primary.clone()),
+        |edit| match apply_edit(&context.buffer.text, edit.range.clone(), &edit.replacement) {
+            Ok(resulting) => DedupeKey::ResultingBuffer(resulting),
+            Err(_) => DedupeKey::Edit(edit.range.start, edit.range.end, edit.replacement.clone()),
+        },
+    )
+}
+
+fn merge_duplicate(existing: &mut Candidate, candidate: Candidate) {
+    let distinct_history_source = (existing.source == crate::completion::CandidateSource::History
+        && candidate.source != crate::completion::CandidateSource::History)
+        || (candidate.source == crate::completion::CandidateSource::History
+            && existing.source != crate::completion::CandidateSource::History);
+    let stricter = stricter_risk(existing.risk, candidate.risk);
+    let merged_score = merge_score_signals(existing.score, candidate.score);
+
+    if ranking_key(&candidate) > ranking_key(existing) {
+        *existing = candidate;
+    }
+
+    existing.risk = stricter;
+    existing.score = merged_score;
+    if distinct_history_source || existing.score.history_overlap > 0 {
+        existing.score.history_overlap = HISTORY_OVERLAP_BONUS;
+    }
+    // The merge may have raised the risk level; keep the displayed score in
+    // sync with the risk the merged row now carries.
+    existing.score.risk_penalty = risk_penalty(existing.risk);
+    // This penalty describes the retained candidate's interaction semantics,
+    // unlike the other merged signals which describe shared ranking evidence.
+    existing.score.incomplete_penalty = incomplete_penalty(existing);
+}
+
+fn merge_score_signals(
+    left: crate::completion::ScoreSignals,
+    right: crate::completion::ScoreSignals,
+) -> crate::completion::ScoreSignals {
+    crate::completion::ScoreSignals {
+        match_priority: left.match_priority.max(right.match_priority),
+        continuation_priority: left.continuation_priority.max(right.continuation_priority),
+        command_priority: left.command_priority.max(right.command_priority),
+        match_quality: left.match_quality.max(right.match_quality),
+        source_trust: left.source_trust.max(right.source_trust),
+        spec_priority: left.spec_priority.max(right.spec_priority),
+        cwd_affinity: left.cwd_affinity.max(right.cwd_affinity),
+        frecency: left.frecency.max(right.frecency),
+        transition: left.transition.max(right.transition),
+        history_overlap: left.history_overlap.max(right.history_overlap),
+        context: left.context.max(right.context),
+        risk_penalty: left.risk_penalty.max(right.risk_penalty),
+        incomplete_penalty: left.incomplete_penalty.max(right.incomplete_penalty),
+        failed_penalty: left.failed_penalty.max(right.failed_penalty),
+    }
 }
 
 fn candidate_match_signal(query: &str, candidate: &Candidate) -> MatchSignal {
@@ -484,6 +535,17 @@ const fn risk_penalty(risk: RiskLevel) -> i16 {
         RiskLevel::Medium => 100,
         RiskLevel::High => 250,
         RiskLevel::Unknown => 300,
+    }
+}
+
+fn incomplete_penalty(candidate: &Candidate) -> i16 {
+    match candidate.completeness {
+        Completeness::Runnable => 0,
+        // Directories are always NeedsInput because descending into them IS
+        // the interaction — the penalty would sink them below files.
+        Completeness::NeedsInput { .. } if candidate.kind == CandidateKind::Directory => 0,
+        Completeness::NeedsInput { .. } => 60,
+        Completeness::ActionOnly => 80,
     }
 }
 
@@ -848,30 +910,52 @@ mod tests {
     }
 
     #[test]
-    fn executable_name_beats_full_line_history_in_an_executable_argument_slot() {
+    fn executable_argument_merges_matching_history_and_ranks_it_first() {
         let context = buffer_context("which co");
-        let history = history_candidate(&context, "which codex", context.buffer.text.len());
-        let executable = Candidate::new(
-            context.query_id,
-            "which codex",
-            "PATH command",
-            Some(TextEdit {
-                range: context.parsed.replacement.clone(),
-                replacement: "codex".into(),
-                cursor_after: CursorPlacement::End,
-            }),
-            CandidateAction::Insert,
-            CandidateSource::PathCommand,
-            CandidateKind::Command,
-            Completeness::Runnable,
-            RiskLevel::Unknown,
-            "path:codex",
-        );
+        let mut history = history_candidate(&context, "which codex", context.buffer.text.len());
+        history.score.cwd_affinity = 100;
+        history.score.frecency = 80;
+        history.score.transition = 120;
+        history.score.failed_penalty = 150;
+        let executable = |name: &str| {
+            Candidate::new(
+                context.query_id,
+                format!("which {name}"),
+                "PATH command",
+                Some(TextEdit {
+                    range: context.parsed.replacement.clone(),
+                    replacement: name.into(),
+                    cursor_after: CursorPlacement::End,
+                }),
+                CandidateAction::Insert,
+                CandidateSource::PathCommand,
+                CandidateKind::Command,
+                Completeness::Runnable,
+                RiskLevel::Unknown,
+                format!("path:{name}"),
+            )
+        };
 
-        let ranked = rank_and_dedupe(&context, vec![history, executable], 10);
+        let ranked = rank_and_dedupe(
+            &context,
+            vec![executable("codex"), executable("code"), history],
+            10,
+        );
+        assert_eq!(ranked.len(), 2);
+        assert_eq!(ranked[0].display.primary, "which codex");
         assert_eq!(ranked[0].source, CandidateSource::PathCommand);
         assert_eq!(ranked[0].score.command_priority, 1);
-        assert_eq!(ranked[1].score.continuation_priority, 0);
+        assert_eq!(ranked[0].score.history_overlap, HISTORY_OVERLAP_BONUS);
+        assert_eq!(ranked[0].score.cwd_affinity, 100);
+        assert_eq!(ranked[0].score.frecency, 80);
+        assert_eq!(ranked[0].score.transition, 120);
+        assert_eq!(ranked[0].score.failed_penalty, 150);
+        assert_eq!(
+            ranked[0].edit.as_ref().map(|edit| edit.range.clone()),
+            Some(context.parsed.replacement.clone()),
+            "the PATH candidate's token-level edit semantics must survive the merge"
+        );
+        assert_eq!(ranked[1].display.primary, "which code");
     }
 
     #[test]

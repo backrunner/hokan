@@ -32,6 +32,7 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 const READ_POLL: Duration = Duration::from_millis(5);
 const SYNC_QUERY: &[u8] = b"\x1b[?2026$p";
 const HOKAN_CPR_QUERY: &[u8] = b"\x1b[?6n";
+const STATUS_QUERY: &[u8] = b"\x1b[5n";
 const STANDARD_CPR_QUERY: &[u8] = b"\x1b[6n";
 const KITTY_KEYBOARD_QUERY: &[u8] = b"\x1b[?u";
 const DEVICE_ATTRIBUTES_QUERY: &[u8] = b"\x1b[c";
@@ -63,6 +64,7 @@ struct TerminalSession {
     transcript: Vec<u8>,
     probe_tail: Vec<u8>,
     sync_status: u8,
+    private_cpr_supported: bool,
     sync_replies: usize,
     cpr_replies: usize,
 }
@@ -75,6 +77,15 @@ impl TerminalSession {
     fn spawn_with_sync_status(sync_status: u8) -> Self {
         let (home, work) = fixture_directories();
         Self::spawn_hokan(home, work, sync_status)
+    }
+
+    fn spawn_without_private_cpr() -> Self {
+        let (home, work) = fixture_directories();
+        let mut command = CommandBuilder::new(hokan_test_bin());
+        command.arg("--shell");
+        command.arg("zsh");
+        configure_command(&mut command, &home, &work);
+        Self::spawn_command_with_private_cpr(home, work, command, 2, false)
     }
 
     fn spawn_with_dynamic_prompt() -> Self {
@@ -292,6 +303,16 @@ impl TerminalSession {
         command: CommandBuilder,
         sync_status: u8,
     ) -> Self {
+        Self::spawn_command_with_private_cpr(home, work, command, sync_status, true)
+    }
+
+    fn spawn_command_with_private_cpr(
+        home: TempDir,
+        work: TempDir,
+        command: CommandBuilder,
+        sync_status: u8,
+        private_cpr_supported: bool,
+    ) -> Self {
         let pty = native_pty_system();
         let pair = pty
             .openpty(PtySize {
@@ -345,6 +366,7 @@ impl TerminalSession {
             transcript: Vec::new(),
             probe_tail: Vec::new(),
             sync_status,
+            private_cpr_supported,
             sync_replies: 0,
             cpr_replies: 0,
         }
@@ -380,6 +402,7 @@ impl TerminalSession {
             let max_query_len = SYNC_QUERY
                 .len()
                 .max(HOKAN_CPR_QUERY.len())
+                .max(STATUS_QUERY.len())
                 .max(STANDARD_CPR_QUERY.len())
                 .max(KITTY_KEYBOARD_QUERY.len())
                 .max(DEVICE_ATTRIBUTES_QUERY.len());
@@ -398,11 +421,14 @@ impl TerminalSession {
             } else if self.probe_tail.ends_with(DEVICE_ATTRIBUTES_QUERY) {
                 self.write(b"\x1b[?1;2c");
                 self.probe_tail.clear();
-            } else if self.probe_tail.ends_with(HOKAN_CPR_QUERY) {
+            } else if self.probe_tail.ends_with(HOKAN_CPR_QUERY) && self.private_cpr_supported {
                 let (row, col) = self.terminal.screen().cursor_position();
                 let reply = format!("\x1b[?{};{}R", row + 1, col + 1);
                 self.write(reply.as_bytes());
                 self.cpr_replies += 1;
+                self.probe_tail.clear();
+            } else if self.probe_tail.ends_with(STATUS_QUERY) {
+                self.write(b"\x1b[0n");
                 self.probe_tail.clear();
             } else if self.probe_tail.ends_with(STANDARD_CPR_QUERY) {
                 let (row, col) = self.terminal.screen().cursor_position();
@@ -650,6 +676,27 @@ impl TerminalSession {
     fn exit_shell(&mut self) {
         self.write(b"\x15exit\r");
     }
+}
+
+#[test]
+fn terminal_without_private_cpr_uses_guarded_standard_fallback() {
+    if !command_exists("zsh") {
+        return;
+    }
+    let mut terminal = TerminalSession::spawn_without_private_cpr();
+    terminal.wait_for_screen("HK> ");
+    terminal.write(b"ls ");
+    terminal.wait_for_screen(TAG_SPEC);
+    assert!(
+        terminal
+            .transcript
+            .windows(b"\x1b[5n\x1b[6n".len())
+            .any(|window| window == b"\x1b[5n\x1b[6n"),
+        "guarded standard cursor probe was not emitted"
+    );
+
+    terminal.exit_shell();
+    terminal.wait_until_exit();
 }
 
 impl Drop for TerminalSession {
