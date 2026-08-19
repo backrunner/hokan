@@ -202,6 +202,16 @@ fn configured_credential_available_follows_the_auth_method() {
         ..AiConfig::default()
     };
     assert!(configured_credential_available(&file_config, &path));
+
+    for provider in ["ollama", "lmstudio"] {
+        let no_auth_config = AiConfig {
+            provider: provider.into(),
+            api_key_env: String::new(),
+            api_key_file: None,
+            ..AiConfig::default()
+        };
+        assert!(configured_credential_available(&no_auth_config, &path));
+    }
 }
 
 #[test]

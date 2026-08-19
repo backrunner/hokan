@@ -16,8 +16,9 @@ use crate::{
         protocol::AiContext,
     },
     config::{
-        AiAuth, AiConfig, CredentialError, OAuthTokens, ProviderCredential, load_api_key,
-        read_credential, resolve_credential_path, write_credential,
+        AI_NO_AUTH_PROVIDER_SLUGS, AiAuth, AiConfig, CredentialError, OAuthTokens,
+        ProviderCredential, load_api_key, read_credential, resolve_credential_path,
+        write_credential,
     },
 };
 
@@ -47,15 +48,31 @@ pub struct AiClient {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Transport {
     ChatCompletions,
+    AnthropicMessages,
     CodexResponses,
     GeminiCodeAssist,
 }
 
 impl Transport {
-    fn for_provider(provider: &str) -> Self {
+    fn for_provider(provider: &str, model: &str) -> Self {
+        let model = model.trim().to_ascii_lowercase();
+        let model = model.rsplit('/').next().unwrap_or(model.as_str());
         match provider {
-            "openai-oauth" => Self::CodexResponses,
+            "openai-api" | "openai-oauth" => Self::CodexResponses,
+            "anthropic" | "kimi-coding" | "minimax" | "minimax-cn" => Self::AnthropicMessages,
             "gemini-oauth" => Self::GeminiCodeAssist,
+            "opencode-zen" if model.starts_with("claude-") || model.starts_with("qwen") => {
+                Self::AnthropicMessages
+            }
+            "opencode-zen" if model.starts_with("gpt-") || model.contains("codex") => {
+                Self::CodexResponses
+            }
+            "opencode-go" if model.starts_with("qwen") || model.starts_with("minimax") => {
+                Self::AnthropicMessages
+            }
+            "opencode-go" if model.starts_with("gpt-") || model.contains("codex") => {
+                Self::CodexResponses
+            }
             _ => Self::ChatCompletions,
         }
     }
@@ -75,11 +92,13 @@ impl AiClient {
             .connect_timeout(timeout.min(Duration::from_secs(10)))
             .timeout(timeout)
             .redirect(Policy::none())
+            .user_agent(concat!("hokan/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|_| AiClientError::Configuration)?;
-        let transport = Transport::for_provider(config.provider.trim());
+        let transport = Transport::for_provider(config.provider.trim(), config.model.trim());
         let endpoint = match transport {
             Transport::ChatCompletions => normalize_endpoint(&config.endpoint)?,
+            Transport::AnthropicMessages => normalize_anthropic_endpoint(&config.endpoint)?,
             Transport::CodexResponses => codex::normalize_endpoint(&config.endpoint)?,
             Transport::GeminiCodeAssist => code_assist::normalize_endpoint(&config.endpoint)?,
         };
@@ -107,6 +126,9 @@ impl AiClient {
         let user_content = user_prompt(context);
         match self.transport {
             Transport::ChatCompletions => self.chat_completions(&auth, &user_content, cancel).await,
+            Transport::AnthropicMessages => {
+                self.anthropic_messages(&auth, &user_content, cancel).await
+            }
             Transport::CodexResponses => codex::request(self, &auth, &user_content, cancel).await,
             Transport::GeminiCodeAssist => {
                 code_assist::request(self, &auth, &user_content, cancel).await
@@ -132,7 +154,7 @@ impl AiClient {
                     content: user_content,
                 },
             ],
-            temperature: 0.1,
+            temperature: chat_temperature(&self.model),
             max_tokens: 500,
         };
         let body = send_and_read(
@@ -153,6 +175,41 @@ impl AiClient {
         crate::ai::parse_ai_commands(content).map_err(|_| AiClientError::InvalidResponse)
     }
 
+    async fn anthropic_messages(
+        &self,
+        auth: &PreparedAuth,
+        user_content: &str,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<crate::ai::AiCommand>, AiClientError> {
+        let request = AnthropicRequest {
+            model: &self.model,
+            max_tokens: 500,
+            system: SYSTEM_PROMPT,
+            messages: vec![AnthropicMessage {
+                role: "user",
+                content: user_content,
+            }],
+        };
+        let mut builder = self
+            .client
+            .post(&self.endpoint)
+            .header("anthropic-version", "2023-06-01");
+        builder = if anthropic_uses_bearer(self.provider_slug()) {
+            builder.bearer_auth(auth.bearer.as_str())
+        } else {
+            builder.header("x-api-key", auth.bearer.as_str())
+        };
+        let body = send_and_read(builder.json(&request), cancel).await?;
+        let response: AnthropicResponse =
+            serde_json::from_slice(&body).map_err(|_| AiClientError::InvalidResponse)?;
+        let content = response
+            .content
+            .iter()
+            .find_map(|block| block.text.as_deref())
+            .ok_or(AiClientError::InvalidResponse)?;
+        crate::ai::parse_ai_commands(content).map_err(|_| AiClientError::InvalidResponse)
+    }
+
     /// Resolves the bearer credential for one request, dispatched on
     /// `ai.auth`. OAuth tokens are refreshed transparently when they expire
     /// within the provider's skew.
@@ -164,10 +221,12 @@ impl AiClient {
             AiAuth::ApiKey => {
                 let bearer = match load_api_key(&self.config, &self.default_credential_path) {
                     Ok(key) => key,
-                    // Ollama ignores the bearer token but expects the header;
-                    // a placeholder keeps key-less local setups working.
-                    Err(CredentialError::Missing) if self.provider_slug() == "ollama" => {
-                        Zeroizing::new("ollama".to_owned())
+                    // Local no-auth servers tolerate the OpenAI client's
+                    // conventional placeholder bearer value.
+                    Err(CredentialError::Missing)
+                        if AI_NO_AUTH_PROVIDER_SLUGS.contains(&self.provider_slug()) =>
+                    {
+                        Zeroizing::new("not-required".to_owned())
                     }
                     Err(CredentialError::Missing) => return Err(AiClientError::MissingCredential),
                     Err(_) => return Err(AiClientError::CredentialRejected),
@@ -364,7 +423,8 @@ fn map_reqwest_error(error: reqwest::Error) -> AiClientError {
 struct ChatRequest<'a> {
     model: &'a str,
     messages: Vec<ChatMessage<'a>>,
-    temperature: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
     max_tokens: u32,
 }
 
@@ -389,6 +449,31 @@ struct ChatResponseMessage {
     content: String,
 }
 
+#[derive(Serialize)]
+struct AnthropicRequest<'a> {
+    model: &'a str,
+    max_tokens: u32,
+    system: &'a str,
+    messages: Vec<AnthropicMessage<'a>>,
+}
+
+#[derive(Serialize)]
+struct AnthropicMessage<'a> {
+    role: &'a str,
+    content: &'a str,
+}
+
+#[derive(Deserialize)]
+struct AnthropicResponse {
+    content: Vec<AnthropicContentBlock>,
+}
+
+#[derive(Deserialize)]
+struct AnthropicContentBlock {
+    #[serde(default)]
+    text: Option<String>,
+}
+
 fn user_prompt(context: &AiContext) -> String {
     format!(
         "request: {}\nos: {}\narchitecture: {}\nshell: {}\ncwd_basename: {}\nproject_kinds: {}",
@@ -410,6 +495,37 @@ fn normalize_endpoint(endpoint: &str) -> Result<String, AiClientError> {
     };
     validate_endpoint_url(&url)?;
     Ok(url)
+}
+
+fn normalize_anthropic_endpoint(endpoint: &str) -> Result<String, AiClientError> {
+    let endpoint = endpoint.trim().trim_end_matches('/');
+    let url = if endpoint.ends_with("/messages") {
+        endpoint.to_owned()
+    } else if endpoint.ends_with("/v1") {
+        format!("{endpoint}/messages")
+    } else {
+        format!("{endpoint}/v1/messages")
+    };
+    validate_endpoint_url(&url)?;
+    Ok(url)
+}
+
+fn chat_temperature(model: &str) -> Option<f32> {
+    let normalized = model.trim().to_ascii_lowercase();
+    let bare = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
+    if bare == "kimi"
+        || bare.starts_with("kimi-")
+        || bare.starts_with("moonshot-")
+        || bare.starts_with("moonshot_")
+    {
+        None
+    } else {
+        Some(0.1)
+    }
+}
+
+fn anthropic_uses_bearer(provider: &str) -> bool {
+    matches!(provider, "minimax" | "minimax-cn")
 }
 
 fn status_error(status: StatusCode) -> AiClientError {

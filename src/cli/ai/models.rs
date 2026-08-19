@@ -42,7 +42,13 @@ pub(super) fn list_models_live(query: &ModelListQuery<'_>) -> Option<Vec<String>
     runtime.block_on(async move {
         let mut request = client.get(url);
         if let Some(bearer) = bearer {
-            request = request.bearer_auth(bearer);
+            request = if query.slug == "anthropic" {
+                request
+                    .header("x-api-key", bearer)
+                    .header("anthropic-version", "2023-06-01")
+            } else {
+                request.bearer_auth(bearer)
+            };
         }
         if let Some(account_id) = account_id {
             request = request.header("ChatGPT-Account-Id", account_id);

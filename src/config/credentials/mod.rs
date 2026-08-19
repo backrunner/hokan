@@ -11,7 +11,7 @@ use std::{
 
 use zeroize::Zeroizing;
 
-use super::{AiAuth, AiConfig};
+use super::{AiAuth, AiConfig, model::AI_NO_AUTH_PROVIDER_SLUGS};
 use io::{lock_credential_store, write_credential_store};
 use store::{CredentialStore, ProviderEntry, read_credential_store, validate_credential};
 
@@ -80,6 +80,9 @@ pub fn configured_credential_available(config: &AiConfig, default_path: &Path) -
             read_credential(&path, provider),
             Ok(ProviderCredential::OAuth(_))
         );
+    }
+    if AI_NO_AUTH_PROVIDER_SLUGS.contains(&config.provider.trim()) {
+        return true;
     }
     credential_available(config, default_path)
 }

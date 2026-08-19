@@ -160,9 +160,10 @@ impl Config {
             if oauth && !AI_OAUTH_PROVIDER_SLUGS.contains(&provider) {
                 return Err(crate::Error::Config(
                     "ai.auth = oauth requires ai.provider to be one of: openai-oauth, gemini-oauth, grok-oauth"
-                        .into(),
+                    .into(),
                 ));
             }
+            let no_auth = AI_NO_AUTH_PROVIDER_SLUGS.contains(&provider);
             let has_credential_source = self
                 .ai
                 .api_key_file
@@ -171,10 +172,11 @@ impl Config {
                 || !self.ai.api_key_env.trim().is_empty();
             if self.ai.endpoint.trim().is_empty()
                 || self.ai.model.trim().is_empty()
-                || !(oauth || has_credential_source)
+                || !(oauth || no_auth || has_credential_source)
             {
                 return Err(crate::Error::Config(
-                    "enabled AI requires endpoint, model, and a credential source".into(),
+                    "enabled AI requires endpoint, model, and a credential source unless the provider is credential-free"
+                        .into(),
                 ));
             }
             if !(1_000..=120_000).contains(&self.ai.timeout_ms) {
@@ -470,7 +472,7 @@ pub enum AiAuth {
 /// Slugs accepted by `ai.provider`. Duplicated from `ai::providers::registry()`
 /// because config is the lower-level module and must not depend on the ai
 /// module; the `ai::providers` tests assert both lists stay in sync.
-pub(crate) const AI_PROVIDER_SLUGS: [&str; 8] = [
+pub(crate) const AI_PROVIDER_SLUGS: [&str; 36] = [
     "deepseek",
     "openai-oauth",
     "gemini-oauth",
@@ -478,12 +480,43 @@ pub(crate) const AI_PROVIDER_SLUGS: [&str; 8] = [
     "grok-oauth",
     "grok",
     "ollama",
+    "lmstudio",
     "custom",
+    "opencode-go",
+    "openrouter",
+    "kimi-coding",
+    "openai-api",
+    "anthropic",
+    "groq",
+    "mistral",
+    "together",
+    "kimi",
+    "kimi-cn",
+    "zai",
+    "stepfun",
+    "alibaba",
+    "alibaba-coding-plan",
+    "ollama-cloud",
+    "opencode-zen",
+    "ai-gateway",
+    "huggingface",
+    "nvidia",
+    "kilocode",
+    "xiaomi",
+    "tencent-tokenhub",
+    "fireworks",
+    "novita",
+    "deepinfra",
+    "minimax",
+    "minimax-cn",
 ];
 
 /// Slugs whose registry entries support `auth = "oauth"`.
 pub(crate) const AI_OAUTH_PROVIDER_SLUGS: [&str; 3] =
     ["openai-oauth", "gemini-oauth", "grok-oauth"];
+
+/// Slugs whose registry entries require no credential.
+pub(crate) const AI_NO_AUTH_PROVIDER_SLUGS: [&str; 2] = ["ollama", "lmstudio"];
 
 impl Default for AiConfig {
     fn default() -> Self {
@@ -721,6 +754,23 @@ mod tests {
         config.ai.provider = "custom".into();
         config.ai.endpoint = "http://localhost:8080/v1".into();
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn credential_free_provider_does_not_require_a_source() {
+        for (provider, endpoint) in [
+            ("ollama", "http://localhost:11434/v1"),
+            ("lmstudio", "http://127.0.0.1:1234/v1"),
+        ] {
+            let mut config = Config::default();
+            config.ai.enabled = true;
+            config.ai.provider = provider.into();
+            config.ai.endpoint = endpoint.into();
+            config.ai.model = "local-model".into();
+            config.ai.api_key_env.clear();
+            config.ai.api_key_file = None;
+            assert!(config.validate().is_ok(), "{provider} should need no key");
+        }
     }
 
     #[test]

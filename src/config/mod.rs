@@ -9,6 +9,7 @@ pub use credentials::{
     credential_available, delete_credential, load_api_key, read_credential,
     resolve_credential_path, write_api_key, write_credential,
 };
+pub(crate) use model::AI_NO_AUTH_PROVIDER_SLUGS;
 #[cfg(test)]
 pub(crate) use model::{AI_OAUTH_PROVIDER_SLUGS, AI_PROVIDER_SLUGS};
 pub use model::{

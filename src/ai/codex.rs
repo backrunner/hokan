@@ -1,5 +1,6 @@
-//! Codex Responses transport (`openai-oauth`): OpenAI's Responses API behind
-//! `chatgpt.com/backend-api/codex`, carrying the ChatGPT account id header.
+//! OpenAI Responses transport. ChatGPT OAuth uses the Codex backend and an
+//! account id; direct OpenAI and compatible relays use the same wire format
+//! without that account header.
 
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;

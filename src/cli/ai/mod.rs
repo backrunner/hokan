@@ -25,7 +25,7 @@ mod tests;
 mod wizard;
 
 use models::list_models_live;
-use wizard::run_with_io;
+use wizard::run_with_io_tty;
 
 pub fn run(command: AiCommand) -> crate::Result<()> {
     match command {
@@ -41,7 +41,7 @@ pub fn run(command: AiCommand) -> crate::Result<()> {
             let mut input = std::io::stdin().lock();
             let mut output = std::io::stdout().lock();
             let mut err = std::io::stderr().lock();
-            run_with_io(&mut input, &mut output, &mut err, &paths, production_deps())
+            run_with_io_tty(&mut input, &mut output, &mut err, &paths, production_deps())
         }
     }
 }

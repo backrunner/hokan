@@ -56,6 +56,14 @@ fn run_script(
     )
 }
 
+fn provider_number(slug: &str) -> usize {
+    crate::ai::providers::registry()
+        .iter()
+        .position(|spec| spec.slug == slug)
+        .map(|index| index + 1)
+        .expect("provider registered")
+}
+
 #[cfg(unix)]
 fn credentials_mode(paths: &ConfigPaths) -> u32 {
     use std::os::unix::fs::PermissionsExt;
@@ -108,6 +116,116 @@ fn deepseek_happy_path_writes_config_and_private_credential() {
 }
 
 #[test]
+fn opencode_go_subscription_uses_its_zen_endpoint_and_key_store() {
+    let directory = tempfile::tempdir().expect("directory");
+    let paths = paths(&directory);
+    let script = format!(
+        "{}\nopencode-go-key-123\n\n",
+        provider_number("opencode-go")
+    );
+    let (output, err, result) = run_script(&script, &paths, base_deps());
+    result.expect("OpenCode Go wizard should succeed");
+
+    let config = Config::load(&paths.config_file).expect("load config");
+    assert_eq!(config.ai.provider, "opencode-go");
+    assert_eq!(config.ai.endpoint, "https://opencode.ai/zen/go/v1");
+    assert_eq!(config.ai.model, "kimi-k2.7-code");
+    match read_credential(&paths.credentials_file, "opencode-go").expect("credential") {
+        ProviderCredential::ApiKey(key) => assert_eq!(key.as_str(), "opencode-go-key-123"),
+        ProviderCredential::OAuth(_) => panic!("OpenCode Go uses an API key"),
+    }
+    assert!(output.contains("OpenCode Go"));
+    assert!(!output.contains("opencode-go-key-123"));
+    assert!(!err.contains("opencode-go-key-123"));
+}
+
+#[test]
+fn openrouter_uses_the_openrouter_endpoint_and_key_store() {
+    let directory = tempfile::tempdir().expect("directory");
+    let paths = paths(&directory);
+    let script = format!("{}\nopenrouter-key-123\n\n", provider_number("openrouter"));
+    let (_output, _err, result) = run_script(&script, &paths, base_deps());
+    result.expect("OpenRouter wizard should succeed");
+
+    let config = Config::load(&paths.config_file).expect("load config");
+    assert_eq!(config.ai.provider, "openrouter");
+    assert_eq!(config.ai.endpoint, "https://openrouter.ai/api/v1");
+    assert_eq!(config.ai.model, "anthropic/claude-sonnet-4.6");
+    match read_credential(&paths.credentials_file, "openrouter").expect("credential") {
+        ProviderCredential::ApiKey(key) => assert_eq!(key.as_str(), "openrouter-key-123"),
+        ProviderCredential::OAuth(_) => panic!("OpenRouter uses an API key"),
+    }
+}
+
+#[test]
+fn common_api_key_providers_use_registry_defaults_and_private_credentials() {
+    for (slug, endpoint, model) in [
+        (
+            "anthropic",
+            "https://api.anthropic.com/v1",
+            "claude-sonnet-4-6",
+        ),
+        (
+            "groq",
+            "https://api.groq.com/openai/v1",
+            "llama-3.3-70b-versatile",
+        ),
+        (
+            "alibaba-coding-plan",
+            "https://coding-intl.dashscope.aliyuncs.com/v1",
+            "qwen3.7-plus",
+        ),
+        ("opencode-zen", "https://opencode.ai/zen/v1", "gpt-5.4"),
+        ("kimi-coding", "https://api.kimi.com/coding", "kimi-k3"),
+        (
+            "novita",
+            "https://api.novita.ai/openai/v1",
+            "moonshotai/kimi-k2.5",
+        ),
+    ] {
+        let directory = tempfile::tempdir().expect("directory");
+        let paths = paths(&directory);
+        let key = format!("{slug}-test-key");
+        let script = format!("{}\n{key}\n\n", provider_number(slug));
+        let (output, err, result) = run_script(&script, &paths, base_deps());
+        result.unwrap_or_else(|error| panic!("{slug} wizard failed: {error}"));
+
+        let config = Config::load(&paths.config_file).expect("load config");
+        assert_eq!(config.ai.provider, slug);
+        assert_eq!(config.ai.endpoint, endpoint);
+        assert_eq!(config.ai.model, model);
+        match read_credential(&paths.credentials_file, slug).expect("credential") {
+            ProviderCredential::ApiKey(stored) => assert_eq!(stored.as_str(), key),
+            ProviderCredential::OAuth(_) => panic!("{slug} uses an API key"),
+        }
+        assert!(!output.contains(&key));
+        assert!(!err.contains(&key));
+        #[cfg(unix)]
+        assert_eq!(credentials_mode(&paths), 0o600);
+    }
+}
+
+#[test]
+fn provider_environment_alias_is_detected() {
+    let directory = tempfile::tempdir().expect("directory");
+    let paths = paths(&directory);
+    let mut deps = base_deps();
+    deps.env_get =
+        Box::new(|name| (name == "GLM_API_KEY").then(|| "glm-environment-key".to_owned()));
+    let script = format!("{}\n\n\n", provider_number("zai"));
+    let (output, err, result) = run_script(&script, &paths, deps);
+    result.expect("Z.AI wizard should succeed");
+
+    assert!(output.contains("$GLM_API_KEY"));
+    assert!(!output.contains("glm-environment-key"));
+    assert!(!err.contains("glm-environment-key"));
+    match read_credential(&paths.credentials_file, "zai").expect("credential") {
+        ProviderCredential::ApiKey(key) => assert_eq!(key.as_str(), "glm-environment-key"),
+        ProviderCredential::OAuth(_) => panic!("Z.AI uses an API key"),
+    }
+}
+
+#[test]
 fn current_provider_is_marked_and_used_as_default() {
     let directory = tempfile::tempdir().expect("directory");
     let paths = paths(&directory);
@@ -127,7 +245,7 @@ fn current_provider_is_marked_and_used_as_default() {
     // Enter 接受服务商默认值 deepseek，随后输入密钥，Enter 接受当前模型。
     let (output, _err, result) = run_script("\nre-key-999\n\n", &paths, deps);
     result.expect("wizard should succeed");
-    assert!(output.contains("(current)"));
+    assert!(output.contains("当前"));
 
     let config = Config::load(&paths.config_file).expect("load config");
     assert_eq!(config.ai.provider, "deepseek");
@@ -156,12 +274,40 @@ fn ollama_skips_credentials_and_uses_live_models() {
     assert_eq!(config.ai.provider, "ollama");
     assert_eq!(config.ai.endpoint, "http://localhost:11434/v1");
     assert_eq!(config.ai.model, "llama3.2");
+    assert!(config.ai.api_key_env.is_empty());
     assert!(config.ai.api_key_file.is_none());
     assert!(
         !paths.credentials_file.exists(),
         "ollama must not create a credential file"
     );
-    assert!(!output.contains("API Key"));
+    assert!(!output.contains("API Key: "));
+    assert!(output.contains("[3/6] 配置凭据"));
+    assert!(output.contains("无需配置凭据"));
+}
+
+#[test]
+fn lmstudio_skips_credentials_and_uses_live_models() {
+    let directory = tempfile::tempdir().expect("directory");
+    let paths = paths(&directory);
+    let mut deps = base_deps();
+    deps.list_models = Box::new(|query| {
+        assert_eq!(query.slug, "lmstudio");
+        assert_eq!(query.bearer, None);
+        Some(vec!["local-model".to_owned()])
+    });
+    let script = format!("{}\n\n", provider_number("lmstudio"));
+    let (output, _err, result) = run_script(&script, &paths, deps);
+    result.expect("wizard should succeed");
+
+    let config = Config::load(&paths.config_file).expect("load config");
+    assert_eq!(config.ai.provider, "lmstudio");
+    assert_eq!(config.ai.endpoint, "http://127.0.0.1:1234/v1");
+    assert_eq!(config.ai.model, "local-model");
+    assert!(config.ai.api_key_env.is_empty());
+    assert!(config.ai.api_key_file.is_none());
+    assert!(!paths.credentials_file.exists());
+    assert!(output.contains("[3/6] 配置凭据"));
+    assert!(output.contains("无需配置凭据"));
 }
 
 #[test]
@@ -260,11 +406,11 @@ fn custom_endpoint_reprompts_until_valid() {
     let directory = tempfile::tempdir().expect("directory");
     let paths = paths(&directory);
     // custom 无静态模型表，拉取失败 → 手动输入模型。
-    let (output, err, result) = run_script(
-        "8\nbad url with spaces\napi.example.com/v1\ncustom-key-1\nmy-model\n",
-        &paths,
-        base_deps(),
+    let script = format!(
+        "{}\nbad url with spaces\napi.example.com/v1\ncustom-key-1\nmy-model\n",
+        provider_number("custom")
     );
+    let (output, err, result) = run_script(&script, &paths, base_deps());
     result.expect("wizard should succeed");
     assert!(err.contains("端点"));
 
@@ -685,6 +831,7 @@ fn seed_api_key_config(paths: &ConfigPaths) {
     config.ai.auth = AiAuth::ApiKey;
     config.ai.endpoint = "https://api.deepseek.com/v1".into();
     config.ai.model = "deepseek-chat".into();
+    config.ai.api_key_env.clear();
     config.ai.api_key_file = Some(PathBuf::from("credentials.toml"));
     config
         .write_atomic(&paths.config_file)
@@ -705,6 +852,10 @@ fn switching_to_ollama_clears_stale_api_key_file() {
     assert!(
         config.ai.api_key_file.is_none(),
         "stale api_key_file must be cleared"
+    );
+    assert!(
+        config.ai.api_key_env.is_empty(),
+        "credential-free providers must not retain an environment source"
     );
 }
 

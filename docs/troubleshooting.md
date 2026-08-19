@@ -146,9 +146,37 @@ hokan doctor
 hokan ai setup
 ```
 
-向导会按服务商写入 `~/.config/hokan/credentials.toml`（`version = 2`，`0600`）。OAuth
-服务商的 token 过期前自动刷新；刷新失败时该次请求会带旧 token 并收到 401，重新运行
-`hokan ai setup` 登录即可。
+向导会用分步彩色界面展示服务商、凭据、模型和连接测试；错误为红色，成功为绿色。可在
+`[ui]` 中设置 `color = "never"`，或设置 `NO_COLOR=1` 关闭颜色。它会按服务商写入
+`~/.config/hokan/credentials.toml`（`version = 2`，`0600`）；手动输入 key 时会暂时关闭
+终端回显。OpenCode Go/Zen 请在
+`https://opencode.ai/auth` 创建 API key 并选择对应线路；OpenRouter 请选择
+`OpenRouter` 并在 `https://openrouter.ai/settings/keys` 创建 key。OAuth 服务商的 token
+过期前自动刷新；刷新失败时该次请求会带旧 token 并收到 401，重新运行 `hokan ai setup`
+登录即可。
+
+OpenCode Go 优先读取 `OPENCODE_GO_API_KEY`（`OPENCODE_API_KEY` 仅为兼容别名）。
+`sk-kimi-...` 类型的 Kimi Coding Plan key 应选择 `Kimi Coding Plan`；Moonshot 平台 key
+应选择 `Kimi / Moonshot`，两者使用不同端点和协议。
+
+向导当前支持以下几类线路：
+
+| 类型 | 服务商 |
+| --- | --- |
+| 账号登录 | ChatGPT/Codex、Gemini Code Assist、xAI Grok |
+| 直接 API | OpenAI、Anthropic、Gemini、xAI、DeepSeek、Groq、Mistral、Together、Kimi/Moonshot、Z.AI/GLM、StepFun、Alibaba/DashScope、Hugging Face、NVIDIA NIM、Xiaomi MiMo、Tencent TokenHub、Fireworks、NovitaAI、DeepInfra、MiniMax |
+| 订阅/网关 | OpenCode Go/Zen、OpenRouter、Kimi Coding Plan、Alibaba Coding Plan、Ollama Cloud、Vercel AI Gateway、Kilo Code |
+| 本地/自托管 | Ollama、LM Studio、自定义 OpenAI-compatible endpoint |
+
+Anthropic、MiniMax 和 Kimi Coding Plan 使用 Anthropic Messages；OpenAI API key 使用
+Responses；OpenCode Go/Zen 会按模型自动选择 Chat Completions、Messages 或 Responses。
+若连接测试返回
+`HK-AI-JSON` 或 `HK-AI-HTTP`，先确认模型是否属于所选服务商，不要把其他平台的模型名
+直接复制过来。
+
+Nous Portal、Qwen OAuth、MiniMax OAuth、GitHub Copilot、AWS Bedrock 和 Vertex AI 仍需专用
+OAuth、外部进程或云身份流程，目前不会作为可用选项显示。不要把这些服务的 OAuth token
+当作普通 API key 写入凭据文件。
 
 AI 请求错误（`AiClientError`）的稳定错误码：
 

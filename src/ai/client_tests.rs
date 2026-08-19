@@ -154,6 +154,16 @@ fn success_body() -> Vec<u8> {
         .expect("response JSON")
 }
 
+fn anthropic_success_body() -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "content": [{
+            "type": "text",
+            "text": "{\"commands\":[{\"command\":\"find . -name '*.rs'\",\"explanation\":\"find Rust files\"}]}"
+        }]
+    }))
+    .expect("response JSON")
+}
+
 #[test]
 fn sends_minimal_request_and_parses_success() {
     let body = success_body();
@@ -179,6 +189,220 @@ fn sends_minimal_request_and_parses_success() {
     assert!(!request.contains("history"));
     assert!(!request.contains("/full/path/to/project"));
     join.join().expect("server");
+}
+
+#[test]
+fn local_no_auth_provider_uses_placeholder_without_a_credential_file() {
+    let body = success_body();
+    let (endpoint, request_receiver, join) = spawn_server(move |stream| {
+        write_response(stream, "200 OK", &body, "");
+    });
+    let directory = tempfile::tempdir().expect("credential directory");
+    let credential_path = directory.path().join("missing-credentials.toml");
+    let config = AiConfig {
+        enabled: true,
+        provider: "lmstudio".into(),
+        endpoint,
+        model: "local-model".into(),
+        api_key_env: String::new(),
+        api_key_file: None,
+        timeout_ms: 1_000,
+        ..AiConfig::default()
+    };
+    let client = AiClient::new(&config, &credential_path).expect("client");
+    runtime()
+        .block_on(client.request(&context(), &CancellationToken::new()))
+        .expect("local response");
+
+    let request =
+        String::from_utf8(request_receiver.recv().expect("request")).expect("UTF-8 request");
+    assert!(request.starts_with("POST /v1/chat/completions "));
+    assert!(request.contains("authorization: Bearer not-required"));
+    assert!(!credential_path.exists());
+    join.join().expect("server");
+}
+
+#[test]
+fn anthropic_transport_uses_messages_api_and_x_api_key() {
+    let body = anthropic_success_body();
+    let (endpoint, request_receiver, join) = spawn_server(move |stream| {
+        write_response(
+            stream,
+            "200 OK",
+            &body,
+            "Content-Type: application/json\r\n",
+        );
+    });
+    let directory = tempfile::tempdir().expect("credential directory");
+    let credential_path = directory.path().join("credentials.toml");
+    write_credential(
+        &credential_path,
+        "anthropic",
+        &ProviderCredential::ApiKey(Zeroizing::new("anthropic-secret".to_owned())),
+    )
+    .expect("write credential");
+    let config = AiConfig {
+        enabled: true,
+        provider: "anthropic".into(),
+        endpoint,
+        model: "claude-test".into(),
+        api_key_env: String::new(),
+        api_key_file: Some(PathBuf::from("credentials.toml")),
+        timeout_ms: 1_000,
+        ..AiConfig::default()
+    };
+    let client = AiClient::new(&config, &credential_path).expect("client");
+    let commands = runtime()
+        .block_on(client.request(&context(), &CancellationToken::new()))
+        .expect("Anthropic response");
+    assert_eq!(commands[0].command, "find . -name '*.rs'");
+
+    let request =
+        String::from_utf8(request_receiver.recv().expect("request")).expect("UTF-8 request");
+    assert!(request.starts_with("POST /v1/messages "));
+    assert!(request.contains("x-api-key: anthropic-secret"));
+    assert!(request.contains("anthropic-version: 2023-06-01"));
+    assert!(!request.contains("authorization: Bearer"));
+    assert!(request.contains("Return only JSON"));
+    join.join().expect("server");
+}
+
+#[test]
+fn minimax_messages_transport_uses_bearer_auth() {
+    let body = anthropic_success_body();
+    let (endpoint, request_receiver, join) = spawn_server(move |stream| {
+        write_response(stream, "200 OK", &body, "");
+    });
+    let directory = tempfile::tempdir().expect("credential directory");
+    let credential_path = directory.path().join("credentials.toml");
+    write_credential(
+        &credential_path,
+        "minimax",
+        &ProviderCredential::ApiKey(Zeroizing::new("minimax-secret".to_owned())),
+    )
+    .expect("write credential");
+    let config = AiConfig {
+        enabled: true,
+        provider: "minimax".into(),
+        endpoint,
+        model: "MiniMax-M3".into(),
+        api_key_env: String::new(),
+        api_key_file: Some(PathBuf::from("credentials.toml")),
+        timeout_ms: 1_000,
+        ..AiConfig::default()
+    };
+    let client = AiClient::new(&config, &credential_path).expect("client");
+    let commands = runtime()
+        .block_on(client.request(&context(), &CancellationToken::new()))
+        .expect("MiniMax response");
+    assert_eq!(commands[0].command, "find . -name '*.rs'");
+
+    let request =
+        String::from_utf8(request_receiver.recv().expect("request")).expect("UTF-8 request");
+    assert!(request.starts_with("POST /v1/messages "));
+    assert!(request.contains("authorization: Bearer minimax-secret"));
+    assert!(!request.contains("x-api-key"));
+    join.join().expect("server");
+}
+
+#[test]
+fn kimi_coding_messages_transport_uses_x_api_key() {
+    let body = anthropic_success_body();
+    let (endpoint, request_receiver, join) = spawn_server(move |stream| {
+        write_response(stream, "200 OK", &body, "");
+    });
+    let directory = tempfile::tempdir().expect("credential directory");
+    let credential_path = directory.path().join("credentials.toml");
+    write_credential(
+        &credential_path,
+        "kimi-coding",
+        &ProviderCredential::ApiKey(Zeroizing::new("sk-kimi-test".to_owned())),
+    )
+    .expect("write credential");
+    let config = AiConfig {
+        enabled: true,
+        provider: "kimi-coding".into(),
+        endpoint,
+        model: "kimi-k2.7-code".into(),
+        api_key_env: String::new(),
+        api_key_file: Some(PathBuf::from("credentials.toml")),
+        timeout_ms: 1_000,
+        ..AiConfig::default()
+    };
+    let client = AiClient::new(&config, &credential_path).expect("client");
+    runtime()
+        .block_on(client.request(&context(), &CancellationToken::new()))
+        .expect("Kimi Coding response");
+
+    let request =
+        String::from_utf8(request_receiver.recv().expect("request")).expect("UTF-8 request");
+    assert!(request.starts_with("POST /v1/messages "));
+    assert!(request.contains("x-api-key: sk-kimi-test"));
+    assert!(request.contains(&format!("user-agent: hokan/{}", env!("CARGO_PKG_VERSION"))));
+    assert!(!request.contains("authorization: Bearer"));
+    join.join().expect("server");
+}
+
+#[test]
+fn anthropic_endpoint_normalization_handles_native_and_proxy_bases() {
+    assert_eq!(
+        normalize_anthropic_endpoint("https://api.anthropic.com/v1").expect("native endpoint"),
+        "https://api.anthropic.com/v1/messages"
+    );
+    assert_eq!(
+        normalize_anthropic_endpoint("https://api.minimax.io/anthropic").expect("proxy endpoint"),
+        "https://api.minimax.io/anthropic/v1/messages"
+    );
+}
+
+#[test]
+fn transport_selection_handles_direct_and_mixed_protocol_providers() {
+    assert_eq!(
+        Transport::for_provider("openai-api", "gpt-5.4"),
+        Transport::CodexResponses
+    );
+    assert_eq!(
+        Transport::for_provider("anthropic", "claude-sonnet-4-6"),
+        Transport::AnthropicMessages
+    );
+    assert_eq!(
+        Transport::for_provider("opencode-zen", "claude-sonnet-4.6"),
+        Transport::AnthropicMessages
+    );
+    assert_eq!(
+        Transport::for_provider("opencode-zen", "gpt-5.4"),
+        Transport::CodexResponses
+    );
+    assert_eq!(
+        Transport::for_provider("opencode-zen", "qwen3.7-plus"),
+        Transport::AnthropicMessages
+    );
+    assert_eq!(
+        Transport::for_provider("opencode-go", "qwen3.7-plus"),
+        Transport::AnthropicMessages
+    );
+    assert_eq!(
+        Transport::for_provider("opencode-go", "glm-5"),
+        Transport::ChatCompletions
+    );
+    assert_eq!(
+        Transport::for_provider("kimi-coding", "kimi-k2.7-code"),
+        Transport::AnthropicMessages
+    );
+    assert!(!anthropic_uses_bearer("anthropic"));
+    assert!(!anthropic_uses_bearer("kimi-coding"));
+    assert!(!anthropic_uses_bearer("opencode-go"));
+    assert!(!anthropic_uses_bearer("opencode-zen"));
+    assert!(anthropic_uses_bearer("minimax"));
+    assert!(anthropic_uses_bearer("minimax-cn"));
+}
+
+#[test]
+fn kimi_chat_models_omit_temperature() {
+    assert_eq!(chat_temperature("kimi-k2.6"), None);
+    assert_eq!(chat_temperature("moonshotai/Kimi-K2.5"), None);
+    assert_eq!(chat_temperature("moonshot-v1-128k"), None);
+    assert_eq!(chat_temperature("deepseek-chat"), Some(0.1));
 }
 
 #[test]
@@ -346,7 +570,7 @@ fn reports_connection_failure() {
 }
 
 #[test]
-fn ollama_falls_back_to_placeholder_bearer() {
+fn ollama_uses_no_auth_placeholder_bearer() {
     let body = success_body();
     let (endpoint, request_receiver, join) = spawn_server(move |stream| {
         write_response(stream, "200 OK", &body, "");
@@ -373,7 +597,7 @@ fn ollama_falls_back_to_placeholder_bearer() {
 
     let request =
         String::from_utf8(request_receiver.recv().expect("request")).expect("UTF-8 request");
-    assert!(request.contains("authorization: Bearer ollama"));
+    assert!(request.contains("authorization: Bearer not-required"));
     join.join().expect("server");
 }
 
