@@ -225,6 +225,13 @@ impl FilesystemProvider {
             *effective = command;
         }
         let prefix = context.parsed.current_prefix.as_str();
+        // npm scoped package names (for example, `@scope/plugin`) contain a
+        // slash but are identifiers, not local paths.  OpenCode's plugin
+        // command accepts these names directly; do not turn them into a
+        // filesystem scan rooted at `cwd/@scope/`.
+        if package_specifier_argument(command, &words, argument_position, prefix) {
+            return None;
+        }
         let command_base =
             command_directory_before_active(context, command, &words, argument_position);
         if command == "find" && super::find_exec_command_position(context) {
@@ -603,6 +610,60 @@ fn flags_ended_before(words: &[&str], argument_position: usize) -> bool {
 
 fn explicit_path(prefix: &str) -> bool {
     prefix.starts_with(['.', '~', '/']) || (prefix.contains('/') && !non_local_path_prefix(prefix))
+}
+
+fn package_specifier_argument(
+    command: &str,
+    words: &[&str],
+    argument_position: usize,
+    prefix: &str,
+) -> bool {
+    if !scoped_package_prefix(prefix) {
+        return false;
+    }
+    if matches!(command, "npx" | "pnpx") {
+        return true;
+    }
+    if super::is_package_manager(command) {
+        // A completed manager subcommand (for example, `npm exec`) means the
+        // scoped value is a package.  An incomplete directory-valued flag
+        // (`npm --prefix @scope/…`) returns `None` here and keeps path rows.
+        return positional_words_before(command, words, argument_position)
+            .is_some_and(|positionals| !positionals.is_empty());
+    }
+    if matches!(command, "opencode" | "opencode2") {
+        return positional_words_before(command, words, argument_position)
+            .is_some_and(|positionals| positionals.contains(&"plugin"));
+    }
+    false
+}
+
+/// Recognize the npm scoped-package spelling while it is being typed.  The
+/// package name may be empty after the scope slash (`@scope/`) and may carry a
+/// version suffix (`@scope/name@latest`).
+fn scoped_package_prefix(prefix: &str) -> bool {
+    let Some(rest) = prefix.strip_prefix('@') else {
+        return false;
+    };
+    let Some((scope, package)) = rest.split_once('/') else {
+        return false;
+    };
+    if !package_name_segment(scope) {
+        return false;
+    }
+    let package = package.trim_end_matches('/');
+    if package.is_empty() {
+        return true;
+    }
+    let package = package.split('@').next().unwrap_or_default();
+    package_name_segment(package)
+}
+
+fn package_name_segment(value: &str) -> bool {
+    !value.is_empty()
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
 }
 
 fn response_file_prefix<'a>(command: &str, prefix: &'a str) -> Option<&'a str> {
@@ -1321,7 +1382,10 @@ fn package_manager_path_slot(
     prefix: &str,
 ) -> Option<SlotKind> {
     let command = super::executable_basename(command);
-    if non_local_path_prefix(prefix) {
+    // Package-manager path flags are handled before this fallback, so a
+    // scoped name reaching here is a package selector rather than a directory
+    // value (`npm --prefix @scope/dir` still gets normal path completion).
+    if non_local_path_prefix(prefix) || scoped_package_prefix(prefix) {
         return None;
     }
     let explicit_path = explicit_path(prefix);
@@ -3818,12 +3882,14 @@ mod tests {
             "deno run jsr:@scope/pkg",
             "rsync host:/remote/ma",
         ] {
+            let output = provider.complete(&context(directory.path(), buffer, 3));
             assert!(
-                provider
-                    .complete(&context(directory.path(), buffer, 3))
-                    .candidates
-                    .is_empty(),
+                output.candidates.is_empty(),
                 "package/URL/remote syntax must not scan the local cwd: {buffer:?}"
+            );
+            assert!(
+                output.diagnostics.is_empty(),
+                "package/URL/remote syntax must not emit filesystem diagnostics: {buffer:?}"
             );
         }
 
@@ -3835,6 +3901,48 @@ mod tests {
                 .any(|candidate| candidate.display.primary == "src/main.ts"),
             "known file-taking commands keep relative nested paths"
         );
+    }
+
+    #[test]
+    fn opencode_scoped_plugin_specs_do_not_trigger_filesystem_diagnostics() {
+        let directory = tempfile::tempdir().expect("directory");
+        let provider = provider(Arc::new(SpecRegistry::default()));
+
+        for buffer in [
+            "opencode plugin @prevalentware/",
+            "opencode plugin @prevalentware/opencode-goal-plugin",
+            "opencode plugin -g @prevalentware/opencode-goal-plugin@latest",
+        ] {
+            let output = provider.complete(&context(directory.path(), buffer, 1));
+            assert!(
+                output.candidates.is_empty(),
+                "package specifier leaked filesystem candidates for {buffer:?}"
+            );
+            assert!(
+                output.diagnostics.is_empty(),
+                "package specifier triggered a filesystem diagnostic for {buffer:?}: {:?}",
+                output.diagnostics
+            );
+        }
+    }
+
+    #[test]
+    fn scoped_names_remain_paths_for_file_commands() {
+        let directory = tempfile::tempdir().expect("directory");
+        let scoped = directory.path().join("@prevalentware");
+        fs::create_dir(&scoped).expect("scoped directory");
+        fs::write(scoped.join("plain.txt"), b"").expect("scoped file");
+        let provider = provider(Arc::new(SpecRegistry::default()));
+
+        let output = provider.complete(&context(directory.path(), "cat @prevalentware/pl", 2));
+        assert!(
+            output
+                .candidates
+                .iter()
+                .any(|candidate| candidate.display.primary == "@prevalentware/plain.txt"),
+            "file commands must retain scoped-looking local paths"
+        );
+        assert!(output.diagnostics.is_empty());
     }
 
     #[test]
@@ -4034,6 +4142,7 @@ mod tests {
     fn package_manager_path_flags_and_literal_values_have_distinct_slots() {
         let directory = tempfile::tempdir().expect("directory");
         fs::create_dir(directory.path().join("cache-dir")).expect("cache directory");
+        fs::create_dir_all(directory.path().join("@scope/dir")).expect("scoped directory");
         fs::write(directory.path().join("npmrc"), b"").expect("npmrc");
         fs::write(directory.path().join("1000"), b"").expect("numeric decoy");
         let provider = provider(Arc::new(SpecRegistry::default()));
@@ -4058,6 +4167,14 @@ mod tests {
                 .candidates
                 .iter()
                 .any(|candidate| candidate.display.primary == "npmrc")
+        );
+        assert!(
+            provider
+                .complete(&context(directory.path(), "npm --prefix @scope/di", 3))
+                .candidates
+                .iter()
+                .any(|candidate| candidate.display.primary == "@scope/dir/"),
+            "directory-valued npm flags must retain scoped-looking local paths"
         );
         for buffer in ["deno run --location 1", "bun test --timeout 1"] {
             assert!(
