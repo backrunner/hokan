@@ -18,7 +18,7 @@ command recipes, files, project scripts, Git state, aliases, functions, man
 pages, and explicitly requested AI suggestions without replacing your prompt
 or launching a GUI.
 
-Hokan `0.1.0-beta.6` is the current public beta. The core terminal recovery
+Hokan `0.1.0-beta.7` is the current public beta. The core terminal recovery
 path is covered by real PTY tests, while several terminal, SSH, tmux, fish, and
 cross-platform combinations still require release certification. See the
 [compatibility matrix](docs/compatibility.md) for the exact status.
@@ -31,8 +31,8 @@ installs into your home directory; and runs `hokan install`.
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/backrunner/hokan/releases/download/v0.1.0-beta.6/hokan-installer.sh \
-  | HOKAN_VERSION=0.1.0-beta.6 sh
+  https://github.com/backrunner/hokan/releases/download/v0.1.0-beta.7/hokan-installer.sh \
+  | HOKAN_VERSION=0.1.0-beta.7 sh
 ```
 
 Open a new terminal, or restart the current shell:
@@ -57,8 +57,8 @@ Prefer an on-demand `hk` command instead of automatic startup:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/backrunner/hokan/releases/download/v0.1.0-beta.6/hokan-installer.sh \
-  | HOKAN_VERSION=0.1.0-beta.6 HOKAN_ON_DEMAND=1 sh
+  https://github.com/backrunner/hokan/releases/download/v0.1.0-beta.7/hokan-installer.sh \
+  | HOKAN_VERSION=0.1.0-beta.7 HOKAN_ON_DEMAND=1 sh
 ```
 
 ## Why Hokan
@@ -181,7 +181,7 @@ The release installer supports these optional environment variables:
 
 | Variable | Purpose |
 | --- | --- |
-| `HOKAN_VERSION` | Install an exact release such as `0.1.0-beta.6` |
+| `HOKAN_VERSION` | Install an exact release such as `0.1.0-beta.7` |
 | `HOKAN_INSTALL_DIR` | Override the binary directory |
 | `HOKAN_MAN_DIR` | Override the man-page directory |
 | `HOKAN_SHELL` | Select `zsh`, `bash`, or `fish` |

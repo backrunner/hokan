@@ -171,6 +171,12 @@ pub(super) fn handle_input_event(
     }
 
     if state.overlay_visible {
+        if dismisses_empty_overlay(&event.kind, state.buffer.text.is_empty()) {
+            state.overlay_visible = false;
+            state.cancel_ai();
+            output.hide_overlay().map_err(output_error)?;
+            return Ok(());
+        }
         if config.keys.up.matches(&event.kind) {
             move_selection(state, -1);
             return render_current(state, output);
@@ -317,6 +323,10 @@ pub(super) fn handle_input_event(
         MirrorOutcome::Submitted | MirrorOutcome::Unchanged => {}
     }
     Ok(())
+}
+
+fn dismisses_empty_overlay(kind: &InputKind, buffer_is_empty: bool) -> bool {
+    buffer_is_empty && matches!(kind, InputKind::Backspace)
 }
 
 fn input_bytes_for_shell(
@@ -688,6 +698,13 @@ mod tests {
             panic!("fixture should be a paste event");
         };
         assert_eq!(input_bytes_for_shell(&event, false, true), payload);
+    }
+
+    #[test]
+    fn backspace_dismisses_overlay_only_for_an_empty_buffer() {
+        assert!(dismisses_empty_overlay(&InputKind::Backspace, true));
+        assert!(!dismisses_empty_overlay(&InputKind::Backspace, false));
+        assert!(!dismisses_empty_overlay(&InputKind::Escape, true));
     }
 
     #[test]
