@@ -184,10 +184,16 @@ pub fn rank_and_dedupe(
     // Ties fall back to deterministic content keys — never the candidate id,
     // which hashes the query id and would re-shuffle every keystroke.
     candidates.sort_by(|left, right| {
-        right
-            .score
-            .match_priority
-            .cmp(&left.score.match_priority)
+        let navigation_order =
+            (context.mode == crate::completion::CompletionMode::HistoryNavigation).then(|| {
+                right
+                    .score
+                    .history_timestamp
+                    .cmp(&left.score.history_timestamp)
+            });
+        navigation_order
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| right.score.match_priority.cmp(&left.score.match_priority))
             .then_with(|| {
                 right
                     .score
@@ -263,6 +269,7 @@ fn merge_score_signals(
         risk_penalty: left.risk_penalty.max(right.risk_penalty),
         incomplete_penalty: left.incomplete_penalty.max(right.incomplete_penalty),
         failed_penalty: left.failed_penalty.max(right.failed_penalty),
+        history_timestamp: left.history_timestamp.max(right.history_timestamp),
     }
 }
 

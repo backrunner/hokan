@@ -19,6 +19,10 @@ pub enum CompletionMode {
     #[default]
     Normal,
     HistoryOnly,
+    /// History recalled through the shell-style Up/Down navigation keys.
+    /// Unlike explicit history search, rows are prefix-matched and ordered
+    /// newest-first by their recorded timestamp.
+    HistoryNavigation,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

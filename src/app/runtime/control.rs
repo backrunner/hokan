@@ -59,6 +59,7 @@ pub(super) fn handle_control_message(
             state.cwd = cwd;
             state.editing = true;
             state.history_only = false;
+            state.history_navigation = false;
             state.need_cpr = true;
             state
                 .buffer
@@ -100,6 +101,7 @@ pub(super) fn handle_control_message(
         }
         ControlMessage::Event(ShellEvent::CommandStart { command }) => {
             state.cancel_ai();
+            state.history_navigation = false;
             state.pending_command = Some(command);
             state.editing = false;
             state.overlay_visible = false;

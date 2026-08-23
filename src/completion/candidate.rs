@@ -179,6 +179,8 @@ pub enum Completeness {
 /// - `incomplete_penalty`: 0..=80, subtracted — set centrally from completeness.
 /// - `failed_penalty`: 0 or 150, subtracted — provider-set when the history
 ///   record's last known run exited non-zero (excluding SIGINT 130).
+/// - `history_timestamp`: raw history timestamp used only by shell-style
+///   Up/Down navigation ordering.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ScoreSignals {
     pub match_priority: u8,
@@ -195,6 +197,7 @@ pub struct ScoreSignals {
     pub risk_penalty: i16,
     pub incomplete_penalty: i16,
     pub failed_penalty: i16,
+    pub history_timestamp: i64,
 }
 
 impl ScoreSignals {

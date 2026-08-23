@@ -175,7 +175,8 @@ pub(super) fn handle_input_event(
             state.overlay_visible = false;
             state.cancel_ai();
             output.hide_overlay().map_err(output_error)?;
-            return Ok(());
+            // Keep processing the event so a mirrored buffer that lagged the
+            // real shell cannot cause this backspace to be swallowed.
         }
         if config.keys.up.matches(&event.kind) {
             move_selection(state, -1);
@@ -238,6 +239,7 @@ pub(super) fn handle_input_event(
             return Ok(());
         }
         if config.keys.history.matches(&event.kind) {
+            state.history_navigation = false;
             state.history_only = !state.history_only;
             state.schedule_query(worker)?;
             hide_overlay_if_query_suppressed(state, output)?;
@@ -255,12 +257,14 @@ pub(super) fn handle_input_event(
         } else {
             1
         };
+        state.history_navigation = true;
         state.history_only = true;
         state.schedule_query(worker)?;
         defer_selection(state, delta);
         arm_hidden_overlay_query(state, output)?;
         return Ok(());
     } else if config.keys.history.matches(&event.kind) || config.keys.toggle.matches(&event.kind) {
+        state.history_navigation = false;
         state.history_only = config.keys.history.matches(&event.kind);
         state.schedule_query(worker)?;
         arm_hidden_overlay_query(state, output)?;
@@ -272,6 +276,15 @@ pub(super) fn handle_input_event(
         state.overlay_visible = false;
         output.hide_overlay().map_err(output_error)?;
     }
+
+    // Any ordinary edit leaves shell-style history navigation mode. A later
+    // Up/Down press at the idle prompt can explicitly enter it again. Once
+    // the user starts editing a recalled row, return to normal suggestions;
+    // explicit Ctrl-R history mode is preserved separately.
+    if state.history_navigation {
+        state.history_only = false;
+    }
+    state.history_navigation = false;
 
     if matches!(event.kind, InputKind::Enter) {
         state.pending_command = Some(state.buffer.text.clone());

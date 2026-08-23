@@ -114,25 +114,44 @@ impl CandidateProvider for HistoryProvider {
         let aliases = self.aliases.load(context.shell);
         // In explicit history search, a known command prefix still narrows the
         // result family; unknown fragments retain Ctrl-R's fuzzy recall.
-        let command_prefix = (context.mode == CompletionMode::HistoryOnly && !later_segment)
+        let command_prefix = (matches!(
+            context.mode,
+            CompletionMode::HistoryOnly | CompletionMode::HistoryNavigation
+        ) && !later_segment)
             .then(|| self.known_command_prefix_with_aliases(context, &aliases))
             .flatten();
         // Apply every eligibility constraint before HistoryIndex takes its
         // bounded top-k. Otherwise 50 high-frecency typo or unrelated rows can
         // hide the first valid continuation entirely.
-        let matches = index.search_filtered(search_text, &context.cwd, now_ms, 50, |record| {
-            anchor.as_ref().is_none_or(|anchor| {
+        let navigation = context.mode == CompletionMode::HistoryNavigation;
+        let matches = if navigation {
+            index.search_recent_filtered(search_text, &context.cwd, now_ms, 50, |record| {
                 let command = record.command.trim().to_lowercase();
-                command.starts_with(anchor.as_str())
-                    && suffix.as_ref().is_none_or(|suffix| {
-                        command.len() >= anchor.len() + suffix.len()
-                            && command.ends_with(suffix.as_str())
+                command.starts_with(search_text.trim_start().to_lowercase().as_str())
+                    && command_prefix.as_ref().is_none_or(|prefix| {
+                        crate::safety::effective_command_word_for_shell(
+                            &record.command,
+                            context.shell,
+                        )
+                        .is_some_and(|command| command.to_lowercase().starts_with(prefix))
                     })
-            }) && command_prefix.as_ref().is_none_or(|prefix| {
-                crate::safety::effective_command_word_for_shell(&record.command, context.shell)
-                    .is_some_and(|command| command.to_lowercase().starts_with(prefix))
-            }) && self.plausible_record_with_aliases(context, record, &aliases)
-        });
+                    && self.plausible_record_with_aliases(context, record, &aliases)
+            })
+        } else {
+            index.search_filtered(search_text, &context.cwd, now_ms, 50, |record| {
+                anchor.as_ref().is_none_or(|anchor| {
+                    let command = record.command.trim().to_lowercase();
+                    command.starts_with(anchor.as_str())
+                        && suffix.as_ref().is_none_or(|suffix| {
+                            command.len() >= anchor.len() + suffix.len()
+                                && command.ends_with(suffix.as_str())
+                        })
+                }) && command_prefix.as_ref().is_none_or(|prefix| {
+                    crate::safety::effective_command_word_for_shell(&record.command, context.shell)
+                        .is_some_and(|command| command.to_lowercase().starts_with(prefix))
+                }) && self.plausible_record_with_aliases(context, record, &aliases)
+            })
+        };
         let candidates = matches
             .into_iter()
             .map(|matched| {
@@ -159,6 +178,9 @@ impl CandidateProvider for HistoryProvider {
                 candidate.score.frecency = matched.frecency;
                 candidate.score.cwd_affinity = matched.cwd_affinity;
                 candidate.score.failed_penalty = matched.failed_penalty;
+                if navigation {
+                    candidate.score.history_timestamp = matched.record.last_used_ms;
+                }
                 if let Some(previous) = context.previous_command.as_deref() {
                     candidate.score.transition =
                         index.transition_score(previous, &matched.record.command);
@@ -1549,7 +1571,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        completion::{BufferSnapshot, SyncQuality, rank_and_dedupe},
+        completion::{BufferSnapshot, CandidateSource, SyncQuality, rank_and_dedupe},
         history::HistoryPolicy,
         shell::ShellKind,
         terminal::{BufferRevision, QueryId},
@@ -1662,6 +1684,43 @@ mod tests {
             &policy,
         );
         index
+    }
+
+    #[test]
+    fn arrow_navigation_uses_prefix_history_in_timestamp_order() {
+        let policy = HistoryPolicy::new(1024, &[]).expect("history policy");
+        let mut index = HistoryIndex::default();
+        index.ingest("echo older", 1_000, ShellKind::Zsh, None, Some(0), &policy);
+        index.ingest_weighted(
+            "echo older",
+            1_100,
+            ShellKind::Zsh,
+            None,
+            40,
+            Some(0),
+            &policy,
+        );
+        index.ingest("echo newest", 2_000, ShellKind::Zsh, None, Some(0), &policy);
+        index.ingest(
+            "printf unrelated",
+            3_000,
+            ShellKind::Zsh,
+            None,
+            Some(0),
+            &policy,
+        );
+
+        let provider = provider_with_executables(index, &["echo", "printf"]);
+        let context = context_in(Path::new("/tmp"), "echo", CompletionMode::HistoryNavigation);
+        let ranked = rank_and_dedupe(&context, provider.complete(&context).candidates, 10);
+        let rows: Vec<_> = ranked
+            .iter()
+            .map(|candidate| candidate.display.primary.as_str())
+            .collect();
+        assert_eq!(rows, ["echo newest", "echo older"]);
+        assert!(ranked.iter().all(|candidate| {
+            candidate.source == CandidateSource::History && candidate.score.history_timestamp > 0
+        }));
     }
 
     #[test]

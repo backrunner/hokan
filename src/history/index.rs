@@ -435,6 +435,73 @@ impl HistoryIndex {
             .collect()
     }
 
+    /// Search history for shell-style Up/Down recall. The caller supplies the
+    /// contextual filter, while the result order is strictly newest-first;
+    /// frequency and fuzzy quality must not move an older command above a
+    /// more recent one.
+    pub(crate) fn search_recent_filtered(
+        &self,
+        query: &str,
+        cwd: &Path,
+        now_ms: i64,
+        limit: usize,
+        mut predicate: impl FnMut(&HistoryRecord) -> bool,
+    ) -> Vec<HistoryMatch> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let query = query.to_lowercase();
+        let mut ranked: Vec<_> = self
+            .records
+            .values()
+            .filter(|record| !record.multiline)
+            .filter_map(|record| {
+                let quality = match_quality_folded(&query, &record.search_key);
+                if !query.is_empty() && quality == 0 {
+                    return None;
+                }
+                if !predicate(record) {
+                    return None;
+                }
+                let age_hours = now_ms.saturating_sub(record.last_used_ms).max(0) / 3_600_000;
+                let recency = 150_i64.saturating_sub(age_hours.min(150));
+                let frequency = (record.count.min(50) * 2) as i64;
+                Some(RankedRecord {
+                    record,
+                    quality,
+                    frecency: (recency + frequency).min(200) as i16,
+                    cwd_affinity: if record.last_cwd.as_deref() == Some(cwd) {
+                        100
+                    } else {
+                        0
+                    },
+                })
+            })
+            .collect();
+        ranked.sort_by(|left, right| {
+            right
+                .record
+                .last_used_ms
+                .cmp(&left.record.last_used_ms)
+                .then_with(|| left.record.command.cmp(&right.record.command))
+        });
+        ranked.truncate(limit);
+        ranked
+            .into_iter()
+            .map(|ranked| HistoryMatch {
+                record: ranked.record.clone(),
+                quality: ranked.quality,
+                frecency: ranked.frecency,
+                cwd_affinity: ranked.cwd_affinity,
+                failed_penalty: if is_failed_exit(ranked.record.last_exit_code) {
+                    150
+                } else {
+                    0
+                },
+            })
+            .collect()
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
         self.records.len()

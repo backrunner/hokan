@@ -43,6 +43,7 @@ pub(super) struct RuntimeState {
     /// it; shell buffer events for bytes typed before Tab do not.
     pub(super) pending_accept: bool,
     pub(super) history_only: bool,
+    pub(super) history_navigation: bool,
     pub(super) provider_pending: bool,
     pub(super) overlay_visible: bool,
     /// Set when `render_current` had rows to show but the terminal was not
@@ -130,6 +131,7 @@ impl RuntimeState {
             selection_intent: None,
             pending_accept: false,
             history_only: false,
+            history_navigation: false,
             provider_pending: false,
             overlay_visible: false,
             repaint_pending: false,
@@ -230,7 +232,9 @@ impl RuntimeState {
                 self.cwd.clone(),
                 self.snapshot()?,
             )?
-            .with_mode(if self.history_only {
+            .with_mode(if self.history_navigation {
+                CompletionMode::HistoryNavigation
+            } else if self.history_only {
                 CompletionMode::HistoryOnly
             } else {
                 CompletionMode::Normal
@@ -398,10 +402,22 @@ pub(super) fn move_selection(state: &mut RuntimeState, delta: isize) {
             .iter()
             .position(|candidate| candidate.id == id)
     }) {
+        Some(current) if state.history_navigation => {
+            (current as isize + delta).clamp(0, length - 1) as usize
+        }
         Some(current) => (current as isize + delta).rem_euclid(length) as usize,
         // No implicit selection: the first Down lands on the first row, the
         // first Up on the last; page jumps go to the first row / the start of
         // the last page.
+        None if state.history_navigation => {
+            if delta < 0 {
+                0
+            } else if delta > 0 {
+                state.candidates.len() - 1
+            } else {
+                0
+            }
+        }
         None => landing_row(state.candidates.len(), state.page_size, delta),
     };
     state.selected = Some(state.candidates[next].id);
