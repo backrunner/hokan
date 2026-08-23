@@ -2343,6 +2343,7 @@ mod tests {
                 Arc::new(crate::specs::SpecRegistry::default()),
                 help,
             )
+            .allow_unknown_cwd_for_tests()
             .with_project_cache(projects),
         );
         let context_for = |query_id, text: &str| {

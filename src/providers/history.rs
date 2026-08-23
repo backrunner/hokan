@@ -29,6 +29,8 @@ pub struct HistoryProvider {
     help: Arc<CommandHelpCache>,
     projects: Arc<ProjectCache>,
     workspaces: NodeWorkspaceCache,
+    #[cfg(test)]
+    allow_unknown_cwd: bool,
 }
 
 impl HistoryProvider {
@@ -48,6 +50,8 @@ impl HistoryProvider {
             help,
             projects: Arc::new(ProjectCache::default()),
             workspaces: NodeWorkspaceCache::default(),
+            #[cfg(test)]
+            allow_unknown_cwd: false,
         }
     }
 
@@ -55,6 +59,29 @@ impl HistoryProvider {
     pub fn with_project_cache(mut self, projects: Arc<ProjectCache>) -> Self {
         self.projects = projects;
         self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn allow_unknown_cwd_for_tests(mut self) -> Self {
+        self.allow_unknown_cwd = true;
+        self
+    }
+
+    fn record_matches_cwd(
+        &self,
+        context: &CompletionContext,
+        record: &crate::history::HistoryRecord,
+    ) -> bool {
+        record.last_cwd.as_deref() == Some(context.cwd.as_path()) || {
+            #[cfg(test)]
+            {
+                self.allow_unknown_cwd && record.last_cwd.is_none()
+            }
+            #[cfg(not(test))]
+            {
+                false
+            }
+        }
     }
 }
 
@@ -127,7 +154,11 @@ impl CandidateProvider for HistoryProvider {
         let matches = if navigation {
             index.search_recent_filtered(search_text, &context.cwd, now_ms, 50, |record| {
                 let command = record.command.trim().to_lowercase();
-                command.starts_with(search_text.trim_start().to_lowercase().as_str())
+                // Shell-style Up/Down recall must be scoped to commands that
+                // actually ran in the current directory. Imported shell
+                // history without a cwd is intentionally excluded here.
+                self.record_matches_cwd(context, record)
+                    && command.starts_with(search_text.trim_start().to_lowercase().as_str())
                     && command_prefix.as_ref().is_none_or(|prefix| {
                         crate::safety::effective_command_word_for_shell(
                             &record.command,
@@ -139,17 +170,26 @@ impl CandidateProvider for HistoryProvider {
             })
         } else {
             index.search_filtered(search_text, &context.cwd, now_ms, 50, |record| {
-                anchor.as_ref().is_none_or(|anchor| {
-                    let command = record.command.trim().to_lowercase();
-                    command.starts_with(anchor.as_str())
-                        && suffix.as_ref().is_none_or(|suffix| {
-                            command.len() >= anchor.len() + suffix.len()
-                                && command.ends_with(suffix.as_str())
-                        })
-                }) && command_prefix.as_ref().is_none_or(|prefix| {
-                    crate::safety::effective_command_word_for_shell(&record.command, context.shell)
+                // History recommendations must be grounded in executions
+                // recorded for the current directory; unknown/imported cwd
+                // records cannot be safely attributed here.
+                self.record_matches_cwd(context, record)
+                    && anchor.as_ref().is_none_or(|anchor| {
+                        let command = record.command.trim().to_lowercase();
+                        command.starts_with(anchor.as_str())
+                            && suffix.as_ref().is_none_or(|suffix| {
+                                command.len() >= anchor.len() + suffix.len()
+                                    && command.ends_with(suffix.as_str())
+                            })
+                    })
+                    && command_prefix.as_ref().is_none_or(|prefix| {
+                        crate::safety::effective_command_word_for_shell(
+                            &record.command,
+                            context.shell,
+                        )
                         .is_some_and(|command| command.to_lowercase().starts_with(prefix))
-                }) && self.plausible_record_with_aliases(context, record, &aliases)
+                    })
+                    && self.plausible_record_with_aliases(context, record, &aliases)
             })
         };
         let candidates = matches
@@ -1646,6 +1686,7 @@ mod tests {
             Arc::new(SpecRegistry::default()),
             help,
         )
+        .allow_unknown_cwd_for_tests()
     }
 
     fn provider_with_project(
@@ -1690,28 +1731,46 @@ mod tests {
     fn arrow_navigation_uses_prefix_history_in_timestamp_order() {
         let policy = HistoryPolicy::new(1024, &[]).expect("history policy");
         let mut index = HistoryIndex::default();
-        index.ingest("echo older", 1_000, ShellKind::Zsh, None, Some(0), &policy);
+        let current = Path::new("/tmp").canonicalize().expect("current directory");
+        let other = Path::new("/var/tmp")
+            .canonicalize()
+            .expect("other directory");
+        index.ingest(
+            "echo older",
+            1_000,
+            ShellKind::Zsh,
+            Some(&current),
+            Some(0),
+            &policy,
+        );
         index.ingest_weighted(
             "echo older",
             1_100,
             ShellKind::Zsh,
-            None,
+            Some(&current),
             40,
             Some(0),
             &policy,
         );
-        index.ingest("echo newest", 2_000, ShellKind::Zsh, None, Some(0), &policy);
+        index.ingest(
+            "echo newest",
+            2_000,
+            ShellKind::Zsh,
+            Some(&current),
+            Some(0),
+            &policy,
+        );
         index.ingest(
             "printf unrelated",
             3_000,
             ShellKind::Zsh,
-            None,
+            Some(&other),
             Some(0),
             &policy,
         );
 
         let provider = provider_with_executables(index, &["echo", "printf"]);
-        let context = context_in(Path::new("/tmp"), "echo", CompletionMode::HistoryNavigation);
+        let context = context_in(&current, "echo", CompletionMode::HistoryNavigation);
         let ranked = rank_and_dedupe(&context, provider.complete(&context).candidates, 10);
         let rows: Vec<_> = ranked
             .iter()
@@ -1721,6 +1780,17 @@ mod tests {
         assert!(ranked.iter().all(|candidate| {
             candidate.source == CandidateSource::History && candidate.score.history_timestamp > 0
         }));
+
+        let normal = context_in(&current, "echo", CompletionMode::Normal);
+        let normal_rows: Vec<_> = provider
+            .complete(&normal)
+            .candidates
+            .into_iter()
+            .map(|candidate| candidate.display.primary)
+            .collect();
+        assert_eq!(normal_rows.len(), 2);
+        assert!(normal_rows.contains(&"echo newest".to_owned()));
+        assert!(normal_rows.contains(&"echo older".to_owned()));
     }
 
     #[test]
@@ -2268,7 +2338,8 @@ mod tests {
             Arc::new(AliasCache::default()),
             Arc::new(SpecRegistry::default()),
             Arc::clone(&help),
-        );
+        )
+        .allow_unknown_cwd_for_tests();
         assert!(
             provider
                 .complete(&context("demo-tool ", None))
@@ -3172,7 +3243,8 @@ mod tests {
             Arc::new(AliasCache::new_fixed(aliases)),
             Arc::new(SpecRegistry::default()),
             Arc::new(CommandHelpCache::default()),
-        );
+        )
+        .allow_unknown_cwd_for_tests();
         assert!(provider.plausible_command(&context("gc", None), "gc"));
         assert!(provider.plausible_command(&context("time gc", None), "time gc"));
         assert!(!provider.plausible_command(&context("sudo gc", None), "sudo gc"));
@@ -3228,7 +3300,8 @@ mod tests {
             aliases,
             Arc::new(SpecRegistry::default()),
             Arc::new(CommandHelpCache::default()),
-        );
+        )
+        .allow_unknown_cwd_for_tests();
         let rows: Vec<_> = provider
             .complete(&context("proj ", None))
             .candidates

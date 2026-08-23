@@ -553,13 +553,16 @@ mod tests {
 
         let mut engine = CompletionEngine::new(100, 12);
         engine.register(AliasProvider::new(Arc::clone(&aliases)));
-        engine.register(HistoryProvider::new(
-            Arc::new(RwLock::new(index)),
-            Arc::new(CommandPathCache::default()),
-            aliases,
-            Arc::new(crate::specs::SpecRegistry::default()),
-            Arc::new(CommandHelpCache::default()),
-        ));
+        engine.register(
+            HistoryProvider::new(
+                Arc::new(RwLock::new(index)),
+                Arc::new(CommandPathCache::default()),
+                aliases,
+                Arc::new(crate::specs::SpecRegistry::default()),
+                Arc::new(CommandHelpCache::default()),
+            )
+            .allow_unknown_cwd_for_tests(),
+        );
 
         for text in ["proj ", "proj s"] {
             let output = engine.complete(&context(text));

@@ -205,7 +205,7 @@ impl HistoryIndex {
                 count: 0,
                 last_used_ms: timestamp_ms,
                 shell,
-                last_cwd: cwd.map(Path::to_owned),
+                last_cwd: normalized_cwd.clone(),
                 multiline: command.contains('\n'),
                 last_exit_code: exit_code,
                 search_key: command.trim().to_lowercase(),
@@ -231,7 +231,7 @@ impl HistoryIndex {
             record.command = command.trim().to_owned();
             record.last_used_ms = timestamp_ms;
             record.shell = shell;
-            record.last_cwd = cwd.map(Path::to_owned);
+            record.last_cwd = normalized_cwd.clone();
             record.multiline = command.contains('\n');
             record.last_exit_code = exit_code;
             record.search_key = command.trim().to_lowercase();
