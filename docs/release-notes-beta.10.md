@@ -6,6 +6,8 @@ self-updates against the actual release archives.
 - Keep dismissed suggestions closed until input changes or the list is reopened.
 - Preserve meaningful quoted, escaped, multiline, and Unicode whitespace in
   history and completion filtering.
+- Reuse substring-search state and avoid UTF-8 decoding for ASCII fuzzy
+  queries when scanning large histories, while preserving Unicode matching.
 - Require confirmation when a known high-risk operation appears alongside
   syntax whose risk cannot be determined.
 - Reject stale cursor reports and restore terminal input modes correctly when

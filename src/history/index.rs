@@ -7,7 +7,7 @@ use std::{
 use regex::Regex;
 
 use super::normalize::normalize_command as normalize;
-use crate::{completion::match_quality_folded, history::HistoryEventV1, shell::ShellKind};
+use crate::{completion::FoldedMatcher, history::HistoryEventV1, shell::ShellKind};
 
 #[derive(Clone, Debug)]
 pub struct HistoryPolicy {
@@ -388,12 +388,13 @@ impl HistoryIndex {
             return Vec::new();
         }
         let query = query.to_lowercase();
+        let matcher = FoldedMatcher::new(&query);
         let mut ranked: Vec<_> = self
             .records
             .values()
             .filter(|record| !record.multiline)
             .filter_map(|record| {
-                let quality = match_quality_folded(&query, &record.search_key);
+                let quality = matcher.quality(&record.search_key);
                 if !query.is_empty() && quality == 0 {
                     return None;
                 }
@@ -452,12 +453,13 @@ impl HistoryIndex {
             return Vec::new();
         }
         let query = query.to_lowercase();
+        let matcher = FoldedMatcher::new(&query);
         let mut ranked: Vec<_> = self
             .records
             .values()
             .filter(|record| !record.multiline)
             .filter_map(|record| {
-                let quality = match_quality_folded(&query, &record.search_key);
+                let quality = matcher.quality(&record.search_key);
                 if !query.is_empty() && quality == 0 {
                     return None;
                 }
@@ -1003,6 +1005,7 @@ mod tests {
         }
         samples.sort_unstable();
         let p95 = samples[18];
+        eprintln!("100k history query p95: {p95:?}");
         let budget = if cfg!(debug_assertions) {
             Duration::from_secs(1)
         } else {

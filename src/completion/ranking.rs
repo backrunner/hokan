@@ -479,23 +479,58 @@ fn match_signal(query: &str, candidate: &str) -> MatchSignal {
 
 #[must_use]
 pub(crate) fn match_quality_folded(query: &str, candidate: &str) -> i16 {
-    if query.is_empty() {
-        return 500;
+    FoldedMatcher::new(query).quality(candidate)
+}
+
+/// Compile substring-search state once for a scan, instead of rebuilding
+/// the same searcher for each of the potentially 100,000 history records.
+pub(crate) struct FoldedMatcher<'a> {
+    query: &'a str,
+    finder: memchr::memmem::Finder<'a>,
+}
+
+impl<'a> FoldedMatcher<'a> {
+    pub(crate) fn new(query: &'a str) -> Self {
+        Self {
+            query,
+            finder: memchr::memmem::Finder::new(query),
+        }
     }
-    if candidate == query {
-        1000
-    } else if candidate.starts_with(query) {
-        900_i16.saturating_sub((candidate.len() - query.len()).min(200) as i16)
-    } else if let Some(index) = candidate.find(query) {
-        700_i16.saturating_sub(index.min(200) as i16)
-    } else if is_subsequence(query, candidate) {
-        450
-    } else {
-        0
+
+    pub(crate) fn quality(&self, candidate: &str) -> i16 {
+        let query = self.query;
+        if query.is_empty() {
+            500
+        } else if candidate == query {
+            1000
+        } else if candidate.starts_with(query) {
+            900_i16.saturating_sub((candidate.len() - query.len()).min(200) as i16)
+        } else if let Some(index) = self.finder.find(candidate.as_bytes()) {
+            700_i16.saturating_sub(index.min(200) as i16)
+        } else if is_subsequence(query, candidate) {
+            450
+        } else {
+            0
+        }
     }
 }
 
 fn is_subsequence(query: &str, candidate: &str) -> bool {
+    // ASCII bytes cannot match any UTF-8 continuation byte, so this also
+    // preserves character-subsequence semantics for Unicode candidates.
+    if query.is_ascii() {
+        let mut query = query.bytes();
+        let mut expected = query.next();
+        for byte in candidate.bytes() {
+            if Some(byte) == expected {
+                expected = query.next();
+                if expected.is_none() {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
     let mut query = query.chars();
     let mut expected = query.next();
     for character in candidate.chars() {
@@ -587,6 +622,32 @@ const fn risk_severity(risk: RiskLevel) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    proptest::proptest! {
+        #[test]
+        fn prepared_matcher_preserves_unicode_and_ascii_scores(
+            query in "[a-zé中🙂0-9 ]{0,16}",
+            text in "[a-zé中🙂0-9 ]{0,60}",
+        ) {
+            let matcher = FoldedMatcher::new(&query);
+            let scattered = query.chars().map(|character| format!("{character}🙂 ")).collect::<String>();
+            for candidate in [text.clone(), format!("{query}{text}"), format!("{text}{query}"), scattered] {
+                let mut expected = query.chars().peekable();
+                for character in candidate.chars() {
+                    if expected.peek() == Some(&character) {
+                        expected.next();
+                    }
+                }
+                let reference = if query.is_empty() { 500 }
+                else if candidate == query { 1000 }
+                else if candidate.starts_with(&query) { 900 - (candidate.len() - query.len()).min(200) as i16 }
+                else if let Some(offset) = candidate.find(&query) { 700 - offset.min(200) as i16 }
+                else if expected.peek().is_none() { 450 }
+                else { 0 };
+                proptest::prop_assert_eq!(matcher.quality(&candidate), reference, "query={:?}, candidate={:?}", &query, &candidate);
+            }
+        }
+    }
     use crate::completion::{
         BufferSnapshot, CandidateKind, CandidateSource, SlotKind, SyncQuality, TextEdit,
     };
