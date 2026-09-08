@@ -40,6 +40,7 @@ fn bash_hokan_leave_marks_the_session_and_exits() {
         .command_builder_isolated(false)
         .expect("isolated bash command");
     command.env("HOKAN_BIN", env!("CARGO_BIN_EXE_hokan"));
+    command.env("HOKAN_NO_AUTO_UPDATE", "1");
     command.env("TERM", "xterm-256color");
     command.env("PS1", "HK> ");
     let (sender, receiver) = crossbeam_channel::unbounded();
@@ -79,6 +80,7 @@ fn exercise_shell(shell: ShellKind, expect_exact_snapshot: bool) {
         .command_builder_isolated(false)
         .expect("isolated command");
     command.env("HOKAN_BIN", env!("CARGO_BIN_EXE_hokan"));
+    command.env("HOKAN_NO_AUTO_UPDATE", "1");
     command.env("TERM", "xterm-256color");
     command.env("PS1", "HK> ");
     command.cwd(&expected_cwd);

@@ -66,6 +66,9 @@ fn run_auto(paths: &ConfigPaths, upgrade_paths: &UpgradePaths) -> u8 {
     let Ok(config) = Config::load(&paths.config_file) else {
         return 1;
     };
+    if !config.update.enabled || std::env::var_os("HOKAN_NO_AUTO_UPDATE").is_some() {
+        return 0;
+    }
     let Ok(channel) = Channel::parse(&config.update.channel) else {
         return 1;
     };
@@ -184,7 +187,7 @@ fn run_with_io(
                 path.display()
             )))
         }
-        UpgradeOutcome::Checked { .. } => Err(crate::Error::Config(
+        UpgradeOutcome::Checked { .. } | UpgradeOutcome::Deferred => Err(crate::Error::Config(
             "内部错误：升级返回了非预期结果".into(),
         )),
     }
@@ -228,6 +231,9 @@ mod tests {
     };
 
     fn test_paths(root: &Path) -> ConfigPaths {
+        // Most CLI fixtures deliberately exercise the stable endpoint.
+        fs::write(root.join("config.toml"), "[update]\nchannel = \"stable\"\n")
+            .expect("fixture channel");
         ConfigPaths {
             config_file: root.join("config.toml"),
             credentials_file: root.join("credentials.toml"),
@@ -430,7 +436,13 @@ mod tests {
         let (result, _, _) = run_scripted("", false, &paths, &upgrade_paths, &args);
         let error = result.expect_err("invalid channel must fail");
         assert!(error.to_string().contains("stable 或 beta"), "{error}");
-        assert!(!paths.config_file.exists());
+        assert_eq!(
+            Config::load(&paths.config_file)
+                .expect("config")
+                .update
+                .channel,
+            "stable"
+        );
     }
 
     #[test]
@@ -455,7 +467,7 @@ mod tests {
             return;
         }
         let root = tempfile::tempdir().expect("tempdir");
-        let (base, join) = serve_full_upgrade("9.9.9", 4);
+        let (base, join) = serve_full_upgrade("9.9.9", 2);
         let paths = test_paths(root.path());
         let upgrade_paths = make_upgrade_paths(root.path(), &base);
         let bin = root.path().join("bin");
@@ -504,6 +516,57 @@ mod tests {
         let paths = test_paths(root.path());
         let failing_paths = make_upgrade_paths(root.path(), &base);
         assert_eq!(run_auto(&paths, &failing_paths), 1);
+        join.join().expect("server thread");
+    }
+
+    #[test]
+    fn disabled_auto_mode_does_not_contact_the_update_server() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let paths = test_paths(root.path());
+        fs::write(&paths.config_file, "[update]\nenabled = false\n").expect("disable");
+        let upgrade_paths = make_upgrade_paths(root.path(), "http://127.0.0.1:1");
+        assert_eq!(run_auto(&paths, &upgrade_paths), 0);
+        assert!(!upgrade_paths.state_dir.exists());
+    }
+
+    #[test]
+    fn auto_mode_installs_a_beta_without_a_stable_release() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let paths = test_paths(root.path());
+        fs::write(&paths.config_file, "[update]\nchannel = \"beta\"\n").expect("beta channel");
+        let version = "9.9.9-beta.1";
+        let archive = build_archive(&format!("#!/bin/sh\necho hokan {version}\n"));
+        let name = archive_asset(version);
+        let sums = sha256sums_for(&[(&format!("{:x}", Sha256::digest(&archive)), &name)]);
+        let (base, join) = spawn_server(4, move |path| {
+            if path.contains("releases?") {
+                json_reply(
+                    "200 OK",
+                    serde_json::json!([release_json(
+                        "v9.9.9-beta.1",
+                        &[name.clone(), "SHA256SUMS".into()]
+                    )]),
+                )
+            } else if path.ends_with(&name) {
+                raw_reply("200 OK", archive.clone())
+            } else if path.ends_with("/SHA256SUMS") {
+                raw_reply("200 OK", sums.as_bytes().to_vec())
+            } else {
+                raw_reply("404 Not Found", Vec::new())
+            }
+        });
+        let upgrade_paths = make_upgrade_paths(root.path(), &base);
+        assert_eq!(run_auto(&paths, &upgrade_paths), 0);
+        assert!(
+            fs::read_to_string(&upgrade_paths.current_exe)
+                .expect("installed beta")
+                .contains(version)
+        );
+        assert_eq!(
+            run_auto(&paths, &upgrade_paths),
+            0,
+            "second session is throttled"
+        );
         join.join().expect("server thread");
     }
 

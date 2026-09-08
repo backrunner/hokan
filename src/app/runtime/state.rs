@@ -7,7 +7,7 @@ use std::{
 
 use super::{
     super::buffer::EditableBuffer,
-    cursor_probe::{CursorProbeBackend, PendingTmuxCursor},
+    cursor_probe::{CursorProbeBackend, PendingTerminalCursor, PendingTmuxCursor},
     worker::ProviderWorker,
 };
 use crate::{
@@ -46,18 +46,24 @@ pub(super) struct RuntimeState {
     pub(super) history_navigation: bool,
     pub(super) provider_pending: bool,
     pub(super) overlay_visible: bool,
+    /// Explicit dismissal lasts until the buffer changes or the user reopens
+    /// the list, including across background help/config refreshes.
+    pub(super) dismissed_revision: Option<BufferRevision>,
     /// Set when `render_current` had rows to show but the terminal was not
     /// ready (render gate, anchor, or geometry) — the main loop retries the
     /// repaint on every tick until it lands or the query moves on.
     pub(super) repaint_pending: bool,
     pub(super) frame_revision: FrameRevision,
     pub(super) editing: bool,
+    /// Enter was forwarded before the shell's first PROMPT control event.
+    pub(super) queued_startup_enter: bool,
     pub(super) pending_mirror_revision: Option<BufferRevision>,
     pub(super) status: Option<String>,
     pub(super) escape_deadline: Option<Instant>,
     pub(super) need_cpr: bool,
     pub(super) cursor_probe_backend: CursorProbeBackend,
     pub(super) cursor_probe_generation: u64,
+    pub(super) pending_terminal_cursor: Option<PendingTerminalCursor>,
     pub(super) pending_tmux_cursor: Option<PendingTmuxCursor>,
     pub(super) tmux_cursor_retry_at: Option<Instant>,
     pub(super) pending_command: Option<String>,
@@ -134,15 +140,18 @@ impl RuntimeState {
             history_navigation: false,
             provider_pending: false,
             overlay_visible: false,
+            dismissed_revision: None,
             repaint_pending: false,
             frame_revision: FrameRevision::ZERO,
             editing: false,
+            queued_startup_enter: false,
             pending_mirror_revision: None,
             status: None,
             escape_deadline: None,
             need_cpr: false,
             cursor_probe_backend: CursorProbeBackend::TerminalPrivate,
             cursor_probe_generation: 0,
+            pending_terminal_cursor: None,
             pending_tmux_cursor: None,
             tmux_cursor_retry_at: None,
             pending_command: None,
@@ -200,9 +209,11 @@ impl RuntimeState {
         self.cancel_ai();
         self.ai_owns_candidates = false;
         self.repaint_pending = false;
+        self.scheduler.discard_pending();
         self.status = None;
         self.pending_confirm = None;
-        if self.buffer.sync == SyncQuality::Uncertain
+        if self.dismissed_revision == Some(self.buffer.revision)
+            || self.buffer.sync == SyncQuality::Uncertain
             || (self.buffer.text.trim().is_empty() && !self.history_only)
         {
             self.context = None;
@@ -248,6 +259,23 @@ impl RuntimeState {
         self.context = Some(Arc::clone(&context));
         self.provider_pending = true;
         worker.schedule(context)
+    }
+
+    pub(super) fn dismiss_overlay(&mut self) {
+        self.dismissed_revision = Some(self.buffer.revision);
+        self.cancel_ai();
+        self.context = None;
+        self.candidates_context = None;
+        self.candidates.clear();
+        self.selected = None;
+        self.selection_intent = None;
+        self.pending_accept = false;
+        self.pending_confirm = None;
+        self.provider_pending = false;
+        self.overlay_visible = false;
+        self.repaint_pending = false;
+        self.status = None;
+        self.scheduler.discard_pending();
     }
 
     pub(super) fn refresh_help_results(&mut self, worker: &ProviderWorker) -> crate::Result<()> {

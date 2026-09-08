@@ -12,9 +12,45 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
-use super::UpdateError;
+use super::{UpdateError, UpgradeOptions, UpgradePaths};
+
+pub(super) fn begin_auto_attempt(
+    paths: &UpgradePaths,
+    options: &UpgradeOptions,
+    current: &semver::Version,
+) -> Result<Option<fs::File>, UpdateError> {
+    fs::create_dir_all(&paths.state_dir)?;
+    let lock = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(paths.state_dir.join("update-auto.lock"))?;
+    match lock.try_lock_exclusive() {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    let attempt_path = paths.state_dir.join("update-auto-attempt.json");
+    // This separate record tracks attempts rather than discovered releases.
+    // Reuse the cache format, with latest_known identifying the running build.
+    if let Some(attempt) =
+        CheckCache::read_fresh(&attempt_path, Duration::from_secs(options.interval_secs))
+        && attempt.channel == options.channel.as_str()
+        && attempt.latest_known == current.to_string()
+    {
+        return Ok(None);
+    }
+    CheckCache {
+        last_check_epoch: now_epoch_secs(),
+        channel: options.channel.as_str().to_owned(),
+        latest_known: current.to_string(),
+    }
+    .write(&attempt_path)?;
+    Ok(Some(lock))
+}
 
 /// Grace for small clock adjustments; beyond it a future-dated file means
 /// the clock jumped backwards and the entry cannot be trusted.

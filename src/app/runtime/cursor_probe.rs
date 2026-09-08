@@ -8,7 +8,7 @@ use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, unbounded};
 
 use crate::{
     platform::run_bounded,
-    terminal::{BufferRevision, CellPos, ScreenEpoch, ScreenRevision, TerminalSize},
+    terminal::{BufferRevision, CellPos, QueryId, ScreenEpoch, ScreenRevision, TerminalSize},
 };
 
 const TMUX_CURSOR_TIMEOUT: Duration = Duration::from_millis(250);
@@ -22,6 +22,14 @@ pub(super) enum CursorProbeBackend {
     TerminalStandardGuarded,
     Tmux,
     Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct PendingTerminalCursor {
+    pub(super) query_id: QueryId,
+    pub(super) buffer_revision: BufferRevision,
+    pub(super) screen_revision: ScreenRevision,
+    pub(super) screen_epoch: ScreenEpoch,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

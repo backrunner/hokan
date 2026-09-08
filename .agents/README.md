@@ -15,6 +15,7 @@ Hokan 是一个以 Rust 单二进制分发、直接工作在 POSIX TTY/PTY 上�
 5. [实施计划](./05-delivery-plan.md)：技术验证、里程碑、测试矩阵、风险和发布门槛。
 6. [终端渲染专项研究](./06-terminal-rendering-research.md)：IRIS 源码审查、Rust 选型、原子帧协议、fallback 和无闪烁测试体系。
 7. [实现与验收状态](./07-acceptance-status.md)：功能闭环、自动化证据、发布产物和仍待真实环境认证的矩阵。
+8. [开发规范](../AGENTS.md)：本地仅验证 macOS，Linux 验证交给 GitHub Actions，禁止本地 Linux 验证容器或虚拟机。
 
 ## 已确定的产品决策
 

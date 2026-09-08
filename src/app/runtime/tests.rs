@@ -17,6 +17,7 @@ use crate::config::{Config, ConfigPaths};
 use crate::history::{HistoryCursor, HistoryIndex, HistoryPolicy, HistoryStore};
 use crate::platform::CommandPathCache;
 use crate::shell::{ControlMessage, ShellEvent, ShellKind};
+use crate::terminal::BoundaryId;
 use crate::terminal::{
     BufferRevision, QueryId, RiskLevel, TerminalQueryKind, TerminalReply, TerminalSize,
 };
@@ -36,6 +37,106 @@ fn runtime_state(directory: &Path) -> RuntimeState {
         Arc::new(crate::specs::SpecRegistry::default()),
         Arc::new(crate::providers::CommandHelpCache::default()),
     )
+}
+
+#[test]
+fn terminal_cursor_replies_cannot_rewind_a_newer_prompt_or_buffer() {
+    for change in ["screen", "buffer", "epoch"] {
+        let directory = tempfile::tempdir().expect("directory");
+        let mut state = runtime_state(directory.path());
+        let (output, join) = test_output();
+        state.editing = true;
+        state.need_cpr = true;
+        let mut router = crate::terminal::TerminalReplyRouter::default();
+        output
+            .allow_cursor_probe(state.buffer.revision)
+            .expect("probe enabled");
+        maybe_probe_cursor(&mut state, &mut router, None, &output).expect("first query");
+        assert!(state.pending_terminal_cursor.is_some());
+        match change {
+            "screen" => output
+                .child_output(crate::terminal::ChildOutputBatch {
+                    bytes: b"\r\nnew prompt> ".to_vec(),
+                    read_cycle: 1,
+                    drain: crate::terminal::DrainState::DrainedToEagain,
+                })
+                .expect("new output"),
+            "buffer" => {
+                state.buffer.set_exact("x".into(), 1).expect("new buffer");
+            }
+            _ => output.invalidate_anchor().expect("new epoch"),
+        }
+        let before = output.state().expect("before reply");
+        let reply = router
+            .route(b"\x1b[?1;1R", Instant::now())
+            .replies
+            .pop()
+            .expect("old cursor reply");
+        assert!(
+            !handle_terminal_reply(reply, &mut state, &output).expect("stale reply"),
+            "accepted after {change}"
+        );
+        assert_eq!(output.state().expect("after reply").cursor, before.cursor);
+        assert!(state.need_cpr);
+
+        maybe_probe_cursor(&mut state, &mut router, None, &output).expect("replacement query");
+        let position = output.state().expect("current position").cursor;
+        let response = format!("\x1b[?{};{}R", position.row + 1, position.col + 1);
+        let reply = router
+            .route(response.as_bytes(), Instant::now())
+            .replies
+            .pop()
+            .expect("fresh reply");
+        assert!(handle_terminal_reply(reply, &mut state, &output).expect("current reply"));
+        assert_eq!(
+            output.state().expect("anchor").confidence,
+            crate::terminal::AnchorConfidence::Exact
+        );
+        output.restore_and_exit().expect("shutdown");
+        join.join().expect("actor joins").expect("actor exits");
+    }
+}
+
+#[test]
+fn initial_prompt_does_not_reclaim_a_command_already_queued_by_enter() {
+    let directory = tempfile::tempdir().expect("directory");
+    let mut state = runtime_state(directory.path());
+    state.queued_startup_enter = true;
+    state.foreground_process = true;
+    let (output, join) = test_output();
+    output.set_foreground(true).expect("queued Enter");
+    let worker = ProviderWorker::start(
+        Arc::new(crate::completion::CompletionEngine::new(20, 12)),
+        None,
+    )
+    .expect("worker");
+    let store = HistoryStore::open(&directory.path().join("state")).expect("store");
+    let history = Arc::new(RwLock::new(HistoryIndex::default()));
+    let policy = HistoryPolicy::new(1024, &[]).expect("policy");
+    for boundary in 1..=2 {
+        handle_control_message(
+            ControlMessage::Event(ShellEvent::Prompt {
+                boundary_id: BoundaryId::new(boundary),
+                cwd: directory.path().to_owned(),
+                history_control: None,
+            }),
+            &mut state,
+            &output,
+            &worker,
+            &store,
+            &history,
+            &policy,
+        )
+        .expect("prompt");
+        let queued = boundary == 1;
+        assert_eq!(state.foreground_process, queued);
+        assert_eq!(output.state().expect("output state").foreground, queued);
+        assert_eq!(state.editing, !queued);
+        assert_eq!(state.need_cpr, !queued);
+        assert!(!state.queued_startup_enter);
+    }
+    output.restore_and_exit().expect("shutdown");
+    join.join().expect("actor joins").expect("actor exits");
 }
 
 #[test]
@@ -767,6 +868,86 @@ fn enter_label(resolution: &EnterResolution) -> &'static str {
         EnterResolution::Execute(_) => "execute",
         EnterResolution::Confirm { .. } => "confirm",
     }
+}
+
+#[test]
+fn unknown_risk_cannot_override_a_known_dangerous_execution() {
+    for (text, risk) in [
+        ("rm -rf ./build", RiskLevel::Unknown),
+        ("echo $(date)", RiskLevel::High),
+        ("rm -rf \"$(pwd)/build\"", RiskLevel::Low),
+        ("eval payload; rm -rf ./build", RiskLevel::Low),
+    ] {
+        let candidate =
+            enter_candidate(text, CandidateAction::Insert, Completeness::Runnable, risk);
+        let activation = Activation::ReplaceBuffer {
+            text: text.into(),
+            cursor: text.len(),
+        };
+        assert!(
+            matches!(
+                resolve_enter(&candidate, &activation),
+                EnterResolution::Confirm {
+                    risk: RiskLevel::High,
+                    ..
+                }
+            ),
+            "confirmation missing for {text:?}"
+        );
+    }
+}
+
+#[test]
+fn dismissed_overlay_drops_pending_frames_and_late_results_until_reopened_or_edited() {
+    let directory = tempfile::tempdir().expect("directory");
+    let mut state = runtime_state(directory.path());
+    let (output, join) = test_output();
+    state.editing = true;
+    state.buffer.set_exact("echo ".into(), 5).expect("buffer");
+    refresh_context(&mut state, QueryId::new(1));
+    let late = provider_result(
+        &state,
+        vec![history_candidate(QueryId::new(1), "echo later")],
+    );
+    state.candidates = vec![history_candidate(QueryId::new(1), "echo first")];
+    output
+        .allow_cursor_probe(state.buffer.revision)
+        .expect("probe");
+    output
+        .confirm_cursor(crate::terminal::CellPos::new(0, 9))
+        .expect("cursor");
+    state.scheduler = crate::terminal::LatestFrameScheduler::new(1);
+    render_current(&mut state, &output).expect("first frame");
+    move_selection(&mut state, 1);
+    render_current(&mut state, &output).expect("queued frame");
+    assert!(!state.scheduler.is_idle());
+
+    state.dismiss_overlay();
+    output.hide_overlay().expect("hide");
+    handle_provider_result(late, &mut state, &output).expect("late result");
+    render_current(&mut state, &output).expect("redisplay");
+    flush_scheduled_frame(&mut state, &output).expect("tick");
+    assert!(state.scheduler.is_idle());
+    assert!(!state.overlay_visible);
+    assert!(!state.repaint_pending);
+    assert!(state.candidates.is_empty());
+    assert!(state.selected.is_none());
+    assert_eq!(state.buffer.text, "echo ");
+
+    let engine = Arc::new(crate::completion::CompletionEngine::new(20, 12));
+    let worker = ProviderWorker::start(engine, None).expect("worker");
+    state.schedule_query(&worker).expect("background refresh");
+    assert!(!state.provider_pending);
+    assert!(state.context.is_none());
+    state.dismissed_revision = None;
+    state.schedule_query(&worker).expect("explicit reopen");
+    assert!(state.provider_pending);
+    state.dismiss_overlay();
+    state.buffer.set_exact("echo n".into(), 6).expect("edit");
+    state.schedule_query(&worker).expect("query after edit");
+    assert!(state.provider_pending);
+    output.restore_and_exit().expect("shutdown");
+    join.join().expect("actor joins").expect("actor exits");
 }
 
 fn session_token() -> crate::terminal::SessionToken {

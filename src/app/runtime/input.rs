@@ -140,6 +140,7 @@ pub(super) fn handle_input_event(
         // cannot change terminal modes before the output actor snapshots the
         // shell baseline.
         if !state.foreground_process && matches!(event.kind, InputKind::Enter) {
+            state.queued_startup_enter = true;
             state.foreground_process = true;
             output.set_foreground_and_wait(true).map_err(output_error)?;
         }
@@ -172,8 +173,7 @@ pub(super) fn handle_input_event(
 
     if state.overlay_visible {
         if dismisses_empty_overlay(&event.kind, state.buffer.text.is_empty()) {
-            state.overlay_visible = false;
-            state.cancel_ai();
+            state.dismiss_overlay();
             output.hide_overlay().map_err(output_error)?;
             // Keep processing the event so a mirrored buffer that lagged the
             // real shell cannot cause this backspace to be swallowed.
@@ -227,14 +227,12 @@ pub(super) fn handle_input_event(
             return Ok(());
         }
         if config.keys.dismiss.matches(&event.kind) {
-            state.overlay_visible = false;
-            state.cancel_ai();
+            state.dismiss_overlay();
             output.hide_overlay().map_err(output_error)?;
             return Ok(());
         }
         if config.keys.toggle.matches(&event.kind) {
-            state.overlay_visible = false;
-            state.cancel_ai();
+            state.dismiss_overlay();
             output.hide_overlay().map_err(output_error)?;
             return Ok(());
         }
@@ -259,11 +257,13 @@ pub(super) fn handle_input_event(
         };
         state.history_navigation = true;
         state.history_only = true;
+        state.dismissed_revision = None;
         state.schedule_query(worker)?;
         defer_selection(state, delta);
         arm_hidden_overlay_query(state, output)?;
         return Ok(());
     } else if config.keys.history.matches(&event.kind) || config.keys.toggle.matches(&event.kind) {
+        state.dismissed_revision = None;
         state.history_navigation = false;
         state.history_only = config.keys.history.matches(&event.kind);
         state.schedule_query(worker)?;

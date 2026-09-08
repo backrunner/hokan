@@ -164,6 +164,59 @@ fn compaction_aggregates_and_survives_the_rename_truncate_crash_window() {
 }
 
 #[test]
+fn compaction_and_index_preserve_meaningful_shell_whitespace() {
+    let directory = tempfile::tempdir().expect("directory");
+    let store = HistoryStore::open(directory.path()).expect("store");
+    let commands = [
+        "printf 'a  b'",
+        "printf 'a b'",
+        "printf a\\  b",
+        "printf a\\ b",
+        "echo one\necho two",
+        "echo one echo two",
+        "printf a\\ ",
+        "printf a\\",
+    ];
+    let policy = HistoryPolicy::new(1024, &[]).expect("policy");
+    let events: Vec<_> = commands.iter().map(|command| event(command)).collect();
+    store.append_many(&events).expect("append");
+    let mut index = HistoryIndex::default();
+    for entry in &events {
+        index.ingest_event(entry, &policy);
+    }
+    assert_eq!(
+        index.len(),
+        commands.len(),
+        "distinct arguments must not merge in memory"
+    );
+    store.compact().expect("compact");
+    let compacted = store.read().expect("read").events;
+    assert_eq!(
+        compacted.len(),
+        commands.len(),
+        "compaction must retain every command"
+    );
+    let mut restored = HistoryIndex::default();
+    for entry in &compacted {
+        restored.ingest_event(entry, &policy);
+        assert_eq!(entry.occurrences, 1);
+    }
+    let rows = restored.search("", std::path::Path::new("/tmp"), 1, commands.len());
+    assert_eq!(restored.len(), commands.len());
+    // Multiline records survive compaction, but are intentionally omitted
+    // from directly actionable search results.
+    for command in commands
+        .into_iter()
+        .filter(|command| !command.contains('\n'))
+    {
+        assert!(
+            rows.iter().any(|row| row.record.command == command),
+            "lost command {command:?}"
+        );
+    }
+}
+
+#[test]
 fn compaction_preserves_per_directory_command_counts() {
     let directory = tempfile::tempdir().expect("directory");
     let store = HistoryStore::open(directory.path()).expect("store");

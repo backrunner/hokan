@@ -378,8 +378,8 @@ fn command_priority(context: &CompletionContext, candidate: &Candidate) -> u8 {
 
 /// A candidate whose FULL resulting buffer equals what is already typed adds
 /// nothing: accepting it would rewrite the edit line to itself. The comparison
-/// is trim-normalized so trailing-whitespace near-misses count as identical
-/// too. A completed line stays open only when a provider has a real next step.
+/// ignores ordinary edge spacing, but preserves whitespace that may belong
+/// to a quoted/escaped argument or nested shell syntax.
 fn produces_current_buffer(context: &CompletionContext, candidate: &Candidate) -> bool {
     let resulting = match candidate.edit.as_ref() {
         Some(edit) => match apply_edit(&context.buffer.text, edit.range.clone(), &edit.replacement)
@@ -389,7 +389,16 @@ fn produces_current_buffer(context: &CompletionContext, candidate: &Candidate) -
         },
         None => candidate.display.primary.clone(),
     };
-    resulting.trim() == context.buffer.text.trim()
+    trim_insignificant_spacing(&resulting) == trim_insignificant_spacing(&context.buffer.text)
+}
+
+fn trim_insignificant_spacing(text: &str) -> &str {
+    let text = text.trim_start_matches([' ', '\t']);
+    if text.contains(['\'', '"', '\\', '\n', '\r', '`', '$', '#']) {
+        text
+    } else {
+        text.trim_end_matches([' ', '\t'])
+    }
 }
 
 fn has_valid_edit(context: &CompletionContext, candidate: &Candidate) -> bool {
@@ -570,8 +579,8 @@ const fn risk_severity(risk: RiskLevel) -> u8 {
         RiskLevel::ReadOnly => 0,
         RiskLevel::Low => 1,
         RiskLevel::Medium => 2,
-        RiskLevel::High => 3,
-        RiskLevel::Unknown => 4,
+        RiskLevel::Unknown => 3,
+        RiskLevel::High => 4,
     }
 }
 
@@ -707,6 +716,27 @@ mod tests {
         );
         assert_eq!(ranked.len(), 1);
         assert_eq!(ranked[0].display.primary, "git status --short");
+    }
+
+    #[test]
+    fn preserves_candidates_that_change_meaningful_shell_whitespace() {
+        for (typed, completed) in [
+            ("printf a\\", "printf a\\ "),
+            ("printf 'a", "printf 'a "),
+            ("echo", "echo\u{00a0}"),
+        ] {
+            let context = buffer_context(typed);
+            let ranked = rank_and_dedupe(
+                &context,
+                vec![history_candidate(&context, completed, typed.len())],
+                10,
+            );
+            assert_eq!(ranked.len(), 1, "lost completion {completed:?}");
+            assert_eq!(
+                ranked[0].edit.as_ref().expect("edit").replacement,
+                completed
+            );
+        }
     }
 
     #[test]
@@ -1035,6 +1065,14 @@ mod tests {
 
     #[test]
     fn stricter_risk_keeps_the_more_severe_level() {
+        assert_eq!(
+            stricter_risk(RiskLevel::Unknown, RiskLevel::High),
+            RiskLevel::High
+        );
+        assert_eq!(
+            stricter_risk(RiskLevel::High, RiskLevel::Unknown),
+            RiskLevel::High
+        );
         assert_eq!(
             stricter_risk(RiskLevel::Low, RiskLevel::High),
             RiskLevel::High

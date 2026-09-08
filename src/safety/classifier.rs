@@ -47,15 +47,17 @@ pub fn classify_command(command: &str) -> RiskAssessment {
     let Ok(parsed) = crate::parser::parse_line(command, command.len()) else {
         return assessment(RiskLevel::Unknown, vec![RiskReason::OpaqueSyntax]);
     };
-    if parsed
+    let opaque = parsed
         .tokens
         .iter()
-        .any(|token| token.quote == crate::parser::QuoteContext::Opaque)
-    {
-        return assessment(RiskLevel::Unknown, vec![RiskReason::OpaqueSyntax]);
-    }
-    let mut level = RiskLevel::Low;
-    let mut reasons = Vec::new();
+        .any(|token| token.quote == crate::parser::QuoteContext::Opaque);
+    // Opaque parts do not erase known destructive operations elsewhere in
+    // the line (for example, `rm -rf "$(...)"`).
+    let (mut level, mut reasons) = if opaque {
+        (RiskLevel::Unknown, vec![RiskReason::OpaqueSyntax])
+    } else {
+        (RiskLevel::Low, Vec::new())
+    };
     let segments = command_segments(&parsed.tokens);
     let commands: Vec<_> = segments
         .iter()
@@ -556,8 +558,8 @@ const fn severity(level: RiskLevel) -> u8 {
         RiskLevel::ReadOnly => 0,
         RiskLevel::Low => 1,
         RiskLevel::Medium => 2,
-        RiskLevel::High => 3,
-        RiskLevel::Unknown => 4,
+        RiskLevel::Unknown => 3,
+        RiskLevel::High => 4,
     }
 }
 
@@ -580,6 +582,9 @@ mod tests {
             ("dd if=image of=copy.img", RiskLevel::Medium),
             ("echo hi > file", RiskLevel::Medium),
             ("rm -rf ./build", RiskLevel::High),
+            ("rm -rf \"$(pwd)/build\"", RiskLevel::High),
+            ("eval payload; rm -rf ./build", RiskLevel::High),
+            ("rm -rf ./build; source ./setup.sh", RiskLevel::High),
             ("sudo /bin/rm -f ./artifact", RiskLevel::High),
             ("doas -u root rm -rf ./artifact", RiskLevel::High),
             ("timeout 2 rm -rf ./artifact", RiskLevel::High),
@@ -624,7 +629,7 @@ mod tests {
             ("env -S 'rm -rf /'", RiskLevel::Unknown),
             ("source ./script.sh", RiskLevel::Unknown),
             (". ./script.sh", RiskLevel::Unknown),
-            ("exec rm -rf /", RiskLevel::Unknown),
+            ("exec rm -rf /", RiskLevel::High),
             ("echo ${(e)payload}", RiskLevel::Unknown),
             ("echo \"${(Xe)payload}\"", RiskLevel::Unknown),
             // Descriptor duplication is not an overwrite and not a background

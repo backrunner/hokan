@@ -6,6 +6,7 @@ use std::{
 
 use regex::Regex;
 
+use super::normalize::normalize_command as normalize;
 use crate::{completion::match_quality_folded, history::HistoryEventV1, shell::ShellKind};
 
 #[derive(Clone, Debug)]
@@ -201,7 +202,7 @@ impl HistoryIndex {
             .records
             .entry(normalized.clone())
             .or_insert_with(|| HistoryRecord {
-                command: command.trim().to_owned(),
+                command: command.trim_start_matches([' ', '\t']).to_owned(),
                 count: 0,
                 last_used_ms: timestamp_ms,
                 shell,
@@ -228,7 +229,7 @@ impl HistoryIndex {
             usage.last_used_ms = usage.last_used_ms.max(timestamp_ms);
         }
         if timestamp_ms >= record.last_used_ms {
-            record.command = command.trim().to_owned();
+            record.command = command.trim_start_matches([' ', '\t']).to_owned();
             record.last_used_ms = timestamp_ms;
             record.shell = shell;
             record.last_cwd = normalized_cwd.clone();
@@ -520,10 +521,6 @@ fn compare_ranked(left: &RankedRecord<'_>, right: &RankedRecord<'_>) -> Ordering
         .cmp(&left_score)
         .then_with(|| right.record.last_used_ms.cmp(&left.record.last_used_ms))
         .then_with(|| left.record.command.cmp(&right.record.command))
-}
-
-fn normalize(command: &str) -> String {
-    command.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn frecency_score(last_used_ms: i64, count: u64, now_ms: i64) -> i16 {
@@ -994,15 +991,23 @@ mod tests {
                 &policy,
             );
         }
-        let started = Instant::now();
-        let matches = index.search("git project-999", Path::new("/"), 100_000, 50);
-        let elapsed = started.elapsed();
-        assert!(!matches.is_empty());
+        // The latency target is p95, not a single wall-clock sample, which
+        // can include an unrelated scheduler pause on a shared CI runner.
+        let mut samples = Vec::with_capacity(20);
+        for _ in 0..20 {
+            let started = Instant::now();
+            let matches = index.search("git project-999", Path::new("/"), 100_000, 50);
+            samples.push(started.elapsed());
+            assert!(!matches.is_empty());
+            assert!(matches.len() <= 50);
+        }
+        samples.sort_unstable();
+        let p95 = samples[18];
         let budget = if cfg!(debug_assertions) {
             Duration::from_secs(1)
         } else {
             Duration::from_millis(30)
         };
-        assert!(elapsed <= budget, "100k history query took {elapsed:?}");
+        assert!(p95 <= budget, "100k history query p95 was {p95:?}");
     }
 }

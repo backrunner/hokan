@@ -121,6 +121,25 @@ impl OutputHandle {
             .push_control(ControlCommand::ConfirmCursor(position))
     }
 
+    /// Validate and apply a delayed cursor report in the output actor, so
+    /// child bytes cannot slip between the version check and the update.
+    pub fn confirm_cursor_if_current(
+        &self,
+        position: super::CellPos,
+        screen_revision: ScreenRevision,
+        screen_epoch: ScreenEpoch,
+    ) -> Result<bool, OutputError> {
+        let (sender, receiver) = mpsc::sync_channel(0);
+        self.mailbox
+            .push_control(ControlCommand::ConfirmCursorIfCurrent {
+                position,
+                screen_revision,
+                screen_epoch,
+                sender,
+            })?;
+        receiver.recv().map_err(|_| OutputError::Closed)
+    }
+
     pub fn set_sync_capability(&self, capability: SyncOutputCapability) -> Result<(), OutputError> {
         self.mailbox
             .push_control(ControlCommand::SetSyncCapability(capability))
@@ -235,6 +254,12 @@ enum ControlCommand {
     ArmPromptGate(BoundaryId),
     ArmRenderGate(RenderGateRequest),
     ConfirmCursor(super::CellPos),
+    ConfirmCursorIfCurrent {
+        position: super::CellPos,
+        screen_revision: ScreenRevision,
+        screen_epoch: ScreenEpoch,
+        sender: SyncSender<bool>,
+    },
     SetSyncCapability(SyncOutputCapability),
     SetBracketedPaste(bool),
     Resize(TerminalSize),

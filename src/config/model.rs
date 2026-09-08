@@ -548,7 +548,12 @@ impl Default for UpdateConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            channel: "stable".into(),
+            channel: if env!("CARGO_PKG_VERSION_PRE").starts_with("beta.") {
+                "beta"
+            } else {
+                "stable"
+            }
+            .into(),
             interval_secs: 1_800,
         }
     }
@@ -774,10 +779,15 @@ mod tests {
     }
 
     #[test]
-    fn update_config_defaults_to_enabled_stable() {
+    fn update_config_defaults_to_the_build_channel() {
         let update = UpdateConfig::default();
         assert!(update.enabled);
-        assert_eq!(update.channel, "stable");
+        let expected = if env!("CARGO_PKG_VERSION_PRE").starts_with("beta.") {
+            "beta"
+        } else {
+            "stable"
+        };
+        assert_eq!(update.channel, expected);
         assert_eq!(update.interval_secs, 1_800);
         assert_eq!(Config::default().update, update);
     }
@@ -794,6 +804,12 @@ mod tests {
         let rendered = toml::to_string(&parsed).expect("serialize update config");
         let reparsed: UpdateConfig = toml::from_str(&rendered).expect("reparse update config");
         assert_eq!(parsed, reparsed);
+    }
+
+    #[test]
+    fn explicit_stable_channel_survives_beta_defaults() {
+        let config: Config = toml::from_str("[update]\nchannel = \"stable\"\n").expect("config");
+        assert_eq!(config.update.channel, "stable");
     }
 
     #[test]

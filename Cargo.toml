@@ -1,6 +1,6 @@
 [package]
 name = "hokan"
-version = "0.1.0-beta.9"
+version = "0.1.0-beta.10"
 edition = "2024"
 rust-version = "1.96"
 description = "A shell-aware terminal completion overlay"
@@ -11,6 +11,7 @@ documentation = "https://docs.rs/hokan"
 keywords = ["completion", "pty", "shell", "terminal", "tui"]
 categories = ["command-line-utilities", "development-tools"]
 include = [
+    "/AGENTS.md",
     "/.agents/**",
     "/assets/**",
     "/docs/**",
@@ -21,6 +22,7 @@ include = [
     "/LICENSE",
     "/README.md",
     "/scripts/install.sh",
+    "/scripts/package-release.sh",
 ]
 
 [dependencies]

@@ -3,6 +3,7 @@ use std::process::{Command, Stdio};
 #[test]
 fn terminal_session_failure_prints_an_actionable_recovery_hint() {
     let output = Command::new(env!("CARGO_BIN_EXE_hokan"))
+        .env("HOKAN_NO_AUTO_UPDATE", "1")
         .env("TERM", "xterm-256color")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

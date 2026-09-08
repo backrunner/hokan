@@ -144,6 +144,10 @@ pub(crate) fn release_json(tag: &str, assets: &[String]) -> serde_json::Value {
 /// Builds a real tar.gz release archive containing `bin/hokan` (mode 0755)
 /// with the given content.
 pub(crate) fn build_archive(binary: &str) -> Vec<u8> {
+    build_archive_at(binary, "bin/hokan")
+}
+
+pub(crate) fn build_archive_at(binary: &str, path: &str) -> Vec<u8> {
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
     {
         let mut builder = tar::Builder::new(&mut encoder);
@@ -152,7 +156,7 @@ pub(crate) fn build_archive(binary: &str) -> Vec<u8> {
         header.set_mode(0o755);
         header.set_cksum();
         builder
-            .append_data(&mut header, "bin/hokan", binary.as_bytes())
+            .append_data(&mut header, path, binary.as_bytes())
             .expect("append binary");
         builder.finish().expect("finish archive");
     }

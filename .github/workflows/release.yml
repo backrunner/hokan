@@ -102,6 +102,12 @@ jobs:
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           generate_release_notes: true
+          # Publish only after every archive and checksum has been uploaded.
+          draft: true
           # Beta channels ship as pre-releases (tags like v0.2.0-beta.1).
           prerelease: ${{ contains(inputs.tag || github.ref_name, '-') }}
           files: dist/*
+      - name: Publish complete release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$RELEASE_TAG" --draft=false

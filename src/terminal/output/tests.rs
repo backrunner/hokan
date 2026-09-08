@@ -260,6 +260,61 @@ fn prompt_mode_recovery_waits_for_prompt_marker_when_control_wins_race() {
 }
 
 #[test]
+fn queued_command_keeps_its_shell_baseline_when_initial_prompt_recovery_is_delayed() {
+    let size = TerminalSize::new(24, 80).expect("size");
+    let mut actor = OutputActor::new(Vec::new(), token(), size, 3);
+    actor
+        .arm_prompt_gate(BoundaryId::new(1))
+        .expect("initial prompt");
+    actor
+        .handle_control(ControlCommand::SetForeground(true))
+        .expect("queued Enter");
+    let mut bytes = encode_marker(
+        &token(),
+        RenderBoundaryEvent::PromptRendered {
+            boundary_id: BoundaryId::new(1),
+        },
+    );
+    bytes.extend_from_slice(b"\x1b[?1003h\x1b[?1004h\x1b[>7u");
+    actor
+        .handle_child(ChildOutputBatch {
+            read_cycle: 1,
+            bytes,
+            drain: DrainState::DrainedToEagain,
+        })
+        .expect("initial prompt followed by TUI output");
+    actor
+        .handle_control(ControlCommand::SetForeground(true))
+        .expect("delayed CommandStart");
+    actor
+        .handle_control(ControlCommand::SetForeground(false))
+        .expect("command exits");
+    actor
+        .arm_prompt_gate(BoundaryId::new(2))
+        .expect("next prompt");
+    actor
+        .handle_child(ChildOutputBatch {
+            read_cycle: 2,
+            bytes: encode_marker(
+                &token(),
+                RenderBoundaryEvent::PromptRendered {
+                    boundary_id: BoundaryId::new(2),
+                },
+            ),
+            drain: DrainState::DrainedToEagain,
+        })
+        .expect("next prompt output");
+    // Check before TerminalGuard's final cleanup, which also disables these
+    // modes and would otherwise conceal a broken prompt recovery.
+    assert!(
+        !actor.model.input_modes().mouse_any,
+        "TUI mouse mode leaked into the shell"
+    );
+    assert!(!actor.model.input_modes().focus_reporting);
+    assert_eq!(actor.model.input_modes().kitty_stack_depth, 0);
+}
+
+#[test]
 fn prepare_surface_scroll_is_wrapped_in_a_transaction_when_2026_is_available() {
     let size = TerminalSize::new(24, 80).expect("fixture terminal size is valid");
     let mut actor = OutputActor::new(Vec::new(), token(), size, 3);

@@ -37,7 +37,7 @@ pub(super) fn json_reply(status: &'static str, body: serde_json::Value) -> MockR
     }
 }
 
-/// Serves exactly `requests` connections, routing each raw request through
+/// Serves exactly `requests` POST requests, routing each raw request through
 /// `handler`; every request is forwarded to the returned channel.
 pub(super) fn spawn_server(
     requests: usize,
@@ -47,12 +47,25 @@ pub(super) fn spawn_server(
     let address = listener.local_addr().expect("server address");
     let (request_sender, request_receiver) = mpsc::channel();
     let join = thread::spawn(move || {
-        for _ in 0..requests {
+        let mut served = 0;
+        while served < requests {
             let (mut stream, _) = listener.accept().expect("accept request");
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .expect("read timeout");
             let request = read_http_request(&mut stream);
+            // Ignore unrelated localhost probes (for example, a developer
+            // service periodically scanning ephemeral ports). They must not
+            // consume one of the scripted OAuth exchanges.
+            let is_post = String::from_utf8_lossy(&request)
+                .lines()
+                .next()
+                .is_some_and(|line| line.starts_with("POST "));
+            if !is_post {
+                write_response(&mut stream, "404 Not Found", b"", "");
+                continue;
+            }
+            served += 1;
             let _ = request_sender.send(request.clone());
             let reply = handler(&request);
             write_response(&mut stream, reply.status, &reply.body, &reply.extra_headers);
@@ -173,4 +186,34 @@ pub(super) fn grok_token_reply() -> MockReply {
             "token_type": "Bearer"
         }),
     )
+}
+
+#[test]
+fn unrelated_localhost_probe_does_not_consume_an_oauth_exchange() {
+    let (base, requests, join) = spawn_server(1, |_| grok_token_reply());
+    let client = reqwest::Client::new();
+    runtime().block_on(async {
+        let probe = client.get(&base).send().await.expect("probe response");
+        assert_eq!(probe.status(), reqwest::StatusCode::NOT_FOUND);
+        let reply = client
+            .post(format!("{base}/oauth/token"))
+            .body("")
+            .send()
+            .await
+            .expect("token response");
+        assert!(reply.status().is_success());
+        assert!(
+            reply
+                .text()
+                .await
+                .expect("token body")
+                .contains("grok-access")
+        );
+    });
+    assert_eq!(
+        request_path(&requests.recv().expect("OAuth request")),
+        "/oauth/token"
+    );
+    join.join().expect("server");
+    assert!(requests.try_recv().is_err());
 }

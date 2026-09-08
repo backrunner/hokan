@@ -3,8 +3,8 @@ use std::time::Instant;
 use super::{
     TERMINAL_QUERY_TIMEOUT,
     cursor_probe::{
-        CursorProbeBackend, PendingTmuxCursor, TMUX_CURSOR_RETRY_DELAY, TmuxCursorProbe,
-        TmuxCursorResult,
+        CursorProbeBackend, PendingTerminalCursor, PendingTmuxCursor, TMUX_CURSOR_RETRY_DELAY,
+        TmuxCursorProbe, TmuxCursorResult,
     },
     output_error,
     state::RuntimeState,
@@ -16,6 +16,15 @@ use crate::terminal::{
 };
 
 pub(super) fn render_current(state: &mut RuntimeState, output: &OutputHandle) -> crate::Result<()> {
+    if state.dismissed_revision == Some(state.buffer.revision)
+        || state.buffer.sync == crate::completion::SyncQuality::Uncertain
+        || state.foreground_process
+        || state.suspended
+    {
+        state.repaint_pending = false;
+        state.scheduler.discard_pending();
+        return Ok(());
+    }
     if !state.overlay_visible
         && state.candidates.is_empty()
         && state.status.is_none()
@@ -191,6 +200,9 @@ pub(super) fn flush_scheduled_frame(
     state: &mut RuntimeState,
     output: &OutputHandle,
 ) -> crate::Result<()> {
+    if !state.overlay_visible {
+        state.scheduler.discard_pending();
+    }
     if state.repaint_pending {
         render_current(state, output)?;
     }
@@ -221,9 +233,31 @@ pub(super) fn handle_terminal_reply(
     output: &OutputHandle,
 ) -> crate::Result<bool> {
     match reply {
-        TerminalReply::CursorPosition { position, .. } => {
-            output.confirm_cursor(position).map_err(output_error)?;
-            return Ok(true);
+        TerminalReply::CursorPosition { query_id, position } => {
+            let Some(pending) = state.pending_terminal_cursor.take() else {
+                return Ok(false);
+            };
+            if pending.query_id != query_id {
+                state.pending_terminal_cursor = Some(pending);
+                return Ok(false);
+            }
+            let confirmed = state.editing
+                && !state.foreground_process
+                && state.buffer.revision == pending.buffer_revision
+                && output
+                    .confirm_cursor_if_current(
+                        position,
+                        pending.screen_revision,
+                        pending.screen_epoch,
+                    )
+                    .map_err(output_error)?;
+            if !confirmed && state.editing && !state.foreground_process {
+                output
+                    .allow_cursor_probe(state.buffer.revision)
+                    .map_err(output_error)?;
+                state.need_cpr = true;
+            }
+            return Ok(confirmed);
         }
         TerminalReply::SynchronizedOutput { capability, .. } => {
             output
@@ -247,6 +281,7 @@ pub(super) fn handle_terminal_reply(
             // guarded by a status DSR so a modified F3 sequence cannot be
             // mistaken for the cursor reply.
             state.cursor_probe_backend = CursorProbeBackend::TerminalStandardGuarded;
+            state.pending_terminal_cursor = None;
             state.pending_tmux_cursor = None;
             state.tmux_cursor_retry_at = None;
             state.need_cpr = state.editing && !state.foreground_process;
@@ -257,6 +292,7 @@ pub(super) fn handle_terminal_reply(
             ..
         } => {
             state.cursor_probe_backend = CursorProbeBackend::Unavailable;
+            state.pending_terminal_cursor = None;
             state.pending_tmux_cursor = None;
             state.tmux_cursor_retry_at = None;
             state.need_cpr = false;
@@ -281,28 +317,26 @@ pub(super) fn maybe_probe_cursor(
         return Ok(());
     }
     match state.cursor_probe_backend {
-        CursorProbeBackend::TerminalPrivate => {
+        CursorProbeBackend::TerminalPrivate | CursorProbeBackend::TerminalStandardGuarded => {
             if router.has_outstanding() {
                 return Ok(());
             }
             let query = router.register(
-                TerminalQueryKind::CursorPositionPrivate,
+                if state.cursor_probe_backend == CursorProbeBackend::TerminalPrivate {
+                    TerminalQueryKind::CursorPositionPrivate
+                } else {
+                    TerminalQueryKind::CursorPositionStandardGuarded
+                },
                 Instant::now(),
                 TERMINAL_QUERY_TIMEOUT,
             )?;
             output.probe(query.bytes).map_err(output_error)?;
-            state.need_cpr = false;
-        }
-        CursorProbeBackend::TerminalStandardGuarded => {
-            if router.has_outstanding() {
-                return Ok(());
-            }
-            let query = router.register(
-                TerminalQueryKind::CursorPositionStandardGuarded,
-                Instant::now(),
-                TERMINAL_QUERY_TIMEOUT,
-            )?;
-            output.probe(query.bytes).map_err(output_error)?;
+            state.pending_terminal_cursor = Some(PendingTerminalCursor {
+                query_id: query.id,
+                buffer_revision: state.buffer.revision,
+                screen_revision: output_state.screen_revision,
+                screen_epoch: output_state.screen_epoch,
+            });
             state.need_cpr = false;
         }
         CursorProbeBackend::Tmux => {
@@ -389,6 +423,12 @@ pub(super) fn handle_tmux_cursor_result(
     };
 
     state.tmux_cursor_retry_at = None;
-    output.confirm_cursor(position).map_err(output_error)?;
-    Ok(true)
+    let confirmed = output
+        .confirm_cursor_if_current(position, pending.screen_revision, pending.screen_epoch)
+        .map_err(output_error)?;
+    if !confirmed {
+        state.need_cpr = true;
+        state.tmux_cursor_retry_at = Some(Instant::now() + TMUX_CURSOR_RETRY_DELAY);
+    }
+    Ok(confirmed)
 }

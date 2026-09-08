@@ -42,6 +42,11 @@ impl<T> LatestFrameScheduler<T> {
         Some(pending)
     }
 
+    /// Cancel queued drawing without allowing older revisions back in.
+    pub fn discard_pending(&mut self) {
+        self.pending = None;
+    }
+
     #[must_use]
     pub const fn pending_len(&self) -> usize {
         if self.pending.is_some() { 1 } else { 0 }

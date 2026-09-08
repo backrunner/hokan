@@ -1,4 +1,4 @@
-.TH HOKAN 1 "2026-08-23" "hokan 0.1.0-beta.9" "User Commands"
+.TH HOKAN 1 "2026-09-09" "hokan 0.1.0-beta.10" "User Commands"
 .SH NAME
 hokan \- shell-aware terminal completion overlay
 .SH SYNOPSIS
@@ -118,6 +118,12 @@ before upgrading. Automatic background updates use the same code path and
 are controlled by the
 .B [update]
 config section and the HOKAN_NO_AUTO_UPDATE environment variable.
+Checks run at session startup and are throttled, including failed retries,
+by update.interval_secs (1800 seconds by default). An installed update takes
+effect on the next launch. Beta builds default to the beta channel, while
+explicit channel settings are preserved. Concurrent updates are serialized;
+the replacement is staged beside the executable to support a cache on a
+different filesystem.
 .TP
 .BI "history " import|stats|prune|repair|compact|clear
 Import and maintain Hokan's private history store. Clearing requires

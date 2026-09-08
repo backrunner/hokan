@@ -76,7 +76,13 @@ impl TerminalSession {
 
     fn spawn_with_sync_status(sync_status: u8) -> Self {
         let (home, work) = fixture_directories();
-        Self::spawn_hokan(home, work, sync_status)
+        let mut terminal = Self::spawn_hokan(home, work, sync_status);
+        // Ordinary interaction tests start after the terminal handshake.
+        // Startup handoff tests use spawn_hokan directly to queue early input.
+        // A fixed sleep can expire before this test thread answers a probe
+        // under parallel load, leaking a late response into its next command.
+        terminal.wait_for_sync_replies(1);
+        terminal
     }
 
     fn spawn_without_private_cpr() -> Self {
@@ -476,6 +482,25 @@ impl TerminalSession {
         );
     }
 
+    fn wait_for_overlay_candidate(&mut self, needle: &str) {
+        let deadline = Instant::now() + TIMEOUT;
+        while Instant::now() < deadline {
+            if self
+                .screen_text()
+                .lines()
+                .any(|line| line.trim_start().starts_with('│') && line.contains(needle))
+                && self.border_strays().is_empty()
+            {
+                return;
+            }
+            self.receive_once(READ_POLL);
+        }
+        panic!(
+            "overlay did not contain {needle:?}; screen=\n{}",
+            self.screen_text()
+        );
+    }
+
     fn wait_for_bytes_since(&mut self, start: usize, needle: &[u8]) {
         let deadline = Instant::now() + TIMEOUT;
         while Instant::now() < deadline {
@@ -625,7 +650,13 @@ impl TerminalSession {
         for row in 0..self.rows {
             for col in 0..self.cols {
                 if let Some(cell) = self.terminal.screen().cell(row, col) {
-                    text.push_str(cell.contents());
+                    if cell.has_contents() {
+                        text.push_str(cell.contents());
+                    } else if !cell.is_wide_continuation() {
+                        // Erased cells occupy columns too. Omitting them
+                        // joins words after a perfectly valid ZLE redraw.
+                        text.push(' ');
+                    }
                 } else {
                     text.push(' ');
                 }
@@ -1722,10 +1753,6 @@ finally:
         command_start,
         format!("TUI_INPUT={expected_hex}").as_bytes(),
     );
-    terminal.wait_for_bytes_since(command_start, b"HK> ");
-    terminal.wait_for_screen("HK> ");
-    terminal.settle(Duration::from_millis(300));
-
     for reset in [
         b"\x1b[?1003l".as_slice(),
         b"\x1b[?1004l".as_slice(),
@@ -1735,13 +1762,9 @@ finally:
         b"\x1b[<u".as_slice(),
         b"\x1b[?2026l".as_slice(),
     ] {
-        assert!(
-            terminal.transcript[command_start..]
-                .windows(reset.len())
-                .any(|window| window == reset),
-            "missing terminal recovery sequence {reset:?}; tail={:?}",
-            tail(&terminal.transcript, 1024)
-        );
+        // The prompt bytes can beat the PROMPT control message. Wait for
+        // recovery itself instead of treating a fixed delay as readiness.
+        terminal.wait_for_bytes_since(command_start, reset);
     }
 
     terminal.write("printf '终端恢复🙂e\u{301}👩‍💻\\n'\r".as_bytes());
@@ -1969,8 +1992,10 @@ finally:
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
+    // IdentitiesOnly still contacts SSH_AUTH_SOCK. Bypass both the user's
+    // agent and config so a stalled agent cannot hang this private fixture.
     let command = format!(
-        "ssh -tt -o LogLevel=ERROR -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -i {} -p {} {}@127.0.0.1 python3 -u {}",
+        "ssh -F /dev/null -tt -o LogLevel=ERROR -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o IdentityAgent=none -i {} -p {} {}@127.0.0.1 python3 -u {}",
         shell_quote(&server.identity_key),
         server.port,
         shell_quote_text(&server.username),
@@ -2021,7 +2046,7 @@ finally:
     )
     .expect("SSH escape fixture");
     let escape_command = format!(
-        "ssh -tt -o LogLevel=ERROR -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -i {} -p {} {}@127.0.0.1 python3 -u {}",
+        "ssh -F /dev/null -tt -o LogLevel=ERROR -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o IdentityAgent=none -i {} -p {} {}@127.0.0.1 python3 -u {}",
         shell_quote(&server.identity_key),
         server.port,
         shell_quote_text(&server.username),
@@ -2617,24 +2642,66 @@ fn rapid_typing_and_backspacing_still_surfaces_the_overlay() {
         for byte in b"echo HKBURST_alx\x7fp" {
             terminal.write(std::slice::from_ref(byte));
         }
-        terminal.wait_for_screen("echo HKBURST_alpha");
+        terminal.wait_for_overlay_candidate("echo HKBURST_alpha");
         terminal.write(b"\x15");
         terminal.settle(Duration::from_millis(200));
 
         // Empty the buffer mid-burst, then retype in one write.
-        terminal.write(b"echo HKB\x7f\x7f\x7f\x7f\x7f\x7f\x7fecho HKBURST_b");
-        terminal.wait_for_screen("echo HKBURST_beta");
+        let prefix = b"echo HKB";
+        let mut burst = prefix.to_vec();
+        burst.extend(std::iter::repeat_n(0x7f, prefix.len()));
+        burst.extend_from_slice(b"echo HKBURST_b");
+        terminal.write(&burst);
+        terminal.wait_for_overlay_candidate("echo HKBURST_beta");
         terminal.write(b"\x15");
         terminal.settle(Duration::from_millis(200));
 
         // End the burst ON backspaces: overshoot the target, erase back to a
         // completable prefix.
         terminal.write(b"echo HKBURST_beta\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f");
-        terminal.wait_for_screen("echo HKBURST_beta");
+        terminal.wait_for_overlay_candidate("echo HKBURST_beta");
         terminal.write(b"\x15");
         terminal.settle(Duration::from_millis(200));
     }
 
+    terminal.exit_shell();
+    terminal.wait_until_exit();
+}
+
+#[test]
+fn dismissed_overlay_stays_closed_across_shell_redisplays() {
+    if !command_exists("zsh") {
+        return;
+    }
+    let (home, work) = fixture_directories();
+    fs::write(
+        home.path().join(".zshrc"),
+        "PROMPT='HK> '\nRPROMPT=''\nsetopt no_beep\nbindkey -e\n\
+         function fixture_redraw() { zle redisplay }\n\
+         zle -N fixture_redraw\nbindkey '^X' fixture_redraw\n",
+    )
+    .expect("redraw fixture");
+    let mut terminal = TerminalSession::spawn_hokan(home, work, 2);
+    terminal.wait_for_screen("HK> ");
+    terminal.write(b"ls ");
+    terminal.wait_for_clean_overlay("HK> ls");
+
+    for close in [b"\x1b".as_slice(), b"\x1b[Z".as_slice()] {
+        terminal.write(b"\x1b[B");
+        terminal.settle(Duration::from_millis(50));
+        terminal.write(close);
+        terminal.settle(Duration::from_millis(100));
+        terminal.write(b"\x18");
+        terminal.settle(Duration::from_millis(300));
+        assert_no_overlay_rows(&terminal);
+        assert!(terminal.screen_text().contains("HK> ls"));
+        terminal.write(b"\x1b[Z");
+        terminal.wait_for_clean_overlay("HK> ls");
+    }
+    terminal.write(b"\x1b");
+    terminal.settle(Duration::from_millis(100));
+    terminal.write(b"-");
+    terminal.wait_for_clean_overlay("HK> ls -");
     terminal.exit_shell();
     terminal.wait_until_exit();
 }
@@ -2700,9 +2767,13 @@ fn arrows_open_history_without_invoking_zsh_arrow_widgets() {
     terminal.wait_for_screen("HK> ");
     terminal.settle(Duration::from_millis(300));
 
+    let prompt_probes = terminal.cpr_replies;
     terminal.write(b"echo HK_ARROW_HISTORY_SEED\r");
     terminal.wait_for_bare_row("HK_ARROW_HISTORY_SEED");
-    terminal.settle(Duration::from_millis(300));
+    terminal.wait_for_bare_row("HK>");
+    // Output from echo can precede the PROMPT control event. Wait for
+    // Hokan's new prompt probe before testing keys it owns while editing.
+    terminal.wait_for_cpr_replies(prompt_probes + 1);
 
     // Application-cursor Up must be decoded by Hokan and open its history
     // list. The deliberately conflicting zle widget must never see the key.
@@ -2929,6 +3000,9 @@ fn command_path(name: &str) -> PathBuf {
 }
 
 fn configure_command(command: &mut CommandBuilder, home: &TempDir, work: &TempDir) {
+    // Terminal fixtures must never contact GitHub or replace their test binary.
+    // Update behavior has dedicated loopback tests.
+    command.env("HOKAN_NO_AUTO_UPDATE", "1");
     command.env_remove("HOKAN_ACTIVE");
     command.env_remove("HOKAN_AUTO_START");
     command.env_remove("HOKAN_BIN");

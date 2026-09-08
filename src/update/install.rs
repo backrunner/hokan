@@ -1,8 +1,8 @@
 //! Download, verify, smoke-test, and atomically install a release binary.
 //!
 //! The sequence is deliberately ordered so a failure at any step leaves the
-//! current executable untouched: download → SHA256 check against the
-//! published SHA256SUMS → extract → smoke test → writability probe →
+//! current executable untouched: writability probe → installation lock →
+//! download → SHA256 check against the published SHA256SUMS → extract → smoke test →
 //! `{exe}.bak` backup → atomic rename.
 
 use std::{
@@ -12,6 +12,7 @@ use std::{
     time::Duration,
 };
 
+use fs2::FileExt;
 use semver::Version;
 use sha2::{Digest, Sha256};
 
@@ -32,16 +33,40 @@ pub(crate) fn download_and_install(
     paths: &UpgradePaths,
     current_version: &Version,
 ) -> Result<UpgradeOutcome, UpdateError> {
+    let parent = paths
+        .current_exe
+        .parent()
+        .ok_or(UpdateError::InvalidResponse)?;
+    if !directory_writable(parent) {
+        return Ok(UpgradeOutcome::NotWritable {
+            path: parent.to_owned(),
+        });
+    }
+    // All sessions updating this installation share one persistent lock.
+    // Never unlink it: a waiter may already hold the old lock file open.
+    let lock = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(parent.join(".hokan-update.lock"))?;
+    lock.lock_exclusive()?;
+    let installed = binary_version(&paths.current_exe)?;
+    if installed > *current_version && installed >= release.version {
+        return Ok(UpgradeOutcome::AlreadyCurrent { version: installed });
+    }
     let downloads = paths.cache_dir.join("downloads");
     fs::create_dir_all(&downloads)?;
     let archive_name = api::archive_name(&release.version)?;
     let target = api::target_triple().ok_or(UpdateError::UnsupportedPlatform)?;
-    let pid = std::process::id();
-    let archive_tmp = downloads.join(format!("{archive_name}.tmp-{pid}"));
-    let staged = downloads.join(format!("hokan-{}-{target}.tmp", release.version));
-    // Removed on drop; a successful rename makes the staged path vanish and
-    // remove_file on a missing path is ignored anyway.
-    let temp = TempFiles(vec![archive_tmp.clone(), staged.clone()]);
+    let mut archive_file = tempfile::Builder::new()
+        .prefix(".archive.")
+        .tempfile_in(&downloads)?;
+    // Atomic replacement requires the staged file to share the executable's
+    // filesystem, even when XDG_CACHE_HOME is on another disk.
+    let staged = tempfile::Builder::new()
+        .prefix(".hokan-update.")
+        .tempfile_in(parent)?
+        .into_temp_path();
 
     let client = api::download_client()?;
     let archive = api::block_on(api::download(
@@ -49,9 +74,8 @@ pub(crate) fn download_and_install(
         &release.archive_url,
         DOWNLOAD_MAX_BYTES,
     ))??;
-    let mut archive_file = fs::File::create(&archive_tmp)?;
     archive_file.write_all(&archive)?;
-    archive_file.sync_all()?;
+    archive_file.as_file().sync_all()?;
 
     let checksums = api::block_on(api::download(
         &client,
@@ -66,29 +90,30 @@ pub(crate) fn download_and_install(
         return Err(UpdateError::ChecksumMismatch);
     }
 
-    extract_binary(&archive, &staged)?;
+    let package = format!("hokan-{}-{target}", release.version);
+    extract_binary(&archive, &staged, &package)?;
     smoke_test(&staged, &release.version)?;
-
-    let parent = paths
-        .current_exe
-        .parent()
-        .map_or_else(|| paths.current_exe.clone(), Path::to_path_buf);
-    if !directory_writable(&parent) {
-        return Ok(UpgradeOutcome::NotWritable { path: parent });
-    }
 
     let mut backup_name = paths.current_exe.as_os_str().to_owned();
     backup_name.push(".bak");
     let backup = PathBuf::from(backup_name);
-    fs::copy(&paths.current_exe, &backup)?;
-    fs::File::open(&backup)?.sync_all()?;
-    fs::rename(&staged, &paths.current_exe)?;
-    if let Ok(directory) = fs::File::open(&parent) {
+    let mut backup_tmp = tempfile::Builder::new()
+        .prefix(".hokan-backup.")
+        .tempfile_in(parent)?;
+    std::io::copy(&mut fs::File::open(&paths.current_exe)?, &mut backup_tmp)?;
+    backup_tmp
+        .as_file()
+        .set_permissions(fs::metadata(&paths.current_exe)?.permissions())?;
+    backup_tmp.as_file().sync_all()?;
+    backup_tmp.persist(&backup).map_err(|error| error.error)?;
+    staged
+        .persist(&paths.current_exe)
+        .map_err(|error| error.error)?;
+    if let Ok(directory) = fs::File::open(parent) {
         let _ = directory.sync_all();
     }
-    drop(temp);
     Ok(UpgradeOutcome::Upgraded {
-        from: current_version.clone(),
+        from: installed,
         to: release.version.clone(),
     })
 }
@@ -104,7 +129,7 @@ fn expected_sha256(checksums: &str, archive_name: &str) -> Option<String> {
 }
 
 /// Extracts `bin/hokan` from the tar.gz archive to `staged`, mode 0755.
-fn extract_binary(archive: &[u8], staged: &Path) -> Result<(), UpdateError> {
+fn extract_binary(archive: &[u8], staged: &Path, package: &str) -> Result<(), UpdateError> {
     let decoder = flate2::read::GzDecoder::new(archive);
     let mut tar = tar::Archive::new(decoder);
     let mut binary = None;
@@ -114,7 +139,10 @@ fn extract_binary(archive: &[u8], staged: &Path) -> Result<(), UpdateError> {
             .path()
             .map_err(|_| UpdateError::InvalidResponse)?
             .into_owned();
-        if path == Path::new("bin/hokan") {
+        if path == Path::new("bin/hokan") || path == Path::new(package).join("bin/hokan") {
+            if !entry.header().entry_type().is_file() || entry.size() > DOWNLOAD_MAX_BYTES as u64 {
+                return Err(UpdateError::InvalidResponse);
+            }
             let mut bytes = Vec::new();
             entry
                 .read_to_end(&mut bytes)
@@ -141,16 +169,27 @@ fn extract_binary(archive: &[u8], staged: &Path) -> Result<(), UpdateError> {
 
 /// The staged binary must run and report the version we think we downloaded.
 fn smoke_test(staged: &Path, version: &Version) -> Result<(), UpdateError> {
-    let program = staged.to_str().ok_or(UpdateError::InvalidResponse)?;
-    let output =
-        crate::platform::run_bounded(program, ["--version"], SMOKE_TIMEOUT, SMOKE_MAX_OUTPUT)
-            .map_err(|_| UpdateError::SmokeTest)?;
-    let expected = version.to_string();
-    if output.status.success() && String::from_utf8_lossy(&output.stdout).contains(&expected) {
+    if binary_version(staged)? == *version {
         Ok(())
     } else {
         Err(UpdateError::SmokeTest)
     }
+}
+
+fn binary_version(path: &Path) -> Result<Version, UpdateError> {
+    let program = path.to_str().ok_or(UpdateError::InvalidResponse)?;
+    let output =
+        crate::platform::run_bounded(program, ["--version"], SMOKE_TIMEOUT, SMOKE_MAX_OUTPUT)
+            .map_err(|_| UpdateError::SmokeTest)?;
+    if !output.status.success() {
+        return Err(UpdateError::SmokeTest);
+    }
+    let text = std::str::from_utf8(&output.stdout).map_err(|_| UpdateError::SmokeTest)?;
+    let version = text
+        .trim()
+        .strip_prefix("hokan ")
+        .ok_or(UpdateError::SmokeTest)?;
+    Version::parse(version).map_err(|_| UpdateError::SmokeTest)
 }
 
 /// Probe-writes the executable's directory: package-manager installs live
@@ -162,15 +201,9 @@ pub(crate) fn directory_writable(directory: &Path) -> bool {
         .is_ok()
 }
 
-struct TempFiles(Vec<PathBuf>);
-
-impl Drop for TempFiles {
-    fn drop(&mut self) {
-        for path in &self.0 {
-            let _ = fs::remove_file(path);
-        }
-    }
-}
+#[cfg(test)]
+#[path = "install_regressions.rs"]
+mod regressions;
 
 #[cfg(test)]
 mod tests {
@@ -180,7 +213,7 @@ mod tests {
         write_stub_binary,
     };
 
-    fn upgrade_paths(root: &Path, base: &str) -> (UpgradePaths, PathBuf) {
+    pub(super) fn upgrade_paths(root: &Path, base: &str) -> (UpgradePaths, PathBuf) {
         let bin = root.join("bin");
         fs::create_dir_all(&bin).expect("bin dir");
         let current_exe = bin.join("hokan");
@@ -197,7 +230,7 @@ mod tests {
         )
     }
 
-    fn release(base: &str, version: &str) -> ReleaseInfo {
+    pub(super) fn release(base: &str, version: &str) -> ReleaseInfo {
         ReleaseInfo {
             version: Version::parse(version).expect("version"),
             tag: format!("v{version}"),
@@ -293,17 +326,15 @@ mod tests {
             return;
         }
         let root = tempfile::tempdir().expect("tempdir");
-        let (base, join) = serve_release("9.9.9", build_archive("#!/bin/sh\necho hokan 9.9.9\n"));
-        let (paths, current_exe) = upgrade_paths(root.path(), &base);
+        let base = "http://127.0.0.1:1";
+        let (paths, current_exe) = upgrade_paths(root.path(), base);
         let bin = root.path().join("bin");
         fs::set_permissions(&bin, fs::Permissions::from_mode(0o555)).expect("read-only bin");
 
         let current = Version::parse("0.1.0").expect("current");
-        let outcome = download_and_install(&release(&base, "9.9.9"), &paths, &current)
+        let outcome = download_and_install(&release(base, "9.9.9"), &paths, &current)
             .expect("not writable is an outcome, not an error");
         assert_eq!(outcome, UpgradeOutcome::NotWritable { path: bin.clone() });
-        join.join().expect("server thread");
-
         fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).expect("restore bin");
         assert!(current_exe.exists());
     }

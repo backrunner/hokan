@@ -92,6 +92,13 @@ impl<W: Write> OutputActor<W> {
             self.model.reset_sync_ownership();
         }
         self.pending_prompt_recovery = None;
+        // An Enter queued during startup can hand off the PTY before the
+        // initial prompt marker reaches us. Recovery ends the model's old
+        // foreground interval; start the queued one at this byte boundary,
+        // before trailing TUI output can become its supposed shell baseline.
+        if self.foreground {
+            self.model.begin_foreground();
+        }
         Ok(())
     }
 

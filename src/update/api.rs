@@ -193,6 +193,7 @@ fn map_reqwest_error(error: reqwest::Error) -> UpdateError {
 fn select_highest(releases: Vec<Release>) -> Result<Release, UpdateError> {
     releases
         .into_iter()
+        .filter(|release| !release.draft)
         .filter_map(|release| parse_tag_version(&release.tag_name).map(|v| (v, release)))
         .max_by(|(left, _), (right, _)| left.cmp(right))
         .map(|(_, release)| release)
@@ -222,6 +223,8 @@ fn release_info(release: Release) -> Result<ReleaseInfo, UpdateError> {
 #[derive(Deserialize)]
 struct Release {
     tag_name: String,
+    #[serde(default)]
+    draft: bool,
     #[serde(default)]
     assets: Vec<Asset>,
 }
@@ -379,6 +382,21 @@ mod tests {
         let stable = Version::parse("0.2.0").expect("stable");
         assert!(beta2 > beta1, "0.2.0-beta.2 > 0.2.0-beta.1");
         assert!(stable > beta2, "0.2.0 > 0.2.0-beta.N");
+    }
+
+    #[test]
+    fn draft_releases_are_not_selected() {
+        let released: Release =
+            serde_json::from_value(release_json("v1.0.0-beta.1", &[])).expect("release");
+        let mut draft = release_json("v9.9.9", &[]);
+        draft["draft"] = serde_json::json!(true);
+        let draft = serde_json::from_value(draft).expect("draft");
+        assert_eq!(
+            select_highest(vec![released, draft])
+                .expect("published release")
+                .tag_name,
+            "v1.0.0-beta.1"
+        );
     }
 
     #[test]

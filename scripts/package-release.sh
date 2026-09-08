@@ -41,6 +41,13 @@ install -m 0755 "$binary" "$stage/bin/hokan"
 install -m 0644 README.md LICENSE "$stage/"
 install -m 0644 docs/hokan.1 "$stage/share/man/man1/hokan.1"
 
-COPYFILE_DISABLE=1 tar -C dist -cf - "$package" | gzip -n > "$archive"
+# Older updaters only read the literal bin/hokan entry. Emit its contents
+# first, then the installer layout with a hard link to that same binary.
+# This preserves both layouts without doubling the archive's binary payload.
+compat_stage=$(mktemp -d "dist/.hokan-package.XXXXXX")
+trap 'rm -rf "$compat_stage"' EXIT
+install -d "$compat_stage/bin"
+ln "$stage/bin/hokan" "$compat_stage/bin/hokan"
+COPYFILE_DISABLE=1 tar -C "$compat_stage" -cf - bin/hokan -C .. "$package" | gzip -n > "$archive"
 rm -r "$stage"
 echo "$archive"

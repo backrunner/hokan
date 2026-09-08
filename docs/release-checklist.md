@@ -15,6 +15,9 @@
 
 ## 自动化门槛
 
+本地仅在 macOS 原生环境验证；Linux 构建与测试由 GitHub Actions 执行。
+禁止为验证在本地创建或使用 Linux 容器或虚拟机，详见 [开发规范](../AGENTS.md)。
+
 ```bash
 cargo fmt --all -- --check
 cargo check --all-targets
@@ -67,6 +70,11 @@ overlay、跨 control sequence 写入、AI 隐式联网或 secret 泄漏都会�
 4. 用临时 rc 文件验证 `install` 幂等、备份、`setup` 兼容别名和 `uninstall`。
 5. 检查归档包含 README、BSD-3-Clause 许可证和 `share/man/man1/hokan.1`。
 6. 检查每个 target 对应的 `.spdx.json` 可解析且与同一构建产物关联。
+7. 验证归档同时包含供旧更新器读取的普通文件 `bin/hokan` 和安装器使用的
+   `hokan-<version>-<target>/bin/hokan`；后者可硬链接到前者。
+8. 在隔离的 macOS 安装目录实际验证上一 beta 的 `upgrade --channel beta --yes`，
+   检查版本变化、备份和新版本的自动检查；不替换开发者的日常安装。
+9. 所有资产和 `SHA256SUMS` 上传完成后才将 draft 发布，避免自动更新读到半成品。
 
 ## Release profile
 

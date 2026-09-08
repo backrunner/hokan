@@ -6,6 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::history::normalize::normalize_command;
 use fs2::FileExt;
 use nix::fcntl::OFlag;
 
@@ -338,10 +339,6 @@ fn aggregate_events(events: Vec<HistoryEventV1>) -> Vec<HistoryEventV1> {
             .then_with(|| left.timestamp_ms.cmp(&right.timestamp_ms))
     });
     events
-}
-
-fn normalize_command(command: &str) -> String {
-    command.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn move_to_backup(path: &Path, backup: &Path) -> crate::Result<()> {

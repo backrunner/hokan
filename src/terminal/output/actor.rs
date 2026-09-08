@@ -162,17 +162,21 @@ impl<W: Write> OutputActor<W> {
             ControlCommand::ArmPromptGate(boundary_id) => self.arm_prompt_gate(boundary_id)?,
             ControlCommand::ArmRenderGate(request) => self.arm_gate(request),
             ControlCommand::ConfirmCursor(position) => {
-                let confirmed = self.cursor_probe_ready && self.model.confirm_cursor(position)?;
-                if !confirmed {
-                    self.readiness = RenderReadiness::Unknown;
-                } else if let Some(buffer_revision) = self.cursor_probe_revision.take() {
-                    self.buffer_revision = buffer_revision;
-                    self.readiness = RenderReadiness::Ready {
-                        buffer_revision,
-                        screen_revision: self.model.screen_revision(),
-                    };
-                }
-                self.cursor_probe_ready = false;
+                self.confirm_cursor(position)?;
+            }
+            ControlCommand::ConfirmCursorIfCurrent {
+                position,
+                screen_revision,
+                screen_epoch,
+                sender,
+            } => {
+                let current = self.model.screen_revision() == screen_revision
+                    && self.model.screen_epoch() == screen_epoch
+                    && !self.foreground
+                    && !self.model.alternate_screen()
+                    && self.scanner.is_safe();
+                let confirmed = current && self.confirm_cursor(position)?;
+                let _ = sender.send(confirmed);
             }
             ControlCommand::SetSyncCapability(capability) => self.capability = capability,
             ControlCommand::SetBracketedPaste(enabled) => {
@@ -285,6 +289,21 @@ impl<W: Write> OutputActor<W> {
             foreground: self.foreground,
             cursor_probe_ready: self.cursor_probe_ready,
         }
+    }
+
+    fn confirm_cursor(&mut self, position: super::super::CellPos) -> Result<bool, OutputError> {
+        let confirmed = self.cursor_probe_ready && self.model.confirm_cursor(position)?;
+        if !confirmed {
+            self.readiness = RenderReadiness::Unknown;
+        } else if let Some(buffer_revision) = self.cursor_probe_revision.take() {
+            self.buffer_revision = buffer_revision;
+            self.readiness = RenderReadiness::Ready {
+                buffer_revision,
+                screen_revision: self.model.screen_revision(),
+            };
+        }
+        self.cursor_probe_ready = false;
+        Ok(confirmed)
     }
 
     pub(super) fn handle_child(&mut self, batch: ChildOutputBatch) -> Result<(), OutputError> {

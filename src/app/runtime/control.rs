@@ -44,6 +44,7 @@ pub(super) fn handle_control_message(
             cwd,
             history_control,
         }) => {
+            let queued_enter = std::mem::take(&mut state.queued_startup_enter);
             state.cancel_ai();
             state.ignore_leading_space_history = history_control
                 .as_deref()
@@ -57,10 +58,10 @@ pub(super) fn handle_control_message(
                 sync_history(state, store, history, policy)?;
             }
             state.cwd = cwd;
-            state.editing = true;
+            state.editing = !queued_enter;
             state.history_only = false;
             state.history_navigation = false;
-            state.need_cpr = true;
+            state.need_cpr = !queued_enter;
             state
                 .buffer
                 .reset_prompt(if state.shell.exact_buffer_sync() {
@@ -77,9 +78,12 @@ pub(super) fn handle_control_message(
             state.provider_pending = false;
             state.overlay_visible = false;
             state.pending_confirm = None;
-            state.foreground_process = false;
+            state.foreground_process = queued_enter;
             state.pending_reanchor = false;
-            output.set_foreground(false).map_err(output_error)?;
+            // An Enter already sent to the PTY belongs to the command after
+            // this initial prompt. Do not briefly return ownership to shell
+            // editing while its CommandStart event is still in flight.
+            output.set_foreground(queued_enter).map_err(output_error)?;
             output.arm_prompt_gate(boundary_id).map_err(output_error)?;
         }
         ControlMessage::Event(ShellEvent::Buffer {

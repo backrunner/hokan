@@ -18,7 +18,7 @@ command recipes, files, project scripts, Git state, aliases, functions, man
 pages, and explicitly requested AI suggestions without replacing your prompt
 or launching a GUI.
 
-Hokan `0.1.0-beta.9` is the current public beta. The core terminal recovery
+Hokan `0.1.0-beta.10` is the current public beta. The core terminal recovery
 path is covered by real PTY tests, while several terminal, SSH, tmux, fish, and
 cross-platform combinations still require release certification. See the
 [compatibility matrix](docs/compatibility.md) for the exact status.
@@ -31,8 +31,8 @@ installs into your home directory; and runs `hokan install`.
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/backrunner/hokan/releases/download/v0.1.0-beta.9/hokan-installer.sh \
-  | HOKAN_VERSION=0.1.0-beta.9 sh
+  https://github.com/backrunner/hokan/releases/download/v0.1.0-beta.10/hokan-installer.sh \
+  | HOKAN_VERSION=0.1.0-beta.10 sh
 ```
 
 Open a new terminal, or restart the current shell:
@@ -57,8 +57,8 @@ Prefer an on-demand `hk` command instead of automatic startup:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/backrunner/hokan/releases/download/v0.1.0-beta.9/hokan-installer.sh \
-  | HOKAN_VERSION=0.1.0-beta.9 HOKAN_ON_DEMAND=1 sh
+  https://github.com/backrunner/hokan/releases/download/v0.1.0-beta.10/hokan-installer.sh \
+  | HOKAN_VERSION=0.1.0-beta.10 HOKAN_ON_DEMAND=1 sh
 ```
 
 ## Why Hokan
@@ -181,7 +181,7 @@ The release installer supports these optional environment variables:
 
 | Variable | Purpose |
 | --- | --- |
-| `HOKAN_VERSION` | Install an exact release such as `0.1.0-beta.9` |
+| `HOKAN_VERSION` | Install an exact release such as `0.1.0-beta.10` |
 | `HOKAN_INSTALL_DIR` | Override the binary directory |
 | `HOKAN_MAN_DIR` | Override the man-page directory |
 | `HOKAN_SHELL` | Select `zsh`, `bash`, or `fish` |
@@ -358,17 +358,35 @@ hokan upgrade
 hokan upgrade --channel beta
 ```
 
-Automatic checks are enabled by default with a 30-minute cache interval. Set
-`HOKAN_NO_AUTO_UPDATE=1` to disable the check for one session, or configure:
+Each new Hokan session can start a silent background check and install a newer
+release. Checks and failed retries are limited to once every 30 minutes;
+running sessions keep their current binary, and the update takes effect on the
+next launch. Updates use an installation lock, keep a `.bak` backup, and stage
+beside the installed binary so a cache on another disk works too.
+
+New beta installations default to the beta channel; stable builds default to
+stable. An explicitly configured channel is preserved. Existing beta users
+whose config says `channel = "stable"` can opt into beta updates once with:
+
+```bash
+hokan upgrade --channel beta --yes
+```
+
+Set `HOKAN_NO_AUTO_UPDATE=1` to disable automatic updating for one session, or
+configure `[update]` (set `enabled = false` to disable it persistently):
 
 ```toml
 [update]
 enabled = true
-channel = "stable"
+channel = "beta"
 interval_secs = 1800
 ```
 
 ## Development
+
+Follow the repository [development guidelines](AGENTS.md). Run local validation
+natively on macOS only. Linux builds and tests run in GitHub Actions; do not
+create or use local Linux containers or virtual machines for validation.
 
 ```bash
 cargo fmt --all -- --check

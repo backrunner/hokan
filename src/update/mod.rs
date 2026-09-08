@@ -131,6 +131,8 @@ pub(crate) use install::directory_writable;
 /// What an upgrade run did or found.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UpgradeOutcome {
+    /// A background attempt is already running or its retry interval has not elapsed.
+    Deferred,
     /// Nothing newer exists (or a fresh cache already said so).
     AlreadyCurrent { version: Version },
     /// `--check` report: no download happened.
@@ -200,6 +202,17 @@ pub fn run_upgrade(
     let current =
         Version::parse(env!("CARGO_PKG_VERSION")).map_err(|_| UpdateError::InvalidResponse)?;
     let cache_path = paths.state_dir.join("update-check.json");
+
+    // Serialize and throttle background attempts, including failed requests
+    // and downloads. Opening many shells must not bypass the configured TTL.
+    let _auto_lock = if options.auto && !options.force && !options.check_only {
+        let Some(lock) = cache::begin_auto_attempt(paths, options, &current)? else {
+            return Ok(UpgradeOutcome::Deferred);
+        };
+        Some(lock)
+    } else {
+        None
+    };
 
     if !options.force
         && !options.check_only
@@ -357,5 +370,26 @@ mod tests {
         )
         .expect("seed stale cache");
         assert!(run_upgrade(&options(), &paths(root.path(), "http://127.0.0.1:1")).is_err());
+    }
+
+    #[test]
+    fn failed_background_attempts_are_throttled_but_manual_checks_can_retry() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let paths = paths(root.path(), "http://127.0.0.1:1");
+        let mut options = options();
+        options.auto = true;
+        assert!(run_upgrade(&options, &paths).is_err());
+        assert_eq!(
+            run_upgrade(&options, &paths).expect("defer retry"),
+            UpgradeOutcome::Deferred
+        );
+        options.check_only = true;
+        assert!(run_upgrade(&options, &paths).is_err());
+        options.check_only = false;
+        options.channel = Channel::Beta;
+        assert!(
+            run_upgrade(&options, &paths).is_err(),
+            "a channel change can retry immediately"
+        );
     }
 }

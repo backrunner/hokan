@@ -1,6 +1,7 @@
 mod checkpoint;
 mod import;
 mod index;
+mod normalize;
 mod store;
 
 pub use checkpoint::{ImportCheckpoints, ImportSourceState};

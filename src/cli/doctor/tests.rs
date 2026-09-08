@@ -383,7 +383,9 @@ fn update_section_reports_config_cache_and_exe_writability() {
     let exe = directory.path().join("bin/hokan");
     fs::create_dir_all(exe.parent().expect("exe parent")).expect("bin dir");
 
-    let details = inspect_update(Some(&Config::default()), Some(&paths), &exe);
+    let mut stable_config = Config::default();
+    stable_config.update.channel = "stable".into();
+    let details = inspect_update(Some(&stable_config), Some(&paths), &exe);
     assert_eq!(
         details.check.level,
         CheckLevel::Ok,
