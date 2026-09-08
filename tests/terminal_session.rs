@@ -402,6 +402,12 @@ impl TerminalSession {
 
     fn process_chunk(&mut self, chunk: &[u8]) {
         self.transcript.extend_from_slice(chunk);
+        if self.try_wait().is_some() {
+            // Drain the final output without sending delayed query responses
+            // into a PTY whose child has exited and restored canonical echo.
+            self.terminal.process(chunk);
+            return;
+        }
         for &byte in chunk {
             self.terminal.process(std::slice::from_ref(&byte));
             self.probe_tail.push(byte);
@@ -745,6 +751,28 @@ impl Drop for TerminalSession {
             let _ = reader.join();
         }
     }
+}
+
+#[test]
+fn terminal_fixture_does_not_answer_buffered_queries_after_process_exit() {
+    if !command_exists("zsh") {
+        return;
+    }
+    let mut terminal = TerminalSession::spawn();
+    terminal.wait_for_screen("HK> ");
+    let replies = terminal.cpr_replies;
+    // Simulate a descheduled terminal emulator: a child emits a query and
+    // exits before the queued output is processed. Answering it now feeds
+    // bytes into the restored outer PTY's canonical echo, not into Hokan.
+    terminal.write(b"printf '\\033[?6n'; exit\r");
+    let deadline = Instant::now() + TIMEOUT;
+    while terminal.try_wait().is_none() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(terminal.try_wait().is_some(), "fixture child did not exit");
+    terminal.settle(Duration::from_millis(100));
+    assert_eq!(terminal.cpr_replies, replies, "answered a query after exit");
+    assert!(terminal.transcript.ends_with(RESTORE_PRESENTATION));
 }
 
 #[test]
