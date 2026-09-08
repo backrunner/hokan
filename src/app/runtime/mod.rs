@@ -355,6 +355,7 @@ pub fn run_session(options: SessionOptions) -> crate::Result<u8> {
     state.cancel_ai();
     pty_pump.join()?;
     let _ = output.handle().barrier();
+    drain_terminal_queries_before_exit(&mut reply_router, &input_receiver);
     output.finish()?;
     drop(signal_bridge);
     drop(control_reader);
@@ -368,6 +369,32 @@ pub fn run_session(options: SessionOptions) -> crate::Result<u8> {
         log.session_finished(exit_code);
     }
     Ok(if leave_requested { 0 } else { exit_code })
+}
+
+/// Finish probes already written to the terminal while raw mode still owns
+/// their replies. Otherwise a fast shell exit can restore canonical echo
+/// before its last CPR arrives, leaking the response into the outer shell.
+/// No new probes are issued here, and an unresponsive terminal cannot hold
+/// shutdown longer than one normal query timeout.
+fn drain_terminal_queries_before_exit(router: &mut TerminalReplyRouter, input: &Receiver<Vec<u8>>) {
+    let deadline = Instant::now() + TERMINAL_QUERY_TIMEOUT;
+    while router.has_outstanding() {
+        let now = Instant::now();
+        router.expire(now);
+        if !router.has_outstanding() || now >= deadline {
+            break;
+        }
+        match input.recv_timeout(deadline.saturating_duration_since(now).min(LOOP_TICK)) {
+            Ok(bytes) => {
+                // The child has exited: route only to settle reply ownership,
+                // never apply cursor positions or schedule replacement probes.
+                router.route(&bytes, Instant::now());
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    router.cancel();
 }
 
 /// Whether session start should spawn the detached `upgrade --auto` child:

@@ -40,6 +40,50 @@ fn runtime_state(directory: &Path) -> RuntimeState {
 }
 
 #[test]
+fn shutdown_settles_an_inflight_cursor_query_without_reprobing() {
+    let mut router = crate::terminal::TerminalReplyRouter::default();
+    router
+        .register(
+            TerminalQueryKind::CursorPositionPrivate,
+            Instant::now(),
+            TERMINAL_QUERY_TIMEOUT,
+        )
+        .expect("cursor query");
+    let (sender, input) = crossbeam_channel::unbounded();
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            sender.send(b"\x1b[?1;1R".to_vec()).expect("reply");
+        });
+        drain_terminal_queries_before_exit(&mut router, &input);
+        assert!(!router.has_outstanding());
+        assert!(
+            input.try_recv().is_err(),
+            "shutdown left the cursor response unread"
+        );
+    });
+    assert!(
+        input.try_recv().is_err(),
+        "shutdown returned before the reply arrived"
+    );
+}
+
+#[test]
+fn shutdown_does_not_wait_forever_for_an_unresponsive_terminal() {
+    let mut router = crate::terminal::TerminalReplyRouter::default();
+    router
+        .register(
+            TerminalQueryKind::CursorPositionPrivate,
+            Instant::now(),
+            Duration::ZERO,
+        )
+        .expect("expired query");
+    let (_sender, input) = crossbeam_channel::unbounded();
+    drain_terminal_queries_before_exit(&mut router, &input);
+    assert!(!router.has_outstanding());
+}
+
+#[test]
 fn terminal_cursor_replies_cannot_rewind_a_newer_prompt_or_buffer() {
     for change in ["screen", "buffer", "epoch"] {
         let directory = tempfile::tempdir().expect("directory");

@@ -10,6 +10,8 @@ self-updates against the actual release archives.
   syntax whose risk cannot be determined.
 - Reject stale cursor reports and restore terminal input modes correctly when
   a command is queued before the initial prompt.
+- Finish outstanding cursor queries before restoring terminal modes on exit,
+  with a bounded wait for terminals that do not respond.
 - Make release archives readable by both existing updaters and the installer.
 - Stage updates beside the executable, serialize concurrent installs, preserve
   the original backup, and verify the exact reported program version.
