@@ -123,11 +123,96 @@ impl CandidateProvider for CommandSpecProvider {
             }
             candidates.push(candidate);
         }
+        if command_name == "kill" {
+            candidates.extend(kill_option_candidates(context));
+        }
         ProviderOutput {
             candidates,
             diagnostics: Vec::new(),
         }
     }
+}
+
+/// `kill` is a shell builtin on the supported shells, so it has no external
+/// executable for the dynamic help provider to probe. Keep the small,
+/// portable option surface here and let the process provider take over after
+/// an option's value (or the option itself) has been completed.
+fn kill_option_candidates(context: &CompletionContext) -> Vec<Candidate> {
+    let Some((_, position)) = crate::providers::argument_progress(context) else {
+        return Vec::new();
+    };
+    if position != 0 || !context.parsed.current_prefix.starts_with('-') {
+        return Vec::new();
+    }
+
+    const OPTIONS: &[(
+        &str,
+        &str,
+        Option<crate::completion::SlotKind>,
+        crate::terminal::RiskLevel,
+    )] = &[
+        (
+            "-s ",
+            "指定要发送的信号名称或编号",
+            Some(crate::completion::SlotKind::Value),
+            crate::terminal::RiskLevel::High,
+        ),
+        (
+            "--signal ",
+            "指定要发送的信号名称或编号",
+            Some(crate::completion::SlotKind::Value),
+            crate::terminal::RiskLevel::High,
+        ),
+        (
+            "-l",
+            "列出可用的信号名称",
+            None,
+            crate::terminal::RiskLevel::ReadOnly,
+        ),
+        (
+            "--list",
+            "列出可用的信号名称",
+            None,
+            crate::terminal::RiskLevel::ReadOnly,
+        ),
+    ];
+    let query = context.parsed.current_prefix.as_str();
+    OPTIONS
+        .iter()
+        .filter(|(option, _, _, _)| option.trim_end().starts_with(query))
+        .map(|(option, description, next_slot, risk)| {
+            let display = crate::parser::apply_edit(
+                &context.buffer.text,
+                context.parsed.replacement.clone(),
+                option,
+            )
+            .unwrap_or_else(|_| option.to_string());
+            let action = next_slot.map_or(CandidateAction::Insert, |slot| {
+                CandidateAction::InsertAndContinue { next_slot: slot }
+            });
+            let completeness = next_slot.map_or(Completeness::Runnable, |slot| {
+                Completeness::NeedsInput { slot }
+            });
+            let mut candidate = Candidate::new(
+                context.query_id,
+                display,
+                *description,
+                Some(TextEdit {
+                    range: context.parsed.replacement.clone(),
+                    replacement: (*option).to_owned(),
+                    cursor_after: CursorPlacement::End,
+                }),
+                action,
+                CandidateSource::CommandSpec,
+                CandidateKind::Recipe,
+                completeness,
+                *risk,
+                format!("core.kill:option:{}", option.trim()),
+            );
+            candidate.score.spec_priority = 140;
+            candidate
+        })
+        .collect()
 }
 
 fn normalize_command(command: &str) -> String {
@@ -337,6 +422,29 @@ mod tests {
                 slot: crate::completion::SlotKind::Process
             }
         ));
+
+        let kill_options = engine.complete(&context("kill -"));
+        for option in ["kill -s ", "kill --signal ", "kill -l", "kill --list"] {
+            assert!(
+                kill_options
+                    .candidates
+                    .iter()
+                    .any(|candidate| candidate.display.primary == option),
+                "missing kill option {option:?}: {:?}",
+                kill_options
+                    .candidates
+                    .iter()
+                    .map(|candidate| candidate.display.primary.as_str())
+                    .collect::<Vec<_>>()
+            );
+        }
+        assert!(
+            engine
+                .complete(&context("kill --"))
+                .candidates
+                .iter()
+                .all(|candidate| candidate.display.primary.starts_with("kill --"))
+        );
 
         let existing_recipe = engine.complete(&context("ls -la"));
         assert!(

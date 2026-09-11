@@ -53,7 +53,7 @@ impl CandidateProvider for ProcessProvider {
                 Candidate::new(
                     context.query_id,
                     format!("{} {}", process.pid, process.command),
-                    format!("{} 拥有的进程", process.owner),
+                    format!("{} · PPID {} · 拥有的进程", process.owner, process.ppid),
                     Some(TextEdit {
                         range: context.parsed.replacement.clone(),
                         replacement: process.pid.to_string(),
@@ -115,10 +115,22 @@ fn linux_processes() -> Result<Vec<ProcessInfo>, String> {
         if metadata.uid() != current_uid {
             continue;
         }
-        let command = fs::read_to_string(entry.path().join("comm"))
-            .unwrap_or_default()
-            .trim()
-            .to_owned();
+        let command = fs::read(entry.path().join("cmdline"))
+            .ok()
+            .map(|bytes| {
+                String::from_utf8_lossy(&bytes)
+                    .split('\0')
+                    .filter(|part| !part.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .filter(|command| !command.is_empty())
+            .or_else(|| {
+                fs::read_to_string(entry.path().join("comm"))
+                    .ok()
+                    .map(|command| command.trim().to_owned())
+            })
+            .unwrap_or_default();
         if command.is_empty() {
             continue;
         }
@@ -145,7 +157,7 @@ fn linux_processes() -> Result<Vec<ProcessInfo>, String> {
 fn ps_processes() -> Result<Vec<ProcessInfo>, String> {
     let output = crate::platform::run_bounded(
         "ps",
-        ["-axo", "pid=,ppid=,user=,comm="],
+        ["-axo", "pid=,ppid=,user=,command="],
         Duration::from_millis(250),
         2 * 1024 * 1024,
     )?;
