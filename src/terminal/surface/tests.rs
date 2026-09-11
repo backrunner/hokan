@@ -195,7 +195,7 @@ fn nerd_fonts_off_leaves_no_icon_gap() {
 }
 
 #[test]
-fn typed_prefix_is_highlighted_green_and_bold() {
+fn typed_prefix_is_highlighted_blue_and_bold() {
     let renderer = OverlaySurfaceRenderer::new(4, SurfaceTheme::default(), true);
     let geometry =
         SurfaceGeometry::new_with_width(10, TerminalSize::new(24, 80).expect("valid size"), 4, 60)
@@ -209,11 +209,11 @@ fn typed_prefix_is_highlighted_green_and_bold() {
     let offset = row_start[..byte_offset].chars().count() as u16;
     for index in 0..7 {
         let cell = &buffer[(area.x + offset + index, 11)];
-        assert_eq!(cell.fg, Color::Green);
+        assert_eq!(cell.fg, Color::Rgb(137, 174, 255));
         assert!(cell.modifier.contains(Modifier::BOLD));
     }
     let tail = &buffer[(area.x + offset + 7, 11)];
-    assert_ne!(tail.fg, Color::Green);
+    assert_ne!(tail.fg, Color::Rgb(137, 174, 255));
 }
 
 #[test]
@@ -225,9 +225,9 @@ fn selected_row_background_spans_the_interior() {
     let buffer = renderer.render(geometry, &OverlayView::with_rows(rows(), Some(1)));
     let area = buffer.area();
     for x in area.x + 1..area.x + area.width - 1 {
-        assert_eq!(buffer[(x, 11)].bg, Color::DarkGray, "column {x}");
+        assert_eq!(buffer[(x, 11)].bg, Color::Rgb(32, 52, 86), "column {x}");
     }
-    assert_ne!(buffer[(area.x + 1, 12)].bg, Color::DarkGray);
+    assert_ne!(buffer[(area.x + 1, 12)].bg, Color::Rgb(32, 52, 86));
     let plain = OverlaySurfaceRenderer::new(4, SurfaceTheme::plain(), true);
     let plain_buffer = plain.render(geometry, &OverlayView::with_rows(rows(), Some(1)));
     assert!(
@@ -236,6 +236,34 @@ fn selected_row_background_spans_the_interior() {
             .contains(Modifier::REVERSED)
     );
     assert_eq!(plain_buffer[(area.x, 11)].fg, Color::Reset);
+}
+
+#[test]
+fn colored_surface_has_a_consistent_panel_background() {
+    let renderer = OverlaySurfaceRenderer::new(5, SurfaceTheme::default(), true);
+    let geometry =
+        SurfaceGeometry::new_with_width(10, TerminalSize::new(24, 80).expect("valid size"), 5, 60)
+            .expect("valid geometry");
+    let buffer = renderer.render(
+        geometry,
+        &OverlayView::with_rows(
+            vec![OverlayRow::new(1, "HIS", "ls", "files", RiskLevel::Low)],
+            None,
+        ),
+    );
+    let area = buffer.area();
+    let panel = Color::Rgb(20, 24, 32);
+    assert_eq!(buffer[(area.x + 1, 11)].bg, panel);
+    assert_eq!(
+        buffer[(area.x + 1, 13)].bg,
+        panel,
+        "padded rows keep the panel surface"
+    );
+    assert_eq!(
+        buffer[(area.x, 10)].bg,
+        panel,
+        "border shares the panel surface"
+    );
 }
 
 #[test]
@@ -308,7 +336,7 @@ fn danger_row_uses_red_tones_and_the_exec_tag() {
     let byte_offset = text.find("rm -rf").expect("primary text");
     let offset = row_text(&buffer, 11)[..byte_offset].chars().count() as u16;
     let cell = &buffer[(area.x + offset, 11)];
-    assert_eq!(cell.fg, Color::Red);
+    assert_eq!(cell.fg, Color::Rgb(255, 126, 126));
     assert!(cell.modifier.contains(Modifier::BOLD));
 
     let plain = OverlaySurfaceRenderer::new(4, SurfaceTheme::plain(), true);

@@ -96,6 +96,7 @@ impl OverlaySurfaceRenderer {
         }
         for index in view.rows.len().min(row_capacity)..row_capacity {
             let y = top_y + 1 + index as u16;
+            buffer.set_style(Rect::new(x + 1, y, inner as u16, 1), self.theme.normal);
             buffer.set_stringn(x, y, "│", 1, self.theme.border);
             buffer.set_stringn(x + width as u16 - 1, y, "│", 1, self.theme.border);
         }
@@ -186,7 +187,7 @@ impl OverlaySurfaceRenderer {
         let primary_style = if row.danger {
             self.theme.danger
         } else if selected {
-            self.theme.normal.add_modifier(Modifier::BOLD)
+            self.theme.selected.add_modifier(Modifier::BOLD)
         } else {
             self.theme.normal
         };

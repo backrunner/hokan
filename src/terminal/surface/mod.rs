@@ -86,9 +86,9 @@ impl RiskLevel {
 
     pub(super) fn color(self) -> Color {
         match self {
-            Self::Medium => Color::Yellow,
-            Self::High | Self::Unknown => Color::Red,
-            Self::ReadOnly | Self::Low => Color::Reset,
+            Self::Medium => Color::Rgb(243, 194, 95),
+            Self::High | Self::Unknown => Color::Rgb(255, 126, 126),
+            Self::ReadOnly | Self::Low => Color::Rgb(156, 169, 190),
         }
     }
 }
