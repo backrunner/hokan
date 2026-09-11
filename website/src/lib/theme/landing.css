@@ -1,0 +1,109 @@
+/* Product overview, installation, and working examples. */
+.hokan-landing { max-width: 1160px; margin: auto; padding-bottom: 16px; }
+.hokan-landing a { text-underline-offset: 4px; text-decoration-thickness: 1px; }
+.hokan-landing a:hover { color: var(--sd-accent); text-decoration: underline; }
+.hokan-landing code, .hokan-landing kbd { font-family: 'JetBrains Mono', monospace; font-size: .9em; }
+.home-intro { padding: 64px 0 56px; }
+.intro-meta { display: flex; justify-content: space-between; align-items: baseline; gap: 16px; font-size: 12px; color: var(--sd-muted); }
+.intro-meta a { font: 12px 'JetBrains Mono', monospace; color: var(--sd-ink); text-decoration: none; }
+.release-label { margin-left: 14px; font: 12px Inter, sans-serif; color: var(--sd-muted); }
+.intro-body { display: grid; grid-template-columns: 1.15fr 1fr; gap: 64px; align-items: end; margin-top: 34px; }
+.intro-body h1 { font-size: clamp(36px, 4.1vw, 54px); font-weight: 600; letter-spacing: -.05em; line-height: 1.12; margin: 0; }
+.intro-description p { margin: 0 0 18px; max-width: 445px; color: var(--sd-muted); font-size: 16px; line-height: 1.75; }
+.home-link { display: inline-flex; align-items: baseline; gap: 12px; font-size: 14px; color: var(--sd-accent); text-decoration: none; }
+.home-section { display: grid; grid-template-columns: 180px minmax(0, 1fr); gap: 32px; padding: 34px 0; border-top: 1px solid var(--sd-line); }
+.section-label h2 { font-size: 15px; line-height: 1.5; font-weight: 600; letter-spacing: -.02em; margin: 0; }
+.section-label p { color: var(--sd-muted); font-size: 13px; line-height: 1.65; margin: 10px 0 0; }
+.section-content { min-width: 0; }
+.install-panel { background: var(--hk-soft); border: 1px solid var(--sd-line); border-radius: 10px; overflow: hidden; }
+.install-heading { display: flex; justify-content: space-between; align-items: center; padding: 8px 18px 0; color: var(--sd-muted); font-size: 12px; }
+.install-heading button { padding: 6px 9px; min-height: 32px; border: 1px solid transparent; border-radius: 5px; background: none; color: var(--sd-ink); font: inherit; }
+.install-heading button:hover { background: var(--sd-panel); border-color: var(--sd-line); }
+.install-panel pre { font: 13px/1.85 'JetBrains Mono', monospace; white-space: pre-wrap; overflow-wrap: anywhere; padding: 8px 18px 18px; margin: 0; }
+.install-panel pre code { font: inherit; }
+.install-note { color: var(--sd-muted); font-size: 14px; line-height: 1.75; margin: 16px 0 12px; max-width: 700px; }
+.install-note code { color: var(--sd-ink); }
+.install-links { display: flex; flex-wrap: wrap; gap: 8px 24px; font-size: 13px; }
+.install-links a { color: var(--sd-accent); text-decoration: underline; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
+.example-layout { display: grid; grid-template-columns: minmax(0, 1fr) 228px; gap: 28px; align-items: start; }
+.example-notes p { margin: 0 0 19px; color: var(--sd-muted); font-size: 14px; line-height: 1.75; }
+.example-notes kbd { color: var(--sd-ink); background: var(--hk-soft); border: 1px solid var(--sd-line); border-radius: 5px; padding: 1px 4px; }
+.example-notes a { color: var(--sd-accent); }
+.example-notes .home-link { font-size: 13px; }
+
+/* The example is deliberately a terminal surface, without window chrome. */
+.terminal-example { margin: 0; min-width: 0; }
+.demo { overflow: hidden; border-radius: 10px; background: #141820; color: #e8edf5; border: 1px solid #2b3341; font-family: 'JetBrains Mono', monospace; }
+.demo-controls { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 14px; border-bottom: 1px solid #2b3341; font: 12px Inter, sans-serif; }
+.demo-controls > span { color: #9ba9bc; }
+.demo-tabs { display: flex; gap: 4px; }
+.demo-tabs button { padding: 8px; min-height: 34px; background: none; border: none; border-bottom: 1px solid transparent; border-radius: 0; color: #9ba9bc; font: inherit; }
+.demo-tabs button.active { color: #f5f7fb; border-bottom-color: #89aeff; }
+.demo-tabs button:hover { color: #f5f7fb; }
+.demo-tabs button:focus-visible { outline-color: #89aeff; outline-offset: -2px; }
+.demo-body { padding: 20px 18px 0; }
+.prompt-context { font-size: 12px; color: #9ba9bc; overflow-wrap: anywhere; }
+.terminal-command { display: flex; align-items: center; gap: 10px; min-height: 42px; font-size: 14px; overflow-wrap: anywhere; }
+.terminal-command > span:last-child { min-width: 0; }
+.prompt-chevron { color: #89aeff; }
+.cursor { display: inline-block; vertical-align: text-bottom; width: 7px; height: 16px; background: #89aeff; margin-left: 2px; }
+.completion-box { margin-top: 4px; border: 1px solid #35435b; border-radius: 6px; overflow: hidden; }
+.completion-row { display: flex; width: 100%; text-align: left; align-items: center; border: none; border-radius: 0; gap: 10px; padding: 10px; background: none; color: #e8edf5; font: inherit; }
+.completion-row.selected { background: #203657; }
+.completion-row:hover, .completion-row:focus-visible { background: #2b4365; outline-color: #89aeff; outline-offset: -2px; }
+.row-chevron { width: 6px; flex-shrink: 0; color: #89aeff; }
+.row-main { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.row-main strong { font-weight: 400; font-size: 13px; overflow-wrap: anywhere; }
+.row-main small { color: #acb8cb; font-size: 11px; }
+.source-label { margin-left: auto; color: #acb8cb; font-size: 10px; }
+.terminal-hints { display: flex; flex-wrap: wrap; gap: 14px; border-top: 1px solid #35435b; padding: 10px; font-size: 11px; color: #acb8cb; }
+.terminal-hints kbd { color: #e8edf5; font: inherit; }
+.demo-status { min-height: 48px; display: flex; align-items: center; padding-block: 12px; font: 11px/1.5 Inter, sans-serif; color: #acb8cb; }
+.dimmed { opacity: .65; }
+.demo-caption { color: var(--sd-muted); font-size: 11px; line-height: 1.6; margin: 10px 0 0; }
+.manual-index a { display: grid; grid-template-columns: 165px minmax(0, 1fr) 16px; gap: 16px; align-items: baseline; padding: 16px 0; border-bottom: 1px solid var(--sd-line); text-decoration: none; font-size: 14px; color: var(--sd-ink); }
+.manual-index a:first-child { padding-top: 0; }
+.manual-index a > span:first-child { font-weight: 500; }
+.manual-index a > span:nth-child(2) { color: var(--sd-muted); font-size: 13px; line-height: 1.6; }
+.manual-index a > span:last-child { color: var(--sd-muted); }
+.manual-index a:hover { text-decoration: none; }
+.manual-index a:hover > span:first-child { text-decoration: underline; }
+.beta-note { color: var(--sd-muted); font-size: 13px; line-height: 1.75; margin: 24px 0 0; max-width: 720px; }
+.beta-note a { color: var(--sd-accent); }
+
+@media (max-width: 1208px) {
+  .home-section { grid-template-columns: 150px minmax(0, 1fr); gap: 24px; }
+  .example-layout { grid-template-columns: minmax(0, 1fr) 210px; gap: 24px; }
+  .intro-body { gap: 40px; }
+}
+@media (max-width: 980px) {
+  .home-section { grid-template-columns: 130px minmax(0, 1fr); }
+  .example-layout { grid-template-columns: minmax(0, 1fr); }
+  .example-notes { max-width: 540px; }
+  .example-notes p { margin-bottom: 12px; }
+  .manual-index a { grid-template-columns: minmax(0, 1fr) 16px; gap: 5px 16px; }
+  .manual-index a > span:nth-child(2) { grid-column: 1; }
+  .manual-index a > span:last-child { grid-column: 2; grid-row: 1; }
+}
+@media (max-width: 640px) {
+  .home-intro { padding: 32px 0; }
+  .intro-meta { align-items: start; flex-direction: column; gap: 10px; font-size: 12px; }
+  .release-label { margin-left: 10px; }
+  .intro-body { grid-template-columns: 1fr; gap: 24px; margin-top: 28px; }
+  .intro-body h1 { font-size: clamp(32px, 8.8vw, 46px); }
+  .intro-description p { font-size: 15px; line-height: 1.7; margin-bottom: 16px; }
+  .home-section { grid-template-columns: 1fr; gap: 20px; padding-block: 28px; }
+  .section-label { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 8px 16px; }
+  .section-label p { margin: 0; font-size: 12px; }
+  .install-panel pre { font-size: 12px; padding: 8px 14px 16px; }
+  .install-heading { padding-inline: 14px; }
+  .install-links { gap: 10px 20px; }
+  .example-layout { gap: 22px; }
+  .demo-body { padding-inline: 12px; }
+  .demo-tabs button { min-height: 40px; }
+  .demo-status { min-height: 50px; }
+  .demo-caption { font-size: 11px; }
+  .manual-index a { padding-block: 15px; }
+  .beta-note { margin-top: 22px; }
+}

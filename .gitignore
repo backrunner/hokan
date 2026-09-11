@@ -5,3 +5,17 @@
 *.log
 .DS_Store
 Thumbs.db
+
+# svedocs website
+/website/node_modules/
+/website/.svelte-kit/
+/website/build/
+/website/static/og/
+/website/.svedocs/
+/website/.env
+/website/.env.*
+!/website/.env.example
+/website/test-results/
+/website/playwright-report/
+/.wrangler/
+/website/.wrangler/

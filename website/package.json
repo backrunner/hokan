@@ -1,0 +1,39 @@
+{
+  "name": "hokan-website",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "svedocs dev",
+    "og": "svedocs og --font node_modules/@fontsource/inter/files/inter-latin-400-normal.woff",
+    "build": "pnpm og && svedocs build",
+    "preview": "svedocs preview",
+    "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+    "check:content": "svedocs check --strict",
+    "verify": "pnpm check && pnpm check:content && pnpm build && pnpm test:site",
+    "test:site": "playwright test"
+  },
+  "dependencies": {
+    "@fontsource/inter": "^5.2.8",
+    "@fontsource/jetbrains-mono": "^5.2.8",
+    "@sveltejs/adapter-static": "^3.0.10",
+    "@sveltejs/kit": "^2.60.1",
+    "@sveltejs/vite-plugin-svelte": "^7.1.2",
+    "@tailwindcss/vite": "^4.3.0",
+    "svedocs": "0.2.1",
+    "svelte": "^5.55.7",
+    "tailwindcss": "^4.3.0",
+    "vite": "^8.0.13"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.63.0",
+    "@types/node": "^25.8.0",
+    "svedocs-cli": "0.2.1",
+    "svelte-check": "^4.7.6",
+    "typescript": "^6.0.3"
+  },
+  "packageManager": "pnpm@12.3.4",
+  "engines": {
+    "node": ">=24"
+  }
+}

@@ -413,3 +413,7 @@ Inspired by [IRIS](https://github.com/versenilvis/IRIS).
 ## License
 
 Hokan is licensed under the [BSD 3-Clause License](LICENSE).
+
+## Documentation site
+
+The svedocs-powered documentation site lives in [`website/`](website/README.md). It includes the product landing page, installation and configuration guides, compatibility notes, search, agent-friendly Markdown twins, SEO metadata, a Hokan logo, and generated Open Graph images.
