@@ -696,9 +696,10 @@ pub struct ScoreSignals {
 
 ### 8.3.1 `command_help`
 
-- 对无 spec 覆盖的 PATH 可执行命令，在 flags 位（当前词以 `-` 开头）和首参数位提供 man page 提取的 flag/子命令候选（source 标签 `HELP`）。
-- 提取只运行固定的 `man -P cat`（只读、run_bounded 限时 1200ms），绝不执行用户输入的命令本身。
+- 对无 spec 覆盖的 PATH 可执行命令，在 flags 位（当前词以 `-` 开头）和首参数位提供 man page / `--help` 提取的 flag/子命令候选（source 标签 `HELP`）。
+- 探测只运行固定的 `man -P cat` 或 `<cmd> --help`（run_bounded 限时、null stdin、无 shell、无用户 argv），命令本身仅接收字面 `--help` 参数；显式路径与构建 wrapper（gradlew/mvnw）不探测。
 - 解析为保守启发式：去 overstrike 后，flag 行取 `-x, --xxx` + 同行/缩进块描述；子命令仅在存在 COMMANDS/SUBCOMMANDS 类小节或 `cmd-<sub>` 引用时提取。
+- 嵌套 scope（`<cmd> <sub> --help`）只对内置白名单 CLI 或 `--help` 已给出完整 Commands 段的自描述 CLI 开启；后者覆盖 cobra/clap/commander/yargs 风格的命令，包括绝大多数 npm 安装的工具。
 - session 级缓存（含负结果）；冷抓取在 `applies` 中完成，使 `complete` 永远命中缓存、不吃 `local_timeout` 预算；filesystem 的抑制检查用免抓取的 `peek`。
 
 ### 8.4 `process` 与 `network_interface`
