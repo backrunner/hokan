@@ -184,7 +184,8 @@ Terminal capability identifier. TERM=dumb is not supported.
 Base directory for config.toml, credentials.toml, and user command specs.
 .TP
 .B XDG_STATE_HOME
-Base directory for the private history store and optional diagnostic log.
+When set, the state directory is $XDG_STATE_HOME/hokan instead of the private
+default ~/.hokan.
 .TP
 .B XDG_CACHE_HOME
 Base directory for caches.
@@ -230,6 +231,10 @@ Set to 0 to bypass managed shell auto-start for the new shell process.
 .B HOKAN_BIN
 Override the Hokan executable used by a managed integration block or active
 child-shell hook.
+.TP
+.B HOKAN_STATE_DIR
+Absolute path that replaces the private state directory entirely; takes
+precedence over XDG_STATE_HOME.
 .SH FILES
 .TP
 .I ~/.config/hokan/config.toml
@@ -243,10 +248,13 @@ access/refresh token set with expiry.
 .I ~/.config/hokan/specs/
 User command specifications.
 .TP
-.I ~/.local/state/hokan/
-Private event log, snapshots, locks, and import checkpoints.
+.I ~/.hokan/
+Private state: event log, snapshots, locks, import checkpoints, and the
+update-check cache. HOKAN_STATE_DIR or XDG_STATE_HOME relocates it; state left
+by earlier releases in ~/.local/state/hokan (or the pre-rename beta's hokann
+directory) is migrated on first use.
 .TP
-.I ~/.local/state/hokan/debug.log
+.I ~/.hokan/debug.log
 Optional bounded JSONL diagnostic log. Disabled by default; excludes query text,
 history, working-directory paths, HTTP bodies, and environment values.
 .TP

@@ -115,7 +115,12 @@ pub(super) struct ParsedEvents {
 
 impl HistoryStore {
     pub fn open(state_directory: &Path) -> crate::Result<Self> {
-        fs::create_dir_all(state_directory)?;
+        fs::create_dir_all(state_directory).map_err(|error| {
+            crate::Error::History(format!(
+                "cannot create state directory {}: {error}",
+                state_directory.display()
+            ))
+        })?;
         let metadata = fs::symlink_metadata(state_directory)?;
         if !metadata.file_type().is_dir() || metadata.uid() != nix::unistd::geteuid().as_raw() {
             return Err(crate::Error::History(format!(
@@ -123,7 +128,14 @@ impl HistoryStore {
                 state_directory.display()
             )));
         }
-        fs::set_permissions(state_directory, fs::Permissions::from_mode(0o700))?;
+        fs::set_permissions(state_directory, fs::Permissions::from_mode(0o700)).map_err(
+            |error| {
+                crate::Error::History(format!(
+                    "cannot secure state directory {}: {error}",
+                    state_directory.display()
+                ))
+            },
+        )?;
         Ok(Self {
             state_directory: state_directory.to_owned(),
             path: state_directory.join("history.events"),

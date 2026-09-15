@@ -236,9 +236,10 @@ detects this case and known conflicting plugins.
 
 ## Configuration
 
-Hokan follows XDG paths. The main configuration is
-`~/.config/hokan/config.toml` by default, and private history state is stored
-under `~/.local/state/hokan`.
+Hokan follows XDG paths for configuration. The main configuration is
+`~/.config/hokan/config.toml` by default, while private state (history,
+snapshots, locks, and the update-check cache) lives in `~/.hokan`. Set
+`HOKAN_STATE_DIR` — or `XDG_STATE_HOME` — to relocate it.
 
 ```bash
 hokan config init
@@ -267,8 +268,8 @@ max_bytes = 1048576
 rotations = 3
 ```
 
-When enabled, logs are written to
-`${XDG_STATE_HOME:-~/.local/state}/hokan/debug.log`. They contain typed event
+When enabled, logs are written to `~/.hokan/debug.log` (the default state
+directory). They contain typed event
 categories and timing data, not query text, history entries, full working
 directories, HTTP bodies, or environment variable values.
 

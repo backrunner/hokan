@@ -122,7 +122,7 @@ hokan config ai
 
 AI 凭据文件必须是当前用户拥有的普通文件，权限为 `0600` 或更严格，且不能是 symlink。
 状态目录必须为 `0700`。运行一次需要 history 的 Hokan 命令会创建并收紧状态目录；也可
-手动执行 `chmod 700 ~/.local/state/hokan`。
+手动执行 `chmod 700 ~/.hokan`（`HOKAN_STATE_DIR` 或 `XDG_STATE_HOME` 覆盖时改为对应目录）。
 
 Hokan history、snapshot 和 lock 必须是当前用户拥有的普通文件，不能是 symlink。升级
 时，Hokan 会把符合这两个条件的旧文件自动收紧为 `0600`；异主文件或非普通文件会被
@@ -209,8 +209,9 @@ OAuth 登录过程错误（`OAuthError`）的稳定错误码：
 ## 诊断日志
 
 诊断日志默认关闭，也不会创建空日志文件。为复现短暂的 provider、AI 或配置重载问题，
-可在 `config.toml` 中设置 `[logging].enabled = true` 后重启 Hokan。日志写入
-`${XDG_STATE_HOME:-~/.local/state}/hokan/debug.log`，单文件默认上限 1 MiB，保留三个
+可在 `config.toml` 中设置 `[logging].enabled = true` 后重启 Hokan。日志写入状态目录
+下的 `debug.log`（默认 `~/.hokan/debug.log`；`HOKAN_STATE_DIR` 或 `XDG_STATE_HOME` 可
+覆盖），单文件默认上限 1 MiB，保留三个
 轮转文件；`hokan doctor` 会显示当前策略和状态目录权限。
 
 日志只记录类型化运行元数据，不记录 query、history、CWD、HTTP body 或环境变量值，

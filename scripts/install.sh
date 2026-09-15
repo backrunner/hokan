@@ -19,6 +19,61 @@ say() {
   printf '%s\n' "$*"
 }
 
+# The target — or, when it does not exist yet, its nearest existing
+# ancestor — must be a directory we can write and traverse. Checking before
+# the download turns a permission problem into an install-time failure
+# instead of a broken first login.
+require_writable_tree() {
+  probe=$1
+  while [ ! -e "$probe" ]; do
+    parent=${probe%/*}
+    if [ -z "$parent" ] || [ "$parent" = "$probe" ]; then
+      probe=/
+    else
+      probe=$parent
+    fi
+  done
+  if [ ! -d "$probe" ]; then
+    fail "$probe exists but is not a directory"
+  fi
+  if [ ! -w "$probe" ] || [ ! -x "$probe" ]; then
+    fail "cannot write inside $probe; fix its permissions or choose a different location"
+  fi
+}
+
+# Private state lives in ~/.hokan by default (HOKAN_STATE_DIR, or
+# $XDG_STATE_HOME/hokan when set). Creating and checking it here means the
+# first launch cannot die on directory permissions; releases that used
+# ~/.local/state/hokan (and the pre-rename beta's .../hokann) are migrated by
+# the move below and again by the binary when it resolves the default path.
+prepare_state_directory() {
+  if [ -z "${HOKAN_STATE_DIR:-}" ] && [ -z "${XDG_STATE_HOME:-}" ]; then
+    for legacy_name in hokan hokann; do
+      legacy_state_dir=$HOME/.local/state/$legacy_name
+      if [ -d "$legacy_state_dir" ] && [ ! -L "$legacy_state_dir" ] && [ ! -e "$state_dir" ]; then
+        if mv "$legacy_state_dir" "$state_dir" 2>/dev/null; then
+          say "Migrated state: $legacy_state_dir -> $state_dir"
+          break
+        fi
+      fi
+    done
+  fi
+  if [ -e "$state_dir" ] && [ ! -d "$state_dir" ]; then
+    fail "$state_dir exists but is not a directory"
+  fi
+  mkdir -p "$state_dir" 2>/dev/null \
+    || fail "cannot create state directory $state_dir; fix permissions on a parent directory or set HOKAN_STATE_DIR"
+  chmod 700 "$state_dir" 2>/dev/null \
+    || fail "cannot secure $state_dir; it is owned by another user"
+  if [ "$(id -u)" = "0" ]; then
+    home_owner=$(ls -ldn "$HOME" | awk '{print $3}')
+    if [ -n "$home_owner" ]; then
+      chown "$home_owner" "$state_dir" 2>/dev/null || true
+    fi
+  fi
+  [ -w "$state_dir" ] || fail "state directory $state_dir is not writable"
+}
+
 [ -n "${HOME:-}" ] || fail 'HOME is not set'
 command -v curl >/dev/null 2>&1 || fail 'curl is required'
 command -v tar >/dev/null 2>&1 || fail 'tar is required'
@@ -57,6 +112,60 @@ case "$architecture" in
   *) fail "unsupported architecture: $architecture" ;;
 esac
 target=$architecture-$platform
+
+# Resolve the state directory exactly like the binary: HOKAN_STATE_DIR wins,
+# then XDG_STATE_HOME/hokan, then the private ~/.hokan default.
+if [ -n "${HOKAN_STATE_DIR:-}" ]; then
+  state_dir=$HOKAN_STATE_DIR
+elif [ -n "${XDG_STATE_HOME:-}" ]; then
+  state_dir=${XDG_STATE_HOME%/}/hokan
+else
+  state_dir=$HOME/.hokan
+fi
+case "$state_dir" in
+  /*) ;;
+  *) fail 'HOKAN_STATE_DIR and XDG_STATE_HOME must be absolute paths' ;;
+esac
+
+# Resolve the rc file the same way `hokan install` does — including one
+# symlink level, since the binary canonicalizes the target and dotfiles
+# managers commonly symlink rc files — so its real parent directory can be
+# checked up front.
+if [ -n "$requested_rc_file" ]; then
+  rc_target=$requested_rc_file
+else
+  case "$requested_shell" in
+    zsh) rc_target=${ZDOTDIR:-$HOME}/.zshrc ;;
+    fish) rc_target=${XDG_CONFIG_HOME:-$HOME/.config}/fish/config.fish ;;
+    bash)
+      if [ "$os" = Darwin ]; then
+        rc_target=$HOME/.bash_profile
+      else
+        rc_target=$HOME/.bashrc
+      fi
+      ;;
+  esac
+fi
+if [ -L "$rc_target" ]; then
+  rc_resolved=$(readlink "$rc_target")
+  case "$rc_resolved" in
+    /*) rc_target=$rc_resolved ;;
+    *) rc_target=${rc_target%/*}/$rc_resolved ;;
+  esac
+fi
+
+if [ "$(id -u)" = "0" ]; then
+  say 'warning: installing as root; Hokan keeps per-user state — install as the target user so files are not left owned by root'
+fi
+require_writable_tree "$install_dir"
+require_writable_tree "$man_dir"
+rc_parent=${rc_target%/*}
+if [ "$rc_parent" = "$rc_target" ]; then
+  rc_parent=.
+fi
+require_writable_tree "$rc_parent"
+[ -w "${TMPDIR:-/tmp}" ] || fail "temporary directory ${TMPDIR:-/tmp} is not writable"
+prepare_state_directory
 
 if [ -z "$requested_version" ]; then
   latest_url=$(curl \

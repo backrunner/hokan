@@ -330,7 +330,7 @@ HTTP client 使用 rustls，支持自定义 base URL，但不自动跟随跨 ori
 $XDG_CONFIG_HOME/hokan/config.toml       # fallback ~/.config/hokan
 $XDG_CONFIG_HOME/hokan/specs/*.toml      # 用户规格
 $XDG_CONFIG_HOME/hokan/credentials.toml  # 可选，0600
-$XDG_STATE_HOME/hokan/                   # fallback ~/.local/state/hokan
+$HOKAN_STATE_DIR 或 $XDG_STATE_HOME/hokan # fallback ~/.hokan（私有目录；不再共享 ~/.local，避免父目录被其他工具以 root 创建后每次登录即崩）
 $XDG_CACHE_HOME/hokan/                   # PATH/project/capability cache
 $XDG_RUNTIME_DIR/hokan/<session>/        # socket；无 XDG_RUNTIME_DIR 时用 0700 临时目录
 ```

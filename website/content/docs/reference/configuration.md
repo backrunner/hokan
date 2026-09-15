@@ -26,7 +26,7 @@ hokan config validate
 | Configuration | `~/.config/hokan/config.toml` | `XDG_CONFIG_HOME` |
 | Private credentials | `~/.config/hokan/credentials.toml` | `XDG_CONFIG_HOME` |
 | Custom command specs | `~/.config/hokan/specs/` | `XDG_CONFIG_HOME` |
-| History and diagnostics | `~/.local/state/hokan/` | `XDG_STATE_HOME` |
+| History and diagnostics | `~/.hokan/` | `HOKAN_STATE_DIR`, then `XDG_STATE_HOME` |
 | Cache | `~/.cache/hokan/` | `XDG_CACHE_HOME` |
 
 Credentials and history files must be owned by the current user and private (`0600` or stricter); the state directory is `0700`. See [AI setup](/docs/guides/ai) for the provider wizard and environment-variable credentials.
@@ -92,7 +92,7 @@ max_bytes = 1048576
 rotations = 3
 ```
 
-Logs are opt-in and bounded. When enabled, they are written to `${XDG_STATE_HOME:-~/.local/state}/hokan/debug.log`. They contain typed event categories and timing data, not query text, history entries, full working directories, HTTP bodies, or environment variable values.
+Logs are opt-in and bounded. When enabled, they are written to `~/.hokan/debug.log` (the default state directory, relocatable with `HOKAN_STATE_DIR` or `XDG_STATE_HOME`). They contain typed event categories and timing data, not query text, history entries, full working directories, HTTP bodies, or environment variable values.
 
 ## Automatic updates
 

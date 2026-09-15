@@ -25,7 +25,7 @@ hokan --version
 hokan doctor
 ```
 
-The default installation uses `~/.local/bin/hokan` and `~/.local/share/man/man1/hokan.1`. It does not require `sudo`.
+The default installation uses `~/.local/bin/hokan` and `~/.local/share/man/man1/hokan.1`. It does not require `sudo`. Private state lives in `~/.hokan`; the installer creates and permission-checks it up front, so the first launch cannot fail on directory access.
 
 ## On-demand mode
 
@@ -62,4 +62,5 @@ hokan install
 | `HOKAN_MAN_DIR` | Override the man-page directory |
 | `HOKAN_SHELL` | Select `zsh`, `bash`, or `fish` |
 | `HOKAN_RC_FILE` | Select an explicit shell rc file |
+| `HOKAN_STATE_DIR` | Override the private state directory (default `~/.hokan`) |
 | `HOKAN_ON_DEMAND=1` | Install `hk` without automatic startup |
