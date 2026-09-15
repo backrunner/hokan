@@ -51,11 +51,21 @@ impl PtyReadPump {
                             break;
                         }
                     }
-                    if descriptors[1]
+
+                    // Drain any readable child output before honoring a
+                    // cancellation observed in the same poll, so shutdown
+                    // still forwards the child's final bytes.
+                    if descriptors[0]
                         .revents()
-                        .is_some_and(|events| !events.is_empty())
+                        .is_none_or(|revents| revents.is_empty())
                     {
-                        break;
+                        if descriptors[1]
+                            .revents()
+                            .is_some_and(|events| !events.is_empty())
+                        {
+                            break;
+                        }
+                        continue;
                     }
 
                     match batch_reader.read_cycle(&mut reader) {
@@ -89,6 +99,12 @@ impl PtyReadPump {
                             break;
                         }
                     }
+                    if descriptors[1]
+                        .revents()
+                        .is_some_and(|events| !events.is_empty())
+                    {
+                        break;
+                    }
                 }
             })?;
         Ok(Self {
@@ -97,7 +113,12 @@ impl PtyReadPump {
         })
     }
 
+    /// Signal the pump to stop and wait for it. Without the cancel signal a
+    /// pump could outlive shutdown indefinitely — for example while a
+    /// detached grandchild still holds the slave side open — and `join` would
+    /// never return.
     pub fn join(mut self) -> crate::Result<()> {
+        self.cancel.take();
         self.join_thread()
     }
 

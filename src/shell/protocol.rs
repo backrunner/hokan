@@ -136,6 +136,23 @@ impl ShellProtocolDecoder {
         }
         let event = envelope.next().unwrap_or_default();
         let payload = envelope.next().unwrap_or_default();
+        if event == "BUFFERX" {
+            // The shell skipped an oversized buffer snapshot. Consume its
+            // redisplay id so id ordering stays intact and mark the mirror
+            // uncertain; a later in-budget BUFFER frame restores exact sync.
+            match parse_monotonic_id(
+                payload.split('\t').next(),
+                self.last_redisplay_id,
+                "redisplay",
+            ) {
+                Ok(id) => self.last_redisplay_id = id,
+                Err((code, message)) => output
+                    .diagnostics
+                    .push(ProtocolDiagnostic { code, message }),
+            }
+            output.buffer_uncertain = true;
+            return;
+        }
         let decoded = match event {
             "PATH" => Ok(ShellEvent::PathChanged {
                 path: OsString::from(payload),
@@ -143,6 +160,10 @@ impl ShellProtocolDecoder {
             "PROMPT" => self.decode_prompt(payload),
             "BUFFER" => self.decode_buffer(payload),
             "START" => self.decode_start(payload),
+            // The command line exceeded the frame budget, so the shell sent a
+            // marker instead of its text. Pairing stays intact so END still
+            // resolves; the empty command is filtered before history writes.
+            "STARTX" => self.decode_start(""),
             "END" => self.decode_end(payload),
             _ => Err((
                 "HK-SHL-006",
@@ -352,6 +373,43 @@ mod tests {
                 }]
             );
         }
+    }
+
+    #[test]
+    fn oversized_markers_keep_id_ordering_and_command_pairing() {
+        let mut decoder = ShellProtocolDecoder::new(ShellKind::Zsh);
+        let skipped = decoder.feed(b"HKP2\tBUFFERX\t3\0");
+        assert!(skipped.buffer_uncertain);
+        assert!(skipped.events.is_empty());
+        assert!(skipped.diagnostics.is_empty());
+
+        // A later in-budget frame resumes exact sync without an id gap error.
+        let recovered = decoder.feed(b"HKP2\tBUFFER\t4\t0\tok\0");
+        assert!(!recovered.buffer_uncertain);
+        assert_eq!(
+            recovered.events,
+            vec![ShellEvent::Buffer {
+                redisplay_id: BoundaryId::new(4),
+                cursor: 0,
+                text: "ok".into(),
+            }]
+        );
+
+        // STARTX pairs with END so the command lifecycle still resolves.
+        let paired = decoder.feed(b"HKP2\tSTARTX\0HKP2\tEND\t0\t/tmp\0");
+        assert_eq!(
+            paired.events,
+            vec![
+                ShellEvent::CommandStart {
+                    command: String::new(),
+                },
+                ShellEvent::CommandEnd {
+                    exit_code: 0,
+                    cwd: PathBuf::from("/tmp"),
+                    command: String::new(),
+                },
+            ]
+        );
     }
 
     #[test]

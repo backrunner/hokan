@@ -106,7 +106,11 @@ pub(super) fn handle_control_message(
         ControlMessage::Event(ShellEvent::CommandStart { command }) => {
             state.cancel_ai();
             state.history_navigation = false;
-            state.pending_command = Some(command);
+            // A STARTX marker decodes to an empty command: the real text
+            // exceeded the control-frame budget. Leave pending_command empty
+            // so history falls back to the shell's own records instead of
+            // persisting a stale mirror or an empty row.
+            state.pending_command = (!command.is_empty()).then_some(command);
             state.editing = false;
             state.overlay_visible = false;
             state.pending_confirm = None;

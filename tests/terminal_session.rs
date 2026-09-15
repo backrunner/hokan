@@ -380,8 +380,16 @@ impl TerminalSession {
 
     fn write(&mut self, bytes: &[u8]) {
         let writer = self.writer.as_mut().expect("PTY writer");
-        writer.write_all(bytes).expect("write terminal input");
-        writer.flush().expect("flush terminal input");
+        if let Err(error) = writer.write_all(bytes).and_then(|()| writer.flush()) {
+            let status = self.try_wait();
+            // Drain whatever the dying child flushed so its error report
+            // (`hokan: …`) reaches the transcript before we panic.
+            self.settle(Duration::from_millis(500));
+            panic!(
+                "write terminal input failed: {error}; child status={status:?}; transcript tail={:?}",
+                tail(&self.transcript, 4_096)
+            );
+        }
     }
 
     fn resize(&mut self, rows: u16, cols: u16) {
@@ -1923,6 +1931,202 @@ finally:
 }
 
 #[test]
+fn foreground_tui_receives_multi_mib_binary_paste_byte_exact() {
+    if !command_exists("zsh") || !command_exists("python3") {
+        return;
+    }
+    let (home, work) = fixture_directories();
+    let fixture = work.path().join("big-paste-tui.py");
+    fs::write(
+        &fixture,
+        r#"import os
+import sys
+import termios
+import time
+import tty
+
+fd = sys.stdin.fileno()
+saved = termios.tcgetattr(fd)
+tty.setraw(fd)
+try:
+    os.write(1, b"\x1b[?2004h\r\nBIG_PASTE_READY\r\n")
+    # Simulate a TUI (codex/kimi style) that is briefly busy before it starts
+    # draining a paste: the bytes must stay queued, not crash the session.
+    time.sleep(0.3)
+    data = bytearray()
+    while not data.endswith(b"\x1b[201~"):
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            raise RuntimeError("unexpected EOF")
+        data.extend(chunk)
+    if not data.startswith(b"\x1b[200~"):
+        raise RuntimeError("invalid paste start: " + data[:16].hex())
+    payload = bytes(data[6:-6])
+    with open("big-paste-out.bin", "wb") as output:
+        output.write(payload)
+    os.write(1, ("BIG_PASTE_LEN=%d\r\n" % len(payload)).encode())
+finally:
+    termios.tcsetattr(fd, termios.TCSANOW, saved)
+"#,
+    )
+    .expect("big paste TUI fixture");
+
+    // Every possible byte value, plus reply-shaped escape text: a binary
+    // image paste in miniature. The i % 256 pattern can never contain
+    // PASTE_END (0x1b is only ever followed by 0x1c).
+    let mut payload: Vec<u8> = (0..3 * 1024 * 1024).map(|i| (i % 256) as u8).collect();
+    let midpoint = payload.len() / 2;
+    payload.splice(
+        midpoint..midpoint,
+        b"\x1b[?12;34R\x1b[?2026;2$y\x1b[6n\x1b[c".iter().copied(),
+    );
+    assert!(
+        !payload
+            .windows(PASTE_END.len())
+            .any(|window| window == PASTE_END),
+        "fixture payload must not contain the paste terminator"
+    );
+    let mut paste = Vec::with_capacity(payload.len() + 12);
+    paste.extend_from_slice(PASTE_START);
+    paste.extend_from_slice(&payload);
+    paste.extend_from_slice(PASTE_END);
+
+    let mut terminal = TerminalSession::spawn_hokan(home, work, 2);
+    terminal.wait_for_screen("HK> ");
+    terminal.settle(Duration::from_millis(300));
+
+    let command_start = terminal.transcript.len();
+    terminal.write(b"python3 ./big-paste-tui.py\r");
+    terminal.wait_for_bytes_since(command_start, b"BIG_PASTE_READY");
+
+    for chunk in paste.chunks(64 * 1024) {
+        terminal.write(chunk);
+    }
+    terminal.wait_for_bytes_since(
+        command_start,
+        format!("BIG_PASTE_LEN={}", payload.len()).as_bytes(),
+    );
+    terminal.wait_for_bytes_since(command_start, b"HK> ");
+
+    let received =
+        fs::read(terminal._work.path().join("big-paste-out.bin")).expect("payload capture file");
+    assert_eq!(
+        received.len(),
+        payload.len(),
+        "TUI received a truncated paste"
+    );
+    assert_eq!(
+        received, payload,
+        "TUI did not receive the paste byte-exact"
+    );
+
+    terminal.exit_shell();
+    terminal.wait_until_exit();
+}
+
+#[test]
+fn zsh_prompt_accepts_oversized_multiline_paste_byte_exact() {
+    if !command_exists("zsh") {
+        return;
+    }
+    let (home, work) = fixture_directories();
+    let state_dir = home.path().join(".local/state");
+    let out_file = work.path().join("zsh-big-paste.txt");
+    // Beyond MAX_PASTE_BYTES the decoder streams PasteFragments; zsh must
+    // still see one coherent bracketed paste. Newlines and CJK/emoji stay
+    // literal inside the single-quoted argument.
+    let unit = "中文字符🙂 spaced payload line\n";
+    let repeats = (2 * 1024 * 1024) / unit.len() + 1;
+    let payload = unit.repeat(repeats);
+    // The trailing marker lands in the same file only after the multi-megabyte
+    // `print` has fully flushed, so it doubles as the completion sentinel.
+    let command = format!(
+        "{{ print -r -- '{}'; print -r -- 'HK_PASTE_DONE'; }} > zsh-big-paste.txt",
+        payload
+    );
+
+    let mut terminal = TerminalSession::spawn_hokan(home, work, 2);
+    terminal.wait_for_screen("HK> ");
+    terminal.settle(Duration::from_millis(300));
+
+    let mut paste = Vec::with_capacity(command.len() + 12);
+    paste.extend_from_slice(PASTE_START);
+    paste.extend_from_slice(command.as_bytes());
+    paste.extend_from_slice(PASTE_END);
+    for chunk in paste.chunks(64 * 1024) {
+        terminal.write(chunk);
+    }
+    terminal.settle(Duration::from_millis(300));
+    let command_start = terminal.transcript.len();
+    terminal.write(b"\r");
+
+    // The redirect creates the output file before `print` runs, so existence
+    // alone cannot prove the write finished. Poll until the trailing sentinel
+    // is flushed — that can only happen after the whole payload was written.
+    let expected = format!("{payload}\nHK_PASTE_DONE\n");
+    let deadline = Instant::now() + TIMEOUT;
+    let mut received = Vec::new();
+    while Instant::now() < deadline {
+        terminal.receive_once(READ_POLL);
+        if let Ok(content) = fs::read(&out_file) {
+            received = content;
+            if received.ends_with(b"HK_PASTE_DONE\n") {
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let debug_log = state_dir.join("hokan/debug.log");
+    let debug_log_text =
+        fs::read_to_string(&debug_log).unwrap_or_else(|_| "<no debug log>".to_owned());
+    assert!(
+        received.ends_with(b"HK_PASTE_DONE\n"),
+        "zsh did not finish the paste command; received_len={} transcript len={} contains_cmd={} contains_end={} tail={:?} debug_log_tail={:?}",
+        received.len(),
+        terminal.transcript.len(),
+        terminal
+            .transcript
+            .windows(b"zsh-big-paste".len())
+            .any(|w| w == b"zsh-big-paste"),
+        terminal
+            .transcript
+            .windows(PASTE_END.len())
+            .any(|w| w == PASTE_END),
+        tail(&terminal.transcript, 2_048),
+        tail(debug_log_text.as_bytes(), 4_096)
+    );
+    let received = fs::read_to_string(&out_file).expect("zsh paste output file");
+    assert!(
+        received == expected,
+        "zsh buffer did not receive the paste; received_len={} expected_len={} received_head={:?} received_tail={:?} transcript_tail={:?}",
+        received.len(),
+        expected.len(),
+        head(received.as_bytes(), 256),
+        tail(received.as_bytes(), 256),
+        tail(&terminal.transcript, 1_024),
+    );
+    // The session must still be alive and back at the editing prompt.
+    terminal.wait_for_bytes_since(command_start, b"HK> ");
+
+    terminal.exit_shell();
+    terminal.wait_until_exit();
+}
+
+#[test]
+fn background_process_holding_pty_does_not_block_shutdown() {
+    if !command_exists("zsh") {
+        return;
+    }
+    let mut terminal = TerminalSession::spawn();
+    terminal.wait_for_screen("HK> ");
+    // A detached grandchild inherits the PTY slave, so the master never sees
+    // EOF after zsh exits. Teardown must cancel the read pump instead of
+    // waiting on it — otherwise `wait_until_exit` would outlive the sleep.
+    terminal.write(b"(sleep 300 &) ; exit\r");
+    terminal.wait_until_exit();
+}
+
+#[test]
 fn ssh_pty_preserves_queries_unicode_resize_ctrl_c_and_escape() {
     if !command_exists("zsh")
         || !command_exists("ssh")
@@ -3127,4 +3331,8 @@ fn assert_forbidden_overlay_sequences_absent(bytes: &[u8]) {
 
 fn tail(bytes: &[u8], max: usize) -> String {
     String::from_utf8_lossy(&bytes[bytes.len().saturating_sub(max)..]).into_owned()
+}
+
+fn head(bytes: &[u8], max: usize) -> String {
+    String::from_utf8_lossy(&bytes[..bytes.len().min(max)]).into_owned()
 }

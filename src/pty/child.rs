@@ -1,10 +1,26 @@
-use std::io::{Read, Write};
+use std::{
+    io::{Read, Write},
+    thread,
+    time::{Duration, Instant},
+};
 
 use nix::sys::signal::Signal;
-use nix_compat::fcntl::{FcntlArg, OFlag, fcntl};
+use nix_compat::{
+    fcntl::{FcntlArg, OFlag, fcntl},
+    poll::{PollFd, PollFlags, poll},
+};
 use portable_pty::{Child, CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system};
 
 use crate::terminal::TerminalSize;
+
+/// A foreground child that stops draining the PTY input queue entirely (for
+/// example a SIGTSTP'd TUI) must not freeze the session on a large write: if
+/// no byte is accepted for this long the write fails instead of blocking the
+/// runtime — including its signal handling — forever.
+const WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(10);
+/// A child already past exit should reap instantly; one stuck in the kernel's
+/// exit path can take arbitrarily long, so teardown bounds the wait.
+const REAP_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub struct PtyChild {
     master: Box<dyn MasterPty + Send>,
@@ -59,11 +75,36 @@ impl PtyChild {
     }
 
     pub fn write_all(&mut self, bytes: &[u8]) -> crate::Result<()> {
+        let descriptor = self
+            .master
+            .as_raw_fd()
+            .ok_or_else(|| crate::Error::Pty("PTY master descriptor is unavailable".into()))?;
         let writer = self
             .writer
             .as_mut()
             .ok_or_else(|| crate::Error::Pty("PTY writer is closed".into()))?;
-        writer.write_all(bytes)?;
+        // `take_writer` duplicates the master descriptor, so the `O_NONBLOCK`
+        // set by `enable_nonblocking_reads` applies here as well. A paste
+        // larger than the PTY input queue must wait for the child to drain
+        // it — returning `WouldBlock` would tear down the whole session.
+        let mut remaining = bytes;
+        let mut stall_deadline = Instant::now() + WRITE_STALL_TIMEOUT;
+        while !remaining.is_empty() {
+            match writer.write(remaining) {
+                Ok(0) => {
+                    return Err(crate::Error::Pty("PTY writer accepted no bytes".into()));
+                }
+                Ok(written) => {
+                    remaining = &remaining[written..];
+                    stall_deadline = Instant::now() + WRITE_STALL_TIMEOUT;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    wait_until_writable(descriptor, stall_deadline)?;
+                }
+                Err(error) => return Err(crate::Error::Io(error)),
+            }
+        }
         writer.flush()?;
         Ok(())
     }
@@ -118,9 +159,41 @@ impl PtyChild {
 impl Drop for PtyChild {
     fn drop(&mut self) {
         self.writer.take();
-        if !matches!(self.child.try_wait(), Ok(Some(_))) {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+        if matches!(self.child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        let _ = self.child.kill();
+        // `wait` blocks until the child becomes reapable; a child wedged in
+        // the kernel's exit path never does, which would hang teardown. Poll
+        // briefly and leave the orphan to the init process instead.
+        let deadline = Instant::now() + REAP_TIMEOUT;
+        while Instant::now() < deadline {
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+fn wait_until_writable(descriptor: i32, deadline: Instant) -> crate::Result<()> {
+    let interests = PollFlags::POLLOUT | PollFlags::POLLHUP | PollFlags::POLLERR;
+    let mut descriptors = [PollFd::new(descriptor, interests)];
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(crate::Error::Pty(
+                "PTY writer stalled: child stopped consuming input".into(),
+            ));
+        }
+        let timeout = i32::try_from(remaining.as_millis()).unwrap_or(i32::MAX);
+        match poll(&mut descriptors, timeout) {
+            // Any readiness result — writable, hang-up, or error — returns so
+            // the next `write` reports the real outcome.
+            Ok(0) => continue,
+            Ok(_) => return Ok(()),
+            Err(nix_compat::errno::Errno::EINTR) => continue,
+            Err(error) => return Err(nix_compat_io(error)),
         }
     }
 }

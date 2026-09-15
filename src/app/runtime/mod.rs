@@ -5,6 +5,7 @@ mod history;
 mod input;
 mod render;
 mod results;
+mod shutdown;
 mod state;
 mod worker;
 
@@ -25,13 +26,14 @@ use history::*;
 use input::*;
 use render::*;
 use results::*;
+use shutdown::*;
 use state::*;
 use worker::*;
 
 use crate::{
     config::{Config, ConfigPaths, ConfigWatcher},
     diagnostics::DebugLog,
-    pty::{PtyChild, PtyReadPump, SignalBridge},
+    pty::{PtyChild, PtyReadEvent, PtyReadPump, SignalBridge},
     shell::{ShellKind, ShellSession},
     terminal::{
         InputDecoder, OutputHandle, OutputJoin, TerminalQueryKind, TerminalReplyRouter,
@@ -44,6 +46,12 @@ use portable_pty::ExitStatus;
 pub(super) const ESCAPE_TIMEOUT: Duration = Duration::from_millis(24);
 pub(super) const TERMINAL_QUERY_TIMEOUT: Duration = Duration::from_millis(250);
 const LOOP_TICK: Duration = Duration::from_millis(8);
+/// Once the child closes the PTY it should become reapable immediately; a
+/// child wedged in the kernel's exit path never does, so the session loop
+/// must stop waiting for it.
+const CHILD_REAP_GRACE: Duration = Duration::from_secs(3);
+/// A killed child reaps near-instantly; this only bounds a stuck reap.
+const POST_KILL_REAP_GRACE: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SessionOptions {
@@ -190,6 +198,7 @@ pub fn run_session(options: SessionOptions) -> crate::Result<u8> {
     let mut terminating = false;
     let mut termination_started = None;
     let mut kill_sent = false;
+    let mut reap_deadline: Option<Instant> = None;
     while exit_status.is_none() {
         select! {
             recv(input_receiver) -> message => {
@@ -223,6 +232,10 @@ pub fn run_session(options: SessionOptions) -> crate::Result<u8> {
             }
             recv(pty_receiver) -> message => {
                 if let Ok(message) = message {
+                    if matches!(message, PtyReadEvent::Eof) {
+                        reap_deadline
+                            .get_or_insert_with(|| Instant::now() + CHILD_REAP_GRACE);
+                    }
                     handle_pty_event(message, &mut state, output.handle())?;
                 }
             }
@@ -346,17 +359,31 @@ pub fn run_session(options: SessionOptions) -> crate::Result<u8> {
             {
                 pty.kill()?;
                 kill_sent = true;
+                reap_deadline = Some(now + POST_KILL_REAP_GRACE);
             }
+        }
+        if exit_status.is_none() && reap_deadline.is_some_and(|deadline| now >= deadline) {
+            // The child's output ended or it survived SIGKILL: either way it
+            // is not coming back, and waiting on its reap could hang forever.
+            let _ = pty.kill();
+            break;
         }
     }
 
     flush_history_before_exit(&mut state, &history_store);
     pty.close_writer();
     state.cancel_ai();
+    // Settle in-flight terminal replies while the guard still owns raw mode,
+    // before any output-shutdown path may restore the terminal.
+    drain_terminal_queries_before_exit(&mut reply_router, &input_receiver);
+    // If the drain wedges (a producer parked on a full mailbox, or a terminal
+    // that stopped reading) the watchdog closes the mailbox so the joins
+    // below can still complete.
+    let watchdog = ShutdownWatchdog::start(output.handle().clone());
     pty_pump.join()?;
     let _ = output.handle().barrier();
-    drain_terminal_queries_before_exit(&mut reply_router, &input_receiver);
     output.finish()?;
+    watchdog.disarm();
     drop(signal_bridge);
     drop(control_reader);
     drop(worker);
@@ -493,20 +520,43 @@ impl OutputLease {
 
     fn finish(&mut self) -> crate::Result<()> {
         self.handle.restore_and_exit().map_err(output_error)?;
-        if let Some(join) = self.join.take() {
-            join.join()
-                .map_err(|_| crate::Error::Runtime("output actor panicked".into()))?
-                .map_err(output_error)?;
+        self.join_actor()
+    }
+
+    /// Join the actor with a bounded wait: a wedged stdout write would
+    /// otherwise pin teardown forever. Past the grace period stdout is
+    /// switched to nonblocking so the write fails fast; if the actor still
+    /// does not exit, raw mode is restored directly and the thread is left
+    /// for process exit to reclaim.
+    fn join_actor(&mut self) -> crate::Result<()> {
+        let Some(join) = self.join.take() else {
+            return Ok(());
+        };
+        let waiter = spawn_join_waiter(join);
+        let result = match waiter.recv_timeout(ACTOR_JOIN_GRACE) {
+            Ok(result) => Some(result),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let saved = set_stdout_nonblocking();
+                let forced = waiter.recv_timeout(ACTOR_FORCE_GRACE).ok();
+                restore_stdout_flags(saved);
+                if forced.is_none() {
+                    let _ = crossterm::terminal::disable_raw_mode();
+                }
+                forced
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => None,
+        };
+        match result {
+            None => Ok(()),
+            Some(Err(_)) => Err(crate::Error::Runtime("output actor panicked".into())),
+            Some(Ok(actor_result)) => actor_result.map_err(output_error).map(|_| ()),
         }
-        Ok(())
     }
 }
 
 impl Drop for OutputLease {
     fn drop(&mut self) {
         let _ = self.handle.restore_and_exit();
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
-        }
+        let _ = self.join_actor();
     }
 }

@@ -24,6 +24,10 @@ if [[ -n ${HOKAN_ACTIVE:-} && -n ${HOKAN_CONTROL_FIFO:-} && -z ${__HOKAN_ZSH_LOA
   typeset -g __hokan_last_path=''
   typeset -g __hokan_prompt_base="$PROMPT"
   typeset -g __hokan_wrapped_prompt=''
+  # The peer drops control frames above 64 KiB. Pushing a larger payload would
+  # only stall ZLE on the FIFO, so oversized buffers/commands degrade to the
+  # cheap BUFFERX/STARTX markers instead.
+  typeset -gi __hokan_payload_max_bytes=65000
   exec {__hokan_control_fd}>"$HOKAN_CONTROL_FIFO"
 
   function __hokan_prompt_marker() {
@@ -51,7 +55,8 @@ if [[ -n ${HOKAN_ACTIVE:-} && -n ${HOKAN_CONTROL_FIFO:-} && -z ${__HOKAN_ZSH_LOA
   }
 
   function __hokan_sync_path() {
-    if [[ "$PATH" != "$__hokan_last_path" ]]; then
+    setopt localoptions no_multibyte
+    if [[ "$PATH" != "$__hokan_last_path" && ${#PATH} -le $__hokan_payload_max_bytes ]]; then
       printf 'HKP2\tPATH\t%s\0' "$PATH" >&$__hokan_control_fd
       __hokan_last_path="$PATH"
     fi
@@ -72,20 +77,30 @@ if [[ -n ${HOKAN_ACTIVE:-} && -n ${HOKAN_CONTROL_FIFO:-} && -z ${__HOKAN_ZSH_LOA
   }
 
   function __hokan_preexec() {
+    setopt localoptions no_multibyte
     __hokan_last_command="$1"
     __hokan_command_active=1
-    printf 'HKP2\tSTART\t%s\0' "$1" >&$__hokan_control_fd
+    if (( ${#1} <= __hokan_payload_max_bytes )); then
+      printf 'HKP2\tSTART\t%s\0' "$1" >&$__hokan_control_fd
+    else
+      printf 'HKP2\tSTARTX\0' >&$__hokan_control_fd
+    fi
   }
 
   function __hokan_line_pre_redraw() {
     # Themes with async rendering (oh-my-posh) can overwrite PROMPT after the
     # precmd chain; re-assert the wrapper. The guard keeps this recursion-free.
+    setopt localoptions no_multibyte
     if [[ "$PROMPT" != "$__hokan_wrapped_prompt" ]]; then
       __hokan_refresh_prompt
     fi
     (( __hokan_redisplay_id++ ))
-    printf 'HKP2\tBUFFER\t%d\t%d\t%s\0' "$__hokan_redisplay_id" "$CURSOR" \
-      "$BUFFER" >&$__hokan_control_fd
+    if (( ${#BUFFER} <= __hokan_payload_max_bytes )); then
+      printf 'HKP2\tBUFFER\t%d\t%d\t%s\0' "$__hokan_redisplay_id" "$CURSOR" \
+        "$BUFFER" >&$__hokan_control_fd
+    else
+      printf 'HKP2\tBUFFERX\t%d\0' "$__hokan_redisplay_id" >&$__hokan_control_fd
+    fi
     # This marker begins a redraw. Hokan waits for the following PTY EAGAIN
     # boundary before treating the matching buffer snapshot as visible.
     __hokan_redisplay_marker
@@ -150,16 +165,22 @@ if [[ -n ${HOKAN_ACTIVE:-} && -n ${HOKAN_CONTROL_FIFO:-} && -z ${__HOKAN_BASH_LO
   __hokan_last_status=0
   __hokan_last_history=$(HISTTIMEFORMAT= builtin history 1)
   __hokan_last_path=''
+  # The peer drops control frames above 64 KiB. Oversized payloads degrade to
+  # the cheap STARTX marker rather than stalling the prompt on the FIFO.
+  __hokan_payload_max_bytes=65000
   exec 9>"$HOKAN_CONTROL_FIFO"
 
   __hokan_sync_path() {
-    if [[ "$PATH" != "$__hokan_last_path" ]]; then
+    if [[ "$PATH" != "$__hokan_last_path" && ${#PATH} -le $__hokan_payload_max_bytes ]]; then
       printf 'HKP2\tPATH\t%s\0' "$PATH" >&9
       __hokan_last_path="$PATH"
     fi
   }
 
   __hokan_prompt_command() {
+    # Byte counts, not characters: LC_ALL=C makes ${#var} measure bytes so the
+    # frame-size guard below matches the peer's byte-level cap.
+    local LC_ALL=C
     local current_history
     local last_command
     current_history=$(HISTTIMEFORMAT= builtin history 1)
@@ -168,7 +189,11 @@ if [[ -n ${HOKAN_ACTIVE:-} && -n ${HOKAN_CONTROL_FIFO:-} && -z ${__HOKAN_BASH_LO
       last_command=${last_command#"${last_command%%[![:space:]]*}"}
       last_command=${last_command#* }
       last_command=${last_command#"${last_command%%[![:space:]]*}"}
-      printf 'HKP2\tSTART\t%s\0' "$last_command" >&9
+      if (( ${#last_command} <= __hokan_payload_max_bytes )); then
+        printf 'HKP2\tSTART\t%s\0' "$last_command" >&9
+      else
+        printf 'HKP2\tSTARTX\0' >&9
+      fi
       printf 'HKP2\tEND\t%d\t%s\0' "$__hokan_last_status" "$PWD" >&9
       __hokan_last_history=$current_history
     fi
@@ -230,10 +255,15 @@ if test -n "$HOKAN_ACTIVE"; and test -n "$HOKAN_CONTROL_FIFO"; \
   set -g __HOKAN_FISH_LOADED 1
   set -g __hokan_prompt_id 0
   set -g __hokan_last_path ''
+  # The peer drops control frames above 64 KiB. string length counts
+  # characters, so stay under 16000 chars (64 KiB worth of 4-byte UTF-8) to
+  # guarantee the frame fits instead of stalling the shell on the FIFO.
+  set -g __hokan_payload_max_chars 15000
 
   function __hokan_sync_path
     set -l current_path (string join : -- $PATH)
-    if test "$current_path" != "$__hokan_last_path"
+    if test "$current_path" != "$__hokan_last_path"; \
+        and test (string length -- "$current_path") -le $__hokan_payload_max_chars
       printf 'HKP2\tPATH\t%s\0' "$current_path" >$HOKAN_CONTROL_FIFO
       set -g __hokan_last_path "$current_path"
     end
@@ -244,7 +274,11 @@ if test -n "$HOKAN_ACTIVE"; and test -n "$HOKAN_CONTROL_FIFO"; \
   end
 
   function __hokan_preexec --on-event fish_preexec
-    printf 'HKP2\tSTART\t%s\0' "$argv[1]" >$HOKAN_CONTROL_FIFO
+    if test (string length -- "$argv[1]") -le $__hokan_payload_max_chars
+      printf 'HKP2\tSTART\t%s\0' "$argv[1]" >$HOKAN_CONTROL_FIFO
+    else
+      printf 'HKP2\tSTARTX\0' >$HOKAN_CONTROL_FIFO
+    end
   end
 
   function __hokan_postexec --on-event fish_postexec

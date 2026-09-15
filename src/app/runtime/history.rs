@@ -18,6 +18,11 @@ pub(super) fn record_history(
     history: &Arc<RwLock<HistoryIndex>>,
     policy: &HistoryPolicy,
 ) -> crate::Result<()> {
+    if command.is_empty() {
+        // Oversized commands arrive via the shell's STARTX marker without
+        // their text; recording them would persist an empty row.
+        return Ok(());
+    }
     let timestamp_ms = crate::history_now_ms();
     state.previous_command = Some(command.clone());
     if !policy.allows(&command) {
