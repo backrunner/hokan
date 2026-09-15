@@ -58,7 +58,14 @@ command instead of automatic startup. New interactive zsh, bash, and fish
 sessions automatically start Hokan; the completion hook is loaded only in the
 managed child shell. The automatic wrapper preserves the underlying shell so
 .B hokan-leave
-can return to it.
+can return to it. When no Nerd Font is detected on the host,
+.B install
+also downloads the Symbols-Only Nerd Font into the user font directory so the
+overlay icons render; use
+.B --skip-font
+to opt out, or
+.BR "nerd_fonts = false"
+in the [ui] section to disable the icon column entirely.
 .TP
 .B setup
 Compatibility alias for
@@ -75,8 +82,8 @@ binaries remain owned by their package manager. Use
 to always preserve the executable.
 .TP
 .B doctor [--json]
-Inspect TTY, terminal, shell, configuration, directory permissions, AI, and
-active shell integration state.
+Inspect TTY, terminal, shell, configuration, directory permissions, AI, Nerd
+Font coverage, and active shell integration state.
 .TP
 .BI "config " path|show|validate|init
 Inspect, validate, or initialize the TOML configuration.

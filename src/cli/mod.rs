@@ -55,6 +55,9 @@ enum Command {
         /// Man page owned by the release installer.
         #[arg(long, hide = true, requires = "managed_install")]
         man_page: Option<PathBuf>,
+        /// Skip the Nerd Font check and bootstrap install.
+        #[arg(long)]
+        skip_font: bool,
     },
 
     /// Remove Hokan; installer-managed binaries are removed, while user data is preserved.
@@ -206,6 +209,7 @@ pub fn run<W: Write>(cli: Cli, output: &mut W) -> crate::Result<Option<SessionOp
             on_demand,
             managed_install,
             man_page,
+            skip_font,
         }) => {
             install::run_install(
                 output,
@@ -214,6 +218,7 @@ pub fn run<W: Write>(cli: Cli, output: &mut W) -> crate::Result<Option<SessionOp
                 on_demand,
                 managed_install,
                 man_page.as_deref(),
+                skip_font,
             )?;
             Ok(None)
         }

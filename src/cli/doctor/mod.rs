@@ -16,7 +16,8 @@ use crate::shell::PROTOCOL_VERSION;
 
 use checks::{
     configured_shell_ready, find_on_path, inspect_ai, inspect_ai_details, inspect_config,
-    inspect_data_directories, inspect_debug_logging, inspect_shell_integration, inspect_update,
+    inspect_data_directories, inspect_debug_logging, inspect_nerd_font, inspect_shell_integration,
+    inspect_update,
 };
 use zsh::inspect_zsh_rc_files;
 
@@ -81,6 +82,7 @@ struct DoctorReport {
     config_path: Option<String>,
     config: Check,
     key_bindings: Check,
+    nerd_font: Check,
     data_directories: BTreeMap<&'static str, Check>,
     debug_logging: Check,
     update: Check,
@@ -162,6 +164,7 @@ pub fn write_report(output: &mut dyn Write, json: bool) -> crate::Result<()> {
         writeln!(output, "config path: {path}")?;
     }
     write_check(output, "key bindings", &report.key_bindings)?;
+    write_check(output, "nerd font", &report.nerd_font)?;
     for (name, check) in &report.data_directories {
         write_check(output, &format!("{name} directory"), check)?;
     }
@@ -225,6 +228,7 @@ fn collect() -> DoctorReport {
         ("zsh", "exact-zle"),
     ]);
     let (paths, config, config_check, key_bindings) = inspect_config();
+    let nerd_font = inspect_nerd_font(config.as_ref());
     let data_directories = inspect_data_directories(paths.as_ref());
     let debug_logging = inspect_debug_logging(config.as_ref(), paths.as_ref());
     let current_exe = env::current_exe().unwrap_or_else(|_| PathBuf::from("hokan"));
@@ -255,6 +259,7 @@ fn collect() -> DoctorReport {
             .map(|paths| paths.config_file.display().to_string()),
         config: config_check,
         key_bindings,
+        nerd_font,
         data_directories,
         debug_logging,
         update: update.check,

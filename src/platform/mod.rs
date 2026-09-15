@@ -1,4 +1,5 @@
 mod command_probe;
+pub(crate) mod fonts;
 mod probe;
 
 pub use command_probe::CommandPathCache;

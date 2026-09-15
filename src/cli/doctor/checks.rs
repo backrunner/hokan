@@ -412,6 +412,48 @@ pub(super) fn inspect_control_channel(_: Option<&Path>, _: &Path) -> Check {
     Check::new(CheckLevel::NotApplicable, "FIFO checks unavailable")
 }
 
+/// Nerd Font coverage for the overlay icon column. Probing is best-effort:
+/// a terminal cannot be asked which font it renders with, so this checks
+/// terminals with bundled symbols, the configured font where readable, then
+/// the installed font files.
+pub(super) fn inspect_nerd_font(config: Option<&Config>) -> Check {
+    if config.is_some_and(|config| !config.ui.nerd_fonts) {
+        return Check::new(
+            CheckLevel::NotApplicable,
+            "overlay icons are disabled (ui.nerd_fonts = false)",
+        );
+    }
+    use crate::platform::fonts::NerdFontCoverage;
+    let probe = crate::platform::fonts::probe();
+    let note = probe
+        .note
+        .map(|note| format!("; {note}"))
+        .unwrap_or_default();
+    match probe.coverage {
+        NerdFontCoverage::Covered(detail) => Check::new(CheckLevel::Ok, format!("{detail}{note}")),
+        NerdFontCoverage::Installed(names) => {
+            let mut preview: Vec<&str> = names.iter().take(3).map(String::as_str).collect();
+            if names.len() > 3 {
+                preview.push("…");
+            }
+            Check::new(
+                CheckLevel::Ok,
+                format!("installed: {}{note}", preview.join(", ")),
+            )
+        }
+        NerdFontCoverage::Missing => Check::new(
+            CheckLevel::Warn,
+            format!(
+                "no Nerd Font found — overlay icons render as placeholder boxes; `hokan install` installs Symbols Nerd Font{note}"
+            ),
+        ),
+        NerdFontCoverage::RemoteClient => Check::new(
+            CheckLevel::NotApplicable,
+            "remote session — glyphs depend on the local terminal's font",
+        ),
+    }
+}
+
 pub(super) fn find_on_path(command: &str) -> Option<PathBuf> {
     let path = env::var_os("PATH")?;
     env::split_paths(&path)

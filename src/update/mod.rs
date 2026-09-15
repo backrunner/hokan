@@ -21,6 +21,7 @@ use semver::Version;
 use thiserror::Error;
 
 pub use api::{ReleaseInfo, fetch_latest};
+pub(crate) use api::{block_on, download, download_client};
 
 /// Production GitHub API base; injectable through [`UpgradePaths`] for tests.
 pub const DEFAULT_API_BASE: &str = "https://api.github.com";

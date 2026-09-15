@@ -45,6 +45,7 @@ pub fn run_install(
     on_demand: bool,
     managed_install: bool,
     man_page: Option<&Path>,
+    skip_font: bool,
 ) -> crate::Result<()> {
     let executable = env::current_exe()?;
     run_install_with_executable(
@@ -54,10 +55,12 @@ pub fn run_install(
         on_demand,
         managed_install,
         man_page,
+        skip_font,
         &executable,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_install_with_executable(
     output: &mut dyn Write,
     shell: Option<ShellKind>,
@@ -65,6 +68,7 @@ fn run_install_with_executable(
     on_demand: bool,
     managed_install: bool,
     man_page: Option<&Path>,
+    skip_font: bool,
     executable: &Path,
 ) -> crate::Result<()> {
     let receipt_path = receipt_path(executable)?;
@@ -95,8 +99,54 @@ fn run_install_with_executable(
         receipt.integrations.push(target);
         write_receipt(&receipt_path, &receipt)?;
     }
+    if !skip_font {
+        write_font_setup(output);
+    }
     writeln!(output, "ready: open a new terminal session to start Hokan")?;
     Ok(())
+}
+
+/// Bootstraps a Nerd Font when the overlay would otherwise render
+/// placeholder boxes. Failures are reported, never fatal — a missing font
+/// only degrades the icon column.
+fn write_font_setup(output: &mut dyn Write) {
+    use crate::platform::fonts::{FontSetup, ensure_nerd_font};
+    if icons_disabled_by_config() {
+        let _ = writeln!(output, "nerd font: skipped (ui.nerd_fonts = false)");
+        return;
+    }
+    match ensure_nerd_font() {
+        Ok(FontSetup::AlreadyCovered(detail)) => {
+            let _ = writeln!(output, "nerd font: {detail}");
+        }
+        Ok(FontSetup::Installed(paths)) => {
+            for path in &paths {
+                let _ = writeln!(output, "nerd font: installed {}", path.display());
+            }
+            let _ = writeln!(
+                output,
+                "nerd font: if icons still render as boxes, select a Nerd Font in the terminal profile"
+            );
+        }
+        Ok(FontSetup::Skipped(reason)) => {
+            let _ = writeln!(output, "nerd font: {reason}");
+        }
+        Err(error) => {
+            let _ = writeln!(
+                output,
+                "nerd font: could not install ({error}) — run `hokan doctor` for details"
+            );
+        }
+    }
+}
+
+/// An explicit `ui.nerd_fonts = false` opts the user out of the font
+/// bootstrap; a missing or unreadable config keeps the default behavior.
+fn icons_disabled_by_config() -> bool {
+    crate::config::ConfigPaths::discover()
+        .and_then(|paths| crate::config::Config::load(&paths.config_file))
+        .map(|config| !config.ui.nerd_fonts)
+        .unwrap_or(false)
 }
 
 pub fn run_uninstall(
@@ -361,6 +411,7 @@ mod tests {
             false,
             true,
             Some(&man_page),
+            true,
             &executable,
         )
         .expect("managed install");
@@ -401,6 +452,7 @@ mod tests {
             false,
             true,
             Some(&man_page),
+            true,
             &executable,
         )
         .expect("managed install");
@@ -429,6 +481,7 @@ mod tests {
             false,
             false,
             None,
+            true,
             &executable,
         )
         .expect("unmanaged install");
@@ -468,6 +521,7 @@ mod tests {
             false,
             true,
             Some(&unrelated),
+            true,
             &executable,
         )
         .expect_err("unexpected man path must be rejected");
