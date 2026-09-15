@@ -158,6 +158,7 @@ impl ProjectProvider {
                     diagnostics: vec![ProviderDiagnostic {
                         provider: self.id(),
                         code: "HK-PROJ-001",
+                        level: crate::completion::DiagnosticLevel::Warning,
                         message: error.to_string(),
                     }],
                 };
@@ -303,6 +304,7 @@ impl ProjectProvider {
                 Err(error) => output.diagnostics.push(ProviderDiagnostic {
                     provider: self.id(),
                     code: "HK-PROJ-001",
+                    level: crate::completion::DiagnosticLevel::Warning,
                     message: error.to_string(),
                 }),
             }
@@ -381,6 +383,7 @@ impl ProjectProvider {
                 output.diagnostics.push(ProviderDiagnostic {
                     provider: self.id(),
                     code: "HK-PROJ-001",
+                    level: crate::completion::DiagnosticLevel::Warning,
                     message: error.to_string(),
                 });
                 return output;
@@ -855,6 +858,7 @@ impl ProjectProvider {
                     diagnostics: vec![ProviderDiagnostic {
                         provider: self.id(),
                         code: "HK-PROJ-002",
+                        level: crate::completion::DiagnosticLevel::Warning,
                         message: error.to_string(),
                     }],
                 };

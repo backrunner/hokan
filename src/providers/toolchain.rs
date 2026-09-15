@@ -129,6 +129,13 @@ pub struct ToolchainProvider {
     go: Mutex<HashMap<PathBuf, Timed<GoProject>>>,
     cmake: Mutex<HashMap<PathBuf, Timed<Vec<NamedItem>>>>,
     ninja: Mutex<HashMap<PathBuf, Timed<Vec<NamedItem>>>>,
+    /// `~/.rustup/toolchains` scan — a `rustup` slot typing burst must not
+    /// re-walk the toolchain directories on every keystroke.
+    rust_toolchains: super::TtlSlot<Vec<String>>,
+    /// Per-selector `lib/rustlib` target scan, same rationale.
+    rust_targets: Mutex<HashMap<String, Timed<Vec<String>>>>,
+    /// `go tool` listing keyed by (toolchain root, project dir).
+    go_tools: Mutex<GoToolEntries>,
 }
 
 impl ToolchainProvider {
@@ -140,6 +147,9 @@ impl ToolchainProvider {
             go: Mutex::new(HashMap::new()),
             cmake: Mutex::new(HashMap::new()),
             ninja: Mutex::new(HashMap::new()),
+            rust_toolchains: super::TtlSlot::new(CACHE_TTL),
+            rust_targets: Mutex::new(HashMap::new()),
+            go_tools: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -166,17 +176,23 @@ impl CandidateProvider for ToolchainProvider {
                 (*source).to_owned(),
             ),
             ToolchainKind::RustToolchain => (
-                installed_rust_toolchains()
-                    .into_iter()
-                    .map(|name| NamedItem::new(name, "已安装 Rust toolchain"))
+                self.rust_toolchains
+                    .get_or(installed_rust_toolchains)
+                    .iter()
+                    .map(|name| NamedItem::new(name.clone(), "已安装 Rust toolchain"))
                     .collect(),
                 "rustup".to_owned(),
             ),
             ToolchainKind::RustTarget { toolchain } => (
-                installed_rust_targets(toolchain.as_deref())
-                    .into_iter()
-                    .map(|name| NamedItem::new(name, "已安装 Rust target"))
-                    .collect(),
+                cached(
+                    &self.rust_targets,
+                    toolchain.clone().unwrap_or_default(),
+                    || Some(installed_rust_targets(toolchain.as_deref())),
+                )
+                .unwrap_or_default()
+                .iter()
+                .map(|name| NamedItem::new(name.clone(), "已安装 Rust target"))
+                .collect(),
                 "rustup-targets".to_owned(),
             ),
             ToolchainKind::Cargo {
@@ -200,7 +216,16 @@ impl CandidateProvider for ToolchainProvider {
             ToolchainKind::GoTool {
                 executable,
                 project_dir,
-            } => (go_tool_items(executable, project_dir), "go-tool".to_owned()),
+            } => (
+                cached(
+                    &self.go_tools,
+                    (canonical_or(executable.clone()), project_dir.clone()),
+                    || Some(go_tool_items(executable, project_dir)),
+                )
+                .map(|items| items.iter().cloned().collect())
+                .unwrap_or_default(),
+                "go-tool".to_owned(),
+            ),
             ToolchainKind::CmakePreset { project_dir, kind } => (
                 self.cmake_items(project_dir, *kind),
                 "cmake-presets".to_owned(),
@@ -281,15 +306,22 @@ struct Timed<T> {
     value: Option<Arc<T>>,
 }
 
+/// `go tool` listings keyed by (canonical toolchain executable, project
+/// directory).
+type GoToolEntries = HashMap<(PathBuf, PathBuf), Timed<Vec<NamedItem>>>;
+
 fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
     value.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-fn cached<T>(
-    cache: &Mutex<HashMap<PathBuf, Timed<T>>>,
-    key: PathBuf,
+fn cached<K, T>(
+    cache: &Mutex<HashMap<K, Timed<T>>>,
+    key: K,
     load: impl FnOnce() -> Option<T>,
-) -> Option<Arc<T>> {
+) -> Option<Arc<T>>
+where
+    K: Eq + std::hash::Hash,
+{
     if let Some(entry) = lock(cache).get(&key)
         && entry.loaded.elapsed() < CACHE_TTL
     {

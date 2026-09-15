@@ -1,20 +1,23 @@
 //! Git repository context for intent-aware `git` completion: where the cwd
 //! sits relative to a repository and what the repository's state is. The
 //! status probe runs `git status --porcelain` through the bounded platform
-//! runner and is cached briefly so a burst of keystrokes costs at most one
-//! subprocess.
+//! runner on a background thread and is cached briefly so a burst of
+//! keystrokes costs at most one subprocess — and the completion worker
+//! never waits on it.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
+    panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    thread,
     time::{Duration, Instant},
 };
 
 /// How long a cached repository context is trusted. Short enough that a
 /// commit made in another terminal shows up quickly, long enough that typing
-/// a full command never spawns `git status` twice.
+/// a full command never needs a second `git status` probe.
 const STATUS_TTL: Duration = Duration::from_millis(2_000);
 /// `git status` on a huge or NFS-backed repository must never stall the
 /// completion worker; on timeout the context degrades to "unknown".
@@ -27,6 +30,10 @@ const MAX_WALK_UP: usize = 8;
 const REFS_TTL: Duration = Duration::from_millis(2_000);
 const REFS_TIMEOUT: Duration = Duration::from_millis(800);
 const REFS_MAX_OUTPUT_BYTES: usize = 256 * 1024;
+/// A stale entry is still served while a background probe refreshes it, but
+/// only up to this bound: returning to a long-idle session must not reuse
+/// repository state captured hours ago.
+const STALE_SERVE_MAX: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GitContext {
@@ -54,6 +61,10 @@ pub struct GitStatus {
 #[derive(Debug, Default)]
 pub struct GitStatusCache {
     entries: Mutex<HashMap<PathBuf, CacheEntry>>,
+    /// Directories with an in-flight probe, so a burst of keystrokes (or a
+    /// probe slower than the typing cadence) never stacks up `git status`
+    /// subprocesses.
+    pending: Mutex<HashSet<PathBuf>>,
 }
 
 #[derive(Debug)]
@@ -62,27 +73,105 @@ struct CacheEntry {
     context: GitContext,
 }
 
+enum Cached<T> {
+    Fresh(T),
+    /// Trusted data past its TTL: still served, but a background refresh is
+    /// requested so the next lookup sees current state.
+    Stale(T),
+}
+
+fn classify<T>(entry: Option<(&Instant, &T)>, ttl: Duration) -> Option<Cached<T>>
+where
+    T: Clone,
+{
+    match entry {
+        Some((at, value)) if at.elapsed() < ttl => Some(Cached::Fresh(value.clone())),
+        Some((at, value)) if at.elapsed() < STALE_SERVE_MAX => Some(Cached::Stale(value.clone())),
+        _ => None,
+    }
+}
+
 impl GitStatusCache {
-    pub fn context_for(&self, cwd: &Path) -> GitContext {
-        if let Some(entry) = self.entries.lock().ok().and_then(|entries| {
-            entries
-                .get(cwd)
-                .filter(|entry| entry.at.elapsed() < STATUS_TTL)
-                .map(|entry| entry.context.clone())
-        }) {
-            return entry;
+    /// Non-blocking repository context: fresh entries are returned as-is,
+    /// stale entries are served while a background probe refreshes them, and
+    /// a cold or long-stale lookup requests a probe and degrades to
+    /// `RepositoryUnknown`. A `git status` run must never stall the
+    /// completion worker.
+    pub fn context_for(self: &Arc<Self>, cwd: &Path) -> GitContext {
+        let hit = self.entries.lock().ok().and_then(|entries| {
+            classify(
+                entries.get(cwd).map(|entry| (&entry.at, &entry.context)),
+                STATUS_TTL,
+            )
+        });
+        match hit {
+            Some(Cached::Fresh(context)) => context,
+            Some(Cached::Stale(context)) => {
+                self.request_probe(cwd);
+                context
+            }
+            None => {
+                self.request_probe(cwd);
+                GitContext::RepositoryUnknown
+            }
         }
+    }
+
+    /// Queue a background status probe unless one is already in flight.
+    /// `GitProvider::applies` calls this so the probe usually lands before
+    /// the first `complete` that needs it.
+    pub fn request_probe(self: &Arc<Self>, cwd: &Path) {
+        {
+            let Ok(mut pending) = self.pending.lock() else {
+                return;
+            };
+            if !pending.insert(cwd.to_owned()) {
+                return;
+            }
+        }
+        let cache = Arc::clone(self);
+        let directory = cwd.to_owned();
+        let spawned = thread::Builder::new()
+            .name("hokan-git-status".into())
+            .spawn(move || {
+                // A panicking probe must still clear `pending`, otherwise the
+                // directory would never be retried.
+                let context = catch_unwind(AssertUnwindSafe(|| probe(&directory)))
+                    .unwrap_or(GitContext::RepositoryUnknown);
+                if let Ok(mut entries) = cache.entries.lock() {
+                    entries.insert(
+                        directory.clone(),
+                        CacheEntry {
+                            at: Instant::now(),
+                            context,
+                        },
+                    );
+                }
+                if let Ok(mut pending) = cache.pending.lock() {
+                    pending.remove(&directory);
+                }
+            });
+        if spawned.is_err()
+            && let Ok(mut pending) = self.pending.lock()
+        {
+            pending.remove(cwd);
+        }
+    }
+
+    /// Run the probe synchronously — used by tests that need a repository
+    /// context on the very first `complete` call.
+    #[cfg(test)]
+    pub(crate) fn probe_now(&self, cwd: &Path) {
         let context = probe(cwd);
         if let Ok(mut entries) = self.entries.lock() {
             entries.insert(
                 cwd.to_owned(),
                 CacheEntry {
                     at: Instant::now(),
-                    context: context.clone(),
+                    context,
                 },
             );
         }
-        context
     }
 }
 
@@ -111,6 +200,16 @@ fn probe(cwd: &Path) -> GitContext {
     GitContext::Repository(parse_status(&String::from_utf8_lossy(&output.stdout)))
 }
 
+/// A recent commit for revision slots (`git cherry-pick <hash>` and
+/// friends).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitCommit {
+    /// Abbreviated object name — what the user types.
+    pub hash: String,
+    /// Subject line, shown as the row description.
+    pub subject: String,
+}
+
 /// Branch/remote/tag listing of a repository, used by ref completion
 /// (`git checkout <…>` and friends).
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -124,46 +223,109 @@ pub struct GitRefs {
     /// Bare remote names derived from the remote-tracking refs (`origin`).
     pub remote_names: Vec<String>,
     pub tags: Vec<String>,
+    /// Recent commits across all refs, newest first — for `cherry-pick`,
+    /// `revert`, `reset`, `rebase --onto`, and similar revision slots.
+    pub commits: Vec<GitCommit>,
 }
 
 /// Short-TTL cache of ref listings keyed by repository root, mirroring
 /// [`GitStatusCache`]: one bounded `for-each-ref` run per burst of
-/// keystrokes.
+/// keystrokes, executed on a background thread so the completion worker
+/// never waits on it.
 #[derive(Debug, Default)]
 pub struct GitRefsCache {
     entries: Mutex<HashMap<PathBuf, RefsEntry>>,
+    /// Repository roots with an in-flight probe — same dedupe as the status
+    /// cache.
+    pending: Mutex<HashSet<PathBuf>>,
 }
 
 #[derive(Debug)]
 struct RefsEntry {
     at: Instant,
-    refs: Arc<GitRefs>,
+    /// `None` is a cached probe failure: a missing or broken `git` must not
+    /// respawn `for-each-ref` on every keystroke.
+    refs: Option<Arc<GitRefs>>,
 }
 
 impl GitRefsCache {
-    /// `None` outside a repository or when the probe fails — ref completion
-    /// stays silent rather than guessing.
-    pub fn refs_for(&self, cwd: &Path) -> Option<Arc<GitRefs>> {
+    /// `None` outside a repository, while a cold probe is still in flight,
+    /// or when the probe keeps failing — ref completion stays silent rather
+    /// than guessing or blocking.
+    pub fn refs_for(self: &Arc<Self>, cwd: &Path) -> Option<Arc<GitRefs>> {
         let root = find_repo_root(cwd)?;
-        if let Some(refs) = self.entries.lock().ok().and_then(|entries| {
-            entries
-                .get(&root)
-                .filter(|entry| entry.at.elapsed() < REFS_TTL)
-                .map(|entry| Arc::clone(&entry.refs))
-        }) {
-            return Some(refs);
+        let hit = self.entries.lock().ok().and_then(|entries| {
+            classify(
+                entries.get(&root).map(|entry| (&entry.at, &entry.refs)),
+                REFS_TTL,
+            )
+        });
+        match hit {
+            Some(Cached::Fresh(refs)) => refs,
+            Some(Cached::Stale(refs)) => {
+                self.request_probe(root);
+                refs
+            }
+            None => {
+                self.request_probe(root);
+                None
+            }
         }
-        let refs = probe_refs(&root)?;
+    }
+
+    fn request_probe(self: &Arc<Self>, root: PathBuf) {
+        {
+            let Ok(mut pending) = self.pending.lock() else {
+                return;
+            };
+            if !pending.insert(root.clone()) {
+                return;
+            }
+        }
+        let cache = Arc::clone(self);
+        let directory = root.clone();
+        let spawned = thread::Builder::new()
+            .name("hokan-git-refs".into())
+            .spawn(move || {
+                let refs =
+                    catch_unwind(AssertUnwindSafe(|| probe_refs(&directory))).unwrap_or(None);
+                if let Ok(mut entries) = cache.entries.lock() {
+                    entries.insert(
+                        directory.clone(),
+                        RefsEntry {
+                            at: Instant::now(),
+                            refs,
+                        },
+                    );
+                }
+                if let Ok(mut pending) = cache.pending.lock() {
+                    pending.remove(&directory);
+                }
+            });
+        if spawned.is_err()
+            && let Ok(mut pending) = self.pending.lock()
+        {
+            pending.remove(&root);
+        }
+    }
+
+    /// Run the probe synchronously — used by tests that need ref rows on
+    /// the very first `complete` call.
+    #[cfg(test)]
+    pub(crate) fn probe_now(&self, cwd: &Path) {
+        let Some(root) = find_repo_root(cwd) else {
+            return;
+        };
+        let refs = probe_refs(&root);
         if let Ok(mut entries) = self.entries.lock() {
             entries.insert(
                 root,
                 RefsEntry {
                     at: Instant::now(),
-                    refs: Arc::clone(&refs),
+                    refs,
                 },
             );
         }
-        Some(refs)
     }
 }
 
@@ -188,9 +350,50 @@ fn probe_refs(root: &Path) -> Option<Arc<GitRefs>> {
     if !output.status.success() {
         return None;
     }
-    Some(Arc::new(parse_refs(&String::from_utf8_lossy(
-        &output.stdout,
-    ))))
+    let mut refs = parse_refs(&String::from_utf8_lossy(&output.stdout));
+    refs.commits = probe_commits(root);
+    Some(Arc::new(refs))
+}
+
+/// Recent commits across every ref. `--all` matters for `cherry-pick`: the
+/// commit the user wants usually lives on another branch. An unborn HEAD
+/// (fresh repository) fails the `log` probe — that is not a ref failure, so
+/// commits degrade to an empty list instead of poisoning the whole entry.
+fn probe_commits(root: &Path) -> Vec<GitCommit> {
+    let Ok(output) = crate::platform::run_bounded(
+        "git",
+        [
+            "-C",
+            root.to_str().unwrap_or("."),
+            "log",
+            "--all",
+            "--format=%h%x09%s",
+            "--max-count=200",
+            "--no-show-signature",
+        ],
+        REFS_TIMEOUT,
+        REFS_MAX_OUTPUT_BYTES,
+    ) else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    parse_commits(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_commits(text: &str) -> Vec<GitCommit> {
+    text.lines()
+        .filter_map(|line| {
+            // Subjects may themselves contain tabs; an empty subject leaves
+            // the line as a bare hash, which still completes fine.
+            let (hash, subject) = line.split_once('\t').unwrap_or((line, ""));
+            (!hash.is_empty()).then(|| GitCommit {
+                hash: hash.to_owned(),
+                subject: subject.to_owned(),
+            })
+        })
+        .collect()
 }
 
 /// Parses `%(HEAD)%09%(refname)` lines into short names grouped by kind.
@@ -332,6 +535,17 @@ mod tests {
         assert_eq!(refs.tags, ["v1"]);
     }
 
+    #[test]
+    fn parses_commit_lines_and_keeps_tabbed_or_empty_subjects() {
+        let commits = parse_commits("a1b2c3\tfix login\tagain\nd4e5f6\tplain subject\n789abc\n\n");
+        assert_eq!(commits.len(), 3);
+        assert_eq!(commits[0].hash, "a1b2c3");
+        assert_eq!(commits[0].subject, "fix login\tagain");
+        assert_eq!(commits[1].subject, "plain subject");
+        assert_eq!(commits[2].hash, "789abc");
+        assert_eq!(commits[2].subject, "");
+    }
+
     fn git_available() -> bool {
         crate::platform::run_bounded("git", ["--version"], Duration::from_secs(2), 1024)
             .is_ok_and(|output| output.status.success())
@@ -376,7 +590,8 @@ mod tests {
         );
         git(root.path(), &["branch", "tmp"]);
 
-        let cache = GitRefsCache::default();
+        let cache = Arc::new(GitRefsCache::default());
+        cache.probe_now(root.path());
         let first = cache.refs_for(root.path()).expect("refs");
         assert_eq!(first.current.as_deref(), Some("main"));
         assert!(first.locals.iter().any(|name| name == "tmp"));
@@ -391,5 +606,54 @@ mod tests {
         // Outside a repository there is nothing to offer.
         let plain = tempfile::tempdir().expect("plain");
         assert!(cache.refs_for(plain.path()).is_none());
+    }
+
+    #[test]
+    fn cold_lookups_never_block_and_are_filled_by_a_background_probe() {
+        if !git_available() {
+            return;
+        }
+        let root = tempfile::tempdir().expect("repo");
+        git(root.path(), &["init", "-q", "-b", "main"]);
+        fs::write(root.path().join("a.txt"), b"a").expect("file");
+        git(root.path(), &["add", "-A"]);
+        git(
+            root.path(),
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "init",
+            ],
+        );
+
+        let status = Arc::new(GitStatusCache::default());
+        let refs = Arc::new(GitRefsCache::default());
+
+        // Cold caches return immediately with the degraded values instead of
+        // running `git` on the completion worker.
+        assert_eq!(
+            status.context_for(root.path()),
+            GitContext::RepositoryUnknown
+        );
+        assert!(refs.refs_for(root.path()).is_none());
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !matches!(status.context_for(root.path()), GitContext::Repository(_))
+            || refs.refs_for(root.path()).is_none()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "background probes never filled the caches"
+            );
+            thread::yield_now();
+        }
+        assert_eq!(
+            refs.refs_for(root.path()).expect("refs").current.as_deref(),
+            Some("main")
+        );
     }
 }

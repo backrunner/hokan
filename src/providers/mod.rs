@@ -32,6 +32,42 @@ pub use toolchain::ToolchainProvider;
 
 use crate::{completion::CompletionContext, parser::TokenKind};
 
+/// Single-entry cache that re-runs `load` at most once per TTL. Used for
+/// provider data produced by a subprocess or directory scan that is too
+/// slow for every keystroke but cheap to serve a moment stale.
+pub(super) struct TtlSlot<T> {
+    ttl: std::time::Duration,
+    value: std::sync::Mutex<Option<(std::time::Instant, std::sync::Arc<T>)>>,
+}
+
+impl<T> TtlSlot<T> {
+    pub(super) fn new(ttl: std::time::Duration) -> Self {
+        Self {
+            ttl,
+            value: std::sync::Mutex::new(None),
+        }
+    }
+
+    pub(super) fn get_or(&self, load: impl FnOnce() -> T) -> std::sync::Arc<T> {
+        if let Some((at, value)) = self
+            .value
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            && at.elapsed() < self.ttl
+        {
+            return std::sync::Arc::clone(value);
+        }
+        let value = std::sync::Arc::new(load());
+        *self
+            .value
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some((std::time::Instant::now(), std::sync::Arc::clone(&value)));
+        value
+    }
+}
+
 /// Builtins and reserved words are shell-specific. Exact and prefix checks
 /// use the same selected table so history filtering and natural-language
 /// detection cannot disagree, without treating zsh-only words as Bash

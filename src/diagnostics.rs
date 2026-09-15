@@ -34,8 +34,20 @@ impl DebugLog {
         if !config.enabled {
             return Ok(None);
         }
-        fs::create_dir_all(state_directory)?;
-        fs::set_permissions(state_directory, fs::Permissions::from_mode(0o700))?;
+        fs::create_dir_all(state_directory).map_err(|error| {
+            crate::Error::Config(format!(
+                "cannot create state directory {}: {error}",
+                state_directory.display()
+            ))
+        })?;
+        fs::set_permissions(state_directory, fs::Permissions::from_mode(0o700)).map_err(
+            |error| {
+                crate::Error::Config(format!(
+                    "cannot secure state directory {}: {error}",
+                    state_directory.display()
+                ))
+            },
+        )?;
         let log = Self {
             path: state_directory.join(LOG_NAME),
             lock_path: state_directory.join(LOCK_NAME),
@@ -79,6 +91,22 @@ impl DebugLog {
                 ),
                 ("candidate_count", json!(candidate_count)),
                 ("cancelled", json!(cancelled)),
+            ],
+        );
+    }
+
+    pub fn provider_diagnostic(
+        &self,
+        provider: &'static str,
+        code: &'static str,
+        level: crate::completion::DiagnosticLevel,
+    ) {
+        self.record(
+            "provider-diagnostic",
+            [
+                ("provider", Value::String(provider.into())),
+                ("code", Value::String(code.into())),
+                ("level", Value::String(level.name().into())),
             ],
         );
     }

@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    fs,
     panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
     sync::{
@@ -76,13 +77,65 @@ impl CommandHelp {
     }
 }
 
+/// Fingerprint of the binary a help entry was probed from. Checked whenever
+/// an entry is read or replaced so an upgraded executable (same path, new
+/// build) invalidates its cached help — not just a PATH resolution change.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExecutableStamp {
+    /// The resolution the entry was probed for; also serves as the cache's
+    /// path-matching key so a PATH change still invalidates.
+    path: PathBuf,
+    /// The file's contents fingerprint at fetch time. `None` when the file
+    /// could not be stat'd then — a binary appearing later at the same path
+    /// (previously a permanent stale negative entry) now invalidates too.
+    file: Option<FileStamp>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileStamp {
+    length: u64,
+    modified_ns: u128,
+}
+
+impl FileStamp {
+    fn for_path(path: &Path) -> Option<Self> {
+        let metadata = fs::metadata(path).ok()?;
+        Some(Self {
+            length: metadata.len(),
+            modified_ns: metadata
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0),
+        })
+    }
+}
+
+impl ExecutableStamp {
+    fn resolved(path: PathBuf) -> Self {
+        Self {
+            file: FileStamp::for_path(&path),
+            path,
+        }
+    }
+
+    /// One `stat` to confirm the recorded file is still what was probed —
+    /// or still absent when `file` is `None`. Cheap compared to a
+    /// `man`/`--help` fetch, so staleness is caught at read time instead of
+    /// only when a new request happens to fire.
+    fn is_current(&self) -> bool {
+        FileStamp::for_path(&self.path) == self.file
+    }
+}
+
 /// Session-scoped command → parsed help cache. Negative results (man failed,
 /// page unparsable, `--help` fallback empty) are cached as empty entries so a
 /// missing or slow page costs at most one bounded fetch per command per
 /// session. Shared between the help provider (which fetches) and the
 /// filesystem provider (which only peeks) so the suppression check never
 /// spawns a subprocess.
-type CommandHelpEntries = HashMap<String, (Option<PathBuf>, Arc<CommandHelp>)>;
+type CommandHelpEntries = HashMap<String, (Option<ExecutableStamp>, Arc<CommandHelp>)>;
 
 #[derive(Default)]
 pub struct CommandHelpCache {
@@ -94,12 +147,21 @@ pub struct CommandHelpCache {
 
 impl CommandHelpCache {
     /// Cached entry only; never runs `man`. Cheap enough for `applies`-time
-    /// suppression checks in other providers.
+    /// suppression checks in other providers. Entries stamped from a binary
+    /// are revalidated against the file so an in-place upgrade drops the
+    /// entry instead of serving stale help for the rest of the session.
     #[must_use]
     pub fn peek(&self, command: &str) -> Option<Arc<CommandHelp>> {
-        lock(&self.entries)
-            .get(command)
-            .map(|(_, help)| Arc::clone(help))
+        let mut entries = lock(&self.entries);
+        let stale = matches!(
+            entries.get(command),
+            Some((Some(stamp), _)) if !stamp.is_current()
+        );
+        if stale {
+            entries.remove(command);
+            return None;
+        }
+        entries.get(command).map(|(_, help)| Arc::clone(help))
     }
 
     #[must_use]
@@ -181,7 +243,7 @@ impl CommandHelpCache {
             let mut entries = lock(&self.entries);
             if entries
                 .get(command)
-                .is_some_and(|(cached_path, _)| cache_path_matches(cached_path, &executable))
+                .is_some_and(|entry| entry_satisfies(entry, &executable))
             {
                 return;
             }
@@ -201,7 +263,7 @@ impl CommandHelpCache {
         // first lookup and the pending insertion.
         if lock(&self.entries)
             .get(command)
-            .is_some_and(|(cached_path, _)| cache_path_matches(cached_path, &executable))
+            .is_some_and(|entry| entry_satisfies(entry, &executable))
         {
             let mut pending = lock(&self.pending);
             if pending.get(command) == Some(&executable) {
@@ -224,12 +286,14 @@ impl CommandHelpCache {
                 let current = pending.get(&command) == Some(&executable);
                 let inserted = current && {
                     let mut entries = lock(&cache.entries);
-                    if entries.get(&command).is_some_and(|(cached_path, _)| {
-                        cache_path_matches(cached_path, &executable)
-                    }) {
+                    if entries
+                        .get(&command)
+                        .is_some_and(|entry| entry_satisfies(entry, &executable))
+                    {
                         false
                     } else {
-                        entries.insert(command.clone(), (executable.clone(), Arc::new(fetched)));
+                        let stamp = executable.clone().map(ExecutableStamp::resolved);
+                        entries.insert(command.clone(), (stamp, Arc::new(fetched)));
                         true
                     }
                 };
@@ -310,8 +374,16 @@ fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
     value.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-fn cache_path_matches(cached: &Option<PathBuf>, requested: &Option<PathBuf>) -> bool {
-    cached.is_none() || cached == requested
+/// An entry is usable for `requested` when it was probed from the same
+/// binary path (or carries no stamp at all — test seeds and explicit `get`
+/// fills) and that binary is still on disk unchanged.
+fn entry_satisfies(
+    entry: &(Option<ExecutableStamp>, Arc<CommandHelp>),
+    requested: &Option<PathBuf>,
+) -> bool {
+    let (stamp, _) = entry;
+    (stamp.is_none() || stamp.as_ref().map(|stamp| &stamp.path) == requested.as_ref())
+        && stamp.as_ref().is_none_or(ExecutableStamp::is_current)
 }
 
 pub struct CommandHelpProvider {
@@ -3391,6 +3463,62 @@ work on the current change
                 subcommands_exhaustive: false,
             }
         });
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while cache
+            .peek("demo")
+            .is_none_or(|help| help.subcommands[0].name != "second")
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            cache.peek("demo").expect("second help").subcommands[0].name,
+            "second"
+        );
+        assert_eq!(cache.fetch_count(), 2);
+    }
+
+    #[test]
+    fn in_place_executable_upgrade_invalidates_cached_help() {
+        fn help(name: &str) -> CommandHelp {
+            CommandHelp {
+                flags: Vec::new(),
+                subcommands: vec![HelpEntry {
+                    name: name.to_owned(),
+                    description: String::new(),
+                    takes_value: false,
+                }],
+                subcommand_aliases: Vec::new(),
+                accepts_positionals: false,
+                subcommands_exhaustive: false,
+            }
+        }
+
+        let directory = tempfile::tempdir().expect("command directory");
+        let executable = directory.path().join("demo");
+        fs::write(&executable, b"#!/bin/sh\n").expect("binary");
+
+        let cache = Arc::new(CommandHelpCache::default());
+        cache.request_with_path("demo", Some(executable.clone()), |_| help("first"));
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while cache.peek("demo").is_none() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            cache.peek("demo").expect("first help").subcommands[0].name,
+            "first"
+        );
+
+        // A same-path rebuild must not serve the old binary's help: the
+        // stamp check at read time drops the entry and the next request
+        // refetches.
+        fs::write(&executable, b"#!/bin/sh\nexec real-demo --upgraded\n").expect("upgrade");
+        assert!(
+            cache.peek("demo").is_none(),
+            "an in-place upgrade must invalidate the stamped entry"
+        );
+
+        cache.request_with_path("demo", Some(executable.clone()), |_| help("second"));
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
         while cache
             .peek("demo")

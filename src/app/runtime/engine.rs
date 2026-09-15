@@ -186,7 +186,7 @@ pub(super) fn build_engine(
     // source must never consume the query budget before `proj skillscat` can
     // continue `proj `.
     engine.register(crate::providers::AliasProvider::new(Arc::clone(&aliases)));
-    engine.register(ProcessProvider);
+    engine.register(ProcessProvider::new());
     engine.register(NetworkInterfaceProvider::new(Arc::clone(&commands)));
     // Directory scans have the largest local latency budget. Keep semantic,
     // PATH, and history providers ahead of them so a large cwd cannot starve

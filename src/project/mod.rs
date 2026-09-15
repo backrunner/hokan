@@ -4,7 +4,7 @@ mod node_workspace;
 mod package_json;
 mod workspace;
 
-pub use git::{GitContext, GitRefs, GitRefsCache, GitStatus, GitStatusCache};
+pub use git::{GitCommit, GitContext, GitRefs, GitRefsCache, GitStatus, GitStatusCache};
 pub use makefile::{MakeTarget, MakefileCache, MakefileManifest, ManifestKind, discover_makefile};
 pub use node_workspace::{
     NodeWorkspace, NodeWorkspaceCache, WorkspaceMember, discover_node_workspace,

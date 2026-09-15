@@ -234,8 +234,17 @@ pub(super) fn handle_provider_result(
     state.status = result
         .output
         .diagnostics
-        .first()
+        .iter()
+        .find(|diagnostic| diagnostic.level == crate::completion::DiagnosticLevel::Warning)
         .map(|diagnostic| format!("{} {}", diagnostic.code, diagnostic.message));
+    if result.final_batch
+        && !result.output.diagnostics.is_empty()
+        && let Some(log) = &state.debug_log
+    {
+        for diagnostic in &result.output.diagnostics {
+            log.provider_diagnostic(diagnostic.provider, diagnostic.code, diagnostic.level);
+        }
+    }
     if state.candidates.is_empty() && state.status.is_none() {
         state.overlay_visible = false;
         output.hide_overlay().map_err(output_error)?;

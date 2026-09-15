@@ -16,6 +16,12 @@ use crate::{
 const LOCAL_BOOST: i16 = 100;
 const REMOTE_BOOST: i16 = 60;
 const CURRENT_PENALTY: i16 = -60;
+/// Commit rows lead at revision-first slots (`cherry-pick`, `revert`,
+/// `reset`, `rebase --onto`): there the hash is the usual answer.
+const COMMIT_BOOST: i16 = 100;
+/// At ref-first slots (`log`, `diff`, `show`, `merge`) commits stay
+/// reachable but trail every named ref.
+const COMMIT_TAIL_BOOST: i16 = 10;
 /// Repositories can carry thousands of refs; cap the rows handed to the
 /// ranker (prefix filtering happens there anyway).
 const MAX_REF_ROWS: usize = 500;
@@ -36,8 +42,17 @@ enum RefSlotKind {
     RemoteNames,
     Locals,
     LocalsAndRemotes,
+    /// `checkout` additionally accepts a commit hash (detached HEAD), which
+    /// `switch` only accepts behind `--detach` — so commits stay checkout-only.
+    CheckoutTargets,
     LocalsAndTags,
+    /// Branches, remotes, and tags, with recent commits trailing.
     AllRefs,
+    /// Only tag names (`git tag -d <…>`).
+    Tags,
+    /// Recent commits first, then every ref — for `cherry-pick`, `revert`,
+    /// `reset`, `rebase --onto`, and other hash-accepting slots.
+    Revisions,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -74,8 +89,16 @@ impl CandidateProvider for GitProvider {
             return false;
         }
         let words = crate::providers::segment_words(context);
-        git_context_supported(&words)
-            && (at_git_argument_position(context) || ref_slot(context).is_some())
+        let applies = git_context_supported(&words)
+            && (at_git_argument_position(context) || ref_slot(context).is_some());
+        if applies {
+            // Warm the status probe while the subcommand is still being
+            // typed so the first `complete` usually finds a fresh context
+            // instead of the unknown-repository fallback.
+            self.cache
+                .request_probe(&git_working_directory(context, &words));
+        }
+        applies
     }
 
     fn complete(&self, context: &CompletionContext) -> ProviderOutput {
@@ -179,24 +202,7 @@ impl GitProvider {
                 }
             }
             RefSlotKind::LocalsAndRemotes => {
-                for local in &refs.locals {
-                    let current = refs.current.as_deref() == Some(local);
-                    candidates.push(ref_candidate(
-                        context,
-                        local,
-                        if current {
-                            "当前分支"
-                        } else {
-                            "本地分支"
-                        },
-                        if current {
-                            CURRENT_PENALTY
-                        } else {
-                            LOCAL_BOOST
-                        },
-                        &slot.edit_prefix,
-                    ));
-                }
+                push_local_rows(context, &mut candidates, &refs, &slot.edit_prefix);
                 for remote in &refs.remotes {
                     candidates.push(ref_candidate(
                         context,
@@ -206,6 +212,25 @@ impl GitProvider {
                         &slot.edit_prefix,
                     ));
                 }
+            }
+            RefSlotKind::CheckoutTargets => {
+                push_local_rows(context, &mut candidates, &refs, &slot.edit_prefix);
+                for remote in &refs.remotes {
+                    candidates.push(ref_candidate(
+                        context,
+                        remote,
+                        "远程分支",
+                        REMOTE_BOOST,
+                        &slot.edit_prefix,
+                    ));
+                }
+                push_commit_rows(
+                    context,
+                    &mut candidates,
+                    &refs,
+                    COMMIT_TAIL_BOOST,
+                    &slot.edit_prefix,
+                );
             }
             RefSlotKind::LocalsAndTags => {
                 for local in &refs.locals {
@@ -217,53 +242,30 @@ impl GitProvider {
                         &slot.edit_prefix,
                     ));
                 }
-                for tag in &refs.tags {
-                    candidates.push(ref_candidate(
-                        context,
-                        tag,
-                        "标签",
-                        REMOTE_BOOST,
-                        &slot.edit_prefix,
-                    ));
-                }
+                push_tag_rows(context, &mut candidates, &refs, &slot.edit_prefix);
             }
             RefSlotKind::AllRefs => {
-                for local in &refs.locals {
-                    let current = refs.current.as_deref() == Some(local);
-                    candidates.push(ref_candidate(
-                        context,
-                        local,
-                        if current {
-                            "当前分支"
-                        } else {
-                            "本地分支"
-                        },
-                        if current {
-                            CURRENT_PENALTY
-                        } else {
-                            LOCAL_BOOST
-                        },
-                        &slot.edit_prefix,
-                    ));
-                }
-                for remote in &refs.remotes {
-                    candidates.push(ref_candidate(
-                        context,
-                        remote,
-                        "远程分支",
-                        REMOTE_BOOST,
-                        &slot.edit_prefix,
-                    ));
-                }
-                for tag in &refs.tags {
-                    candidates.push(ref_candidate(
-                        context,
-                        tag,
-                        "标签",
-                        REMOTE_BOOST,
-                        &slot.edit_prefix,
-                    ));
-                }
+                push_all_ref_rows(context, &mut candidates, &refs, &slot.edit_prefix);
+                push_commit_rows(
+                    context,
+                    &mut candidates,
+                    &refs,
+                    COMMIT_TAIL_BOOST,
+                    &slot.edit_prefix,
+                );
+            }
+            RefSlotKind::Tags => {
+                push_tag_rows(context, &mut candidates, &refs, &slot.edit_prefix);
+            }
+            RefSlotKind::Revisions => {
+                push_commit_rows(
+                    context,
+                    &mut candidates,
+                    &refs,
+                    COMMIT_BOOST,
+                    &slot.edit_prefix,
+                );
+                push_all_ref_rows(context, &mut candidates, &refs, &slot.edit_prefix);
             }
         }
         preselect_ref_candidates(context, &mut candidates);
@@ -294,10 +296,18 @@ fn ref_candidate_match(query: &str, candidate: &Candidate) -> i16 {
         .map_or(candidate.display.primary.as_str(), |edit| {
             edit.replacement.as_str()
         });
-    crate::completion::match_quality(query, replacement).max(crate::completion::match_quality(
-        query,
-        &candidate.display.primary,
-    ))
+    let mut quality = crate::completion::match_quality(query, replacement).max(
+        crate::completion::match_quality(query, &candidate.display.primary),
+    );
+    // Commit rows carry the subject in the description so `git cherry-pick
+    // fix` finds `a1b2c3 fix login` even though the hash does not match.
+    if candidate.provenance.starts_with("git:commit:") {
+        quality = quality.max(crate::completion::match_quality(
+            query,
+            &candidate.display.description,
+        ));
+    }
+    quality
 }
 
 pub(crate) fn git_working_directory(context: &CompletionContext, words: &[&str]) -> PathBuf {
@@ -357,6 +367,112 @@ fn ref_candidate(
     candidate
 }
 
+/// A commit row inserts the abbreviated hash; the subject line explains the
+/// row and is matched against the query so `fix` finds `a1b2c3 fix login`.
+fn commit_candidate(
+    context: &CompletionContext,
+    commit: &crate::project::GitCommit,
+    boost: i16,
+    edit_prefix: &str,
+) -> Candidate {
+    let mut candidate = Candidate::new(
+        context.query_id,
+        &commit.hash,
+        if commit.subject.is_empty() {
+            "提交"
+        } else {
+            commit.subject.as_str()
+        },
+        Some(TextEdit {
+            range: context.parsed.replacement.clone(),
+            replacement: format!("{edit_prefix}{}", commit.hash),
+            cursor_after: CursorPlacement::End,
+        }),
+        CandidateAction::Insert,
+        CandidateSource::Project,
+        CandidateKind::Command,
+        Completeness::Runnable,
+        RiskLevel::Low,
+        format!("git:commit:{}", commit.hash),
+    );
+    candidate.score.spec_priority = boost;
+    candidate
+}
+
+fn push_local_rows(
+    context: &CompletionContext,
+    candidates: &mut Vec<Candidate>,
+    refs: &crate::project::GitRefs,
+    edit_prefix: &str,
+) {
+    for local in &refs.locals {
+        let current = refs.current.as_deref() == Some(local);
+        candidates.push(ref_candidate(
+            context,
+            local,
+            if current {
+                "当前分支"
+            } else {
+                "本地分支"
+            },
+            if current {
+                CURRENT_PENALTY
+            } else {
+                LOCAL_BOOST
+            },
+            edit_prefix,
+        ));
+    }
+}
+
+fn push_tag_rows(
+    context: &CompletionContext,
+    candidates: &mut Vec<Candidate>,
+    refs: &crate::project::GitRefs,
+    edit_prefix: &str,
+) {
+    for tag in &refs.tags {
+        candidates.push(ref_candidate(
+            context,
+            tag,
+            "标签",
+            REMOTE_BOOST,
+            edit_prefix,
+        ));
+    }
+}
+
+fn push_all_ref_rows(
+    context: &CompletionContext,
+    candidates: &mut Vec<Candidate>,
+    refs: &crate::project::GitRefs,
+    edit_prefix: &str,
+) {
+    push_local_rows(context, candidates, refs, edit_prefix);
+    for remote in &refs.remotes {
+        candidates.push(ref_candidate(
+            context,
+            remote,
+            "远程分支",
+            REMOTE_BOOST,
+            edit_prefix,
+        ));
+    }
+    push_tag_rows(context, candidates, refs, edit_prefix);
+}
+
+fn push_commit_rows(
+    context: &CompletionContext,
+    candidates: &mut Vec<Candidate>,
+    refs: &crate::project::GitRefs,
+    boost: i16,
+    edit_prefix: &str,
+) {
+    for commit in &refs.commits {
+        candidates.push(commit_candidate(context, commit, boost, edit_prefix));
+    }
+}
+
 fn ref_slot(context: &CompletionContext) -> Option<RefSlot> {
     let (words, position) = argument_progress(context)?;
     if context.parsed.current_prefix.starts_with('-') {
@@ -405,19 +521,38 @@ fn ref_slot_kind(words: &[&str], position: usize) -> Option<RefSlotKind> {
     }
     let positional = arguments.positionals.len();
     match subcommand {
-        "checkout" | "switch" if positional == 0 => Some(RefSlotKind::LocalsAndRemotes),
-        "merge" | "log" | "diff" | "show" | "cherry-pick" | "revert" => Some(RefSlotKind::AllRefs),
-        "rebase" if positional < 2 => Some(RefSlotKind::AllRefs),
+        "checkout" if positional == 0 => Some(RefSlotKind::CheckoutTargets),
+        "switch" if positional == 0 => Some(RefSlotKind::LocalsAndRemotes),
+        "merge" | "log" | "diff" | "show" => Some(RefSlotKind::AllRefs),
+        // `cherry-pick`/`revert` take any number of commits — keep offering
+        // revisions at every positional slot.
+        "cherry-pick" | "revert" => Some(RefSlotKind::Revisions),
+        "rebase" if positional < 2 => Some(RefSlotKind::Revisions),
         "push" if positional == 0 => Some(RefSlotKind::RemoteNames),
         "push" => Some(RefSlotKind::LocalsAndTags),
         "pull" if positional == 0 => Some(RefSlotKind::RemoteNames),
         "pull" => Some(RefSlotKind::AllRefs),
-        "branch" if before.iter().any(|word| matches!(*word, "-d" | "-D")) => {
+        "branch"
+            if before
+                .iter()
+                .any(|word| matches!(*word, "-d" | "-D" | "--delete")) =>
+        {
             Some(RefSlotKind::Locals)
         }
         "branch" if branch_rename_or_copy(before) => None,
-        "branch" if positional == 1 => Some(RefSlotKind::AllRefs),
-        "reset" if positional == 0 => Some(RefSlotKind::AllRefs),
+        // `git branch <name> <start>` — the start point accepts any commit.
+        "branch" if positional == 1 => Some(RefSlotKind::Revisions),
+        "tag"
+            if before
+                .iter()
+                .any(|word| matches!(*word, "-d" | "-D" | "--delete")) =>
+        {
+            Some(RefSlotKind::Tags)
+        }
+        "tag" if before.iter().any(|word| matches!(*word, "-l" | "--list")) => None,
+        // `git tag <name> <commit>` — the target accepts any revision.
+        "tag" if positional == 1 => Some(RefSlotKind::Revisions),
+        "reset" if positional == 0 => Some(RefSlotKind::Revisions),
         _ => None,
     }
 }
@@ -482,13 +617,24 @@ fn git_value_flag_kind(subcommand: &str, word: &str) -> Option<GitValueKind> {
             "-m" | "--message" | "-s" | "--strategy" | "-X" | "--strategy-option"
         )
         .then_some(GitValueKind::Other),
-        "rebase" if word == "--onto" => Some(GitValueKind::Ref(RefSlotKind::AllRefs)),
+        "rebase" if word == "--onto" => Some(GitValueKind::Ref(RefSlotKind::Revisions)),
         "rebase" => matches!(
             word,
             "--exec" | "-s" | "--strategy" | "-X" | "--strategy-option"
         )
         .then_some(GitValueKind::Other),
-        "log" | "diff" => matches!(
+        "cherry-pick" | "revert" => matches!(
+            word,
+            "-m" | "--mainline"
+                | "-S"
+                | "--gpg-sign"
+                | "-s"
+                | "--strategy"
+                | "-X"
+                | "--strategy-option"
+        )
+        .then_some(GitValueKind::Other),
+        "log" | "diff" | "show" => matches!(
             word,
             "-n" | "--max-count"
                 | "--skip"
@@ -529,11 +675,24 @@ fn git_value_flag_kind(subcommand: &str, word: &str) -> Option<GitValueKind> {
                     | "--set-upstream-to"
             ) =>
         {
-            Some(GitValueKind::Ref(RefSlotKind::AllRefs))
+            Some(GitValueKind::Ref(RefSlotKind::Revisions))
         }
         "branch" => matches!(word, "--sort" | "--format").then_some(GitValueKind::Other),
+        "tag"
+            if matches!(
+                word,
+                "--contains" | "--no-contains" | "--merged" | "--no-merged" | "--points-at"
+            ) =>
+        {
+            Some(GitValueKind::Ref(RefSlotKind::Revisions))
+        }
+        "tag" => matches!(
+            word,
+            "-m" | "--message" | "-u" | "--local-user" | "-n" | "--sort" | "--format" | "--color"
+        )
+        .then_some(GitValueKind::Other),
         "restore" if matches!(word, "-s" | "--source") => {
-            Some(GitValueKind::Ref(RefSlotKind::AllRefs))
+            Some(GitValueKind::Ref(RefSlotKind::Revisions))
         }
         "restore" => {
             matches!(word, "--conflict" | "--pathspec-from-file").then_some(GitValueKind::Other)
@@ -577,7 +736,9 @@ pub(crate) fn new_branch_slot(words: &[&str], position: usize) -> bool {
     }
     branch_rename_or_copy(before)
         || (arguments.positionals.is_empty()
-            && !before.iter().any(|word| matches!(*word, "-d" | "-D")))
+            && !before
+                .iter()
+                .any(|word| matches!(*word, "-d" | "-D" | "--delete")))
 }
 
 pub(crate) fn ref_subcommand_accepts_paths(words: &[&str]) -> bool {
@@ -843,6 +1004,16 @@ mod tests {
         assert!(output.status.success(), "git {args:?} failed");
     }
 
+    fn git_output(directory: &std::path::Path, args: &[&str]) -> String {
+        let mut command = vec!["-C", directory.to_str().expect("utf-8 path")];
+        command.extend_from_slice(args);
+        let output =
+            crate::platform::run_bounded("git", command, std::time::Duration::from_secs(10), 1024)
+                .expect("git run");
+        assert!(output.status.success(), "git {args:?} failed");
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
     fn primaries(context: &CompletionContext, provider: &GitProvider) -> Vec<String> {
         provider
             .complete(context)
@@ -852,14 +1023,24 @@ mod tests {
             .collect()
     }
 
+    /// Provider whose caches are already populated for `probed`
+    /// directories: probes run on background threads in production, so
+    /// tests must warm them synchronously to observe repository state on
+    /// the first `complete` call.
+    fn warm_provider(cwd: &std::path::Path, probed: &[&std::path::Path]) -> GitProvider {
+        let status = Arc::new(GitStatusCache::default());
+        let refs = Arc::new(GitRefsCache::default());
+        for directory in probed {
+            status.probe_now(directory);
+            refs.probe_now(directory);
+        }
+        GitProvider::new(status, refs, git_on_path(cwd))
+    }
+
     #[test]
     fn outside_a_repository_recommends_init_and_clone() {
         let directory = tempfile::tempdir().expect("directory");
-        let provider = GitProvider::new(
-            Arc::new(GitStatusCache::default()),
-            Arc::new(GitRefsCache::default()),
-            git_on_path(directory.path()),
-        );
+        let provider = warm_provider(directory.path(), &[directory.path()]);
         let context = context(directory.path(), "git ");
         let rows = primaries(&context, &provider);
         assert_eq!(rows, ["git init", "git clone"]);
@@ -876,14 +1057,10 @@ mod tests {
         }
         let root = tempfile::tempdir().expect("repo");
         git(root.path(), &["init", "-q", "-b", "main"]);
-        let provider = GitProvider::new(
-            Arc::new(GitStatusCache::default()),
-            Arc::new(GitRefsCache::default()),
-            git_on_path(root.path()),
-        );
 
         // Fresh empty repository, untracked file → commit-oriented rows.
         fs::write(root.path().join("a.txt"), b"a").expect("file");
+        let provider = warm_provider(root.path(), &[root.path()]);
         let rows = primaries(&context(root.path(), "git "), &provider);
         assert!(rows.contains(&"git status".to_owned()), "rows: {rows:?}");
         assert!(rows.contains(&"git add -A".to_owned()), "rows: {rows:?}");
@@ -904,11 +1081,7 @@ mod tests {
                 "init",
             ],
         );
-        let provider = GitProvider::new(
-            Arc::new(GitStatusCache::default()),
-            Arc::new(GitRefsCache::default()),
-            git_on_path(root.path()),
-        );
+        let provider = warm_provider(root.path(), &[root.path()]);
         let rows = primaries(&context(root.path(), "git "), &provider);
         assert!(
             rows.contains(&"git log --oneline -10".to_owned()),
@@ -932,11 +1105,7 @@ mod tests {
         fs::create_dir(&repository).expect("repository");
         git(&repository, &["init", "-q", "-b", "main"]);
         fs::write(repository.join("untracked.txt"), b"x").expect("file");
-        let provider = GitProvider::new(
-            Arc::new(GitStatusCache::default()),
-            Arc::new(GitRefsCache::default()),
-            git_on_path(root.path()),
-        );
+        let provider = warm_provider(root.path(), &[&repository]);
 
         let rows = primaries(&context(root.path(), "git -C repo "), &provider);
         assert!(rows.contains(&"git status".to_owned()), "rows: {rows:?}");
@@ -961,11 +1130,7 @@ mod tests {
     #[test]
     fn non_ref_deeper_positions_do_not_fire() {
         let directory = tempfile::tempdir().expect("directory");
-        let provider = GitProvider::new(
-            Arc::new(GitStatusCache::default()),
-            Arc::new(GitRefsCache::default()),
-            git_on_path(directory.path()),
-        );
+        let provider = warm_provider(directory.path(), &[directory.path()]);
         // `git add <path>` keeps file completion: no git rows at all here.
         let add_context = context(directory.path(), "git add ma");
         assert!(provider.complete(&add_context).candidates.is_empty());
@@ -1009,11 +1174,7 @@ mod tests {
     #[test]
     fn checkout_completes_refs_and_marks_the_current_branch() {
         let Some(root) = ref_repository() else { return };
-        let provider = GitProvider::new(
-            Arc::new(GitStatusCache::default()),
-            Arc::new(GitRefsCache::default()),
-            git_on_path(root.path()),
-        );
+        let provider = warm_provider(root.path(), &[root.path()]);
         let context = context(root.path(), "git checkout fea");
         assert!(provider.applies(&context));
         let output = provider.complete(&context);
@@ -1056,11 +1217,7 @@ mod tests {
     #[test]
     fn checkout_outside_a_repository_stays_silent() {
         let directory = tempfile::tempdir().expect("directory");
-        let provider = GitProvider::new(
-            Arc::new(GitStatusCache::default()),
-            Arc::new(GitRefsCache::default()),
-            git_on_path(directory.path()),
-        );
+        let provider = warm_provider(directory.path(), &[directory.path()]);
         let context = context(directory.path(), "git checkout ma");
         assert!(provider.complete(&context).candidates.is_empty());
     }
@@ -1068,11 +1225,7 @@ mod tests {
     #[test]
     fn push_and_pull_distinguish_remote_and_refspec_slots() {
         let Some(root) = ref_repository() else { return };
-        let provider = GitProvider::new(
-            Arc::new(GitStatusCache::default()),
-            Arc::new(GitRefsCache::default()),
-            git_on_path(root.path()),
-        );
+        let provider = warm_provider(root.path(), &[root.path()]);
         let rows = primaries(&context(root.path(), "git push "), &provider);
         assert_eq!(rows, vec!["origin".to_owned()]);
 
@@ -1086,11 +1239,7 @@ mod tests {
     #[test]
     fn revision_and_branch_slots_offer_only_valid_ref_families() {
         let Some(root) = ref_repository() else { return };
-        let provider = GitProvider::new(
-            Arc::new(GitStatusCache::default()),
-            Arc::new(GitRefsCache::default()),
-            git_on_path(root.path()),
-        );
+        let provider = warm_provider(root.path(), &[root.path()]);
         let rows = primaries(&context(root.path(), "git log "), &provider);
         for expected in ["main", "feature/mars", "origin/main", "v1"] {
             assert!(rows.contains(&expected.to_owned()), "rows: {rows:?}");
@@ -1126,11 +1275,7 @@ mod tests {
     #[test]
     fn ref_valued_flags_complete_refs_in_separate_and_attached_forms() {
         let Some(root) = ref_repository() else { return };
-        let provider = GitProvider::new(
-            Arc::new(GitStatusCache::default()),
-            Arc::new(GitRefsCache::default()),
-            git_on_path(root.path()),
-        );
+        let provider = warm_provider(root.path(), &[root.path()]);
         for text in [
             "git branch --contains ",
             "git branch --merged ma",
@@ -1158,14 +1303,165 @@ mod tests {
         );
     }
 
+    /// Commits reachable only from a side branch still appear: `cherry-pick`
+    /// is exactly the command that needs them, so `git log --all` is required.
+    #[test]
+    fn revision_slots_offer_commits_from_every_branch() {
+        let Some(root) = ref_repository() else { return };
+        git(root.path(), &["checkout", "-q", "feature/mars"]);
+        fs::write(root.path().join("mars.txt"), b"m").expect("file");
+        git(root.path(), &["add", "-A"]);
+        git(
+            root.path(),
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "mars work",
+            ],
+        );
+        git(root.path(), &["checkout", "-q", "main"]);
+        let mars = git_output(root.path(), &["rev-parse", "--short", "feature/mars"]);
+        let provider = warm_provider(root.path(), &[root.path()]);
+
+        let context = context(root.path(), "git cherry-pick ");
+        let output = provider.complete(&context);
+        let mars_row = output
+            .candidates
+            .iter()
+            .find(|candidate| candidate.display.primary == mars)
+            .unwrap_or_else(|| panic!("{mars} must be offered: {output:?}"));
+        assert_eq!(mars_row.display.description, "mars work");
+        assert_eq!(
+            mars_row.edit.as_ref().expect("edit").replacement,
+            mars,
+            "hash is inserted, not the subject"
+        );
+        assert_eq!(mars_row.provenance, format!("git:commit:{mars}"));
+    }
+
+    #[test]
+    fn revision_slots_rank_commits_before_refs_and_replace_only_the_word() {
+        let Some(root) = ref_repository() else { return };
+        let provider = warm_provider(root.path(), &[root.path()]);
+        let head = git_output(root.path(), &["rev-parse", "--short", "HEAD"]);
+
+        for text in [
+            "git cherry-pick ",
+            "git revert ",
+            "git reset ",
+            "git rebase --onto ",
+            "git restore --source ",
+            "git branch new ",
+            "git tag v2 ",
+            "git cherry-pick main ", // more commits follow a revision
+        ] {
+            let output = provider.complete(&context(root.path(), text));
+            let commit_index = output
+                .candidates
+                .iter()
+                .position(|candidate| candidate.display.primary == head)
+                .unwrap_or_else(|| panic!("{text:?} must offer commit {head}"));
+            let main_index = output
+                .candidates
+                .iter()
+                .position(|candidate| candidate.display.primary == "main")
+                .unwrap_or_else(|| panic!("{text:?} must offer branch main"));
+            assert!(
+                commit_index < main_index,
+                "{text:?}: commits must outrank named refs"
+            );
+        }
+
+        // Typing part of the hash keeps the commit candidate competitive:
+        // it survives the pre-selection sort that feeds the row cap.
+        let typed = &head[..3.min(head.len())];
+        let context = context(root.path(), &format!("git cherry-pick {typed}"));
+        let output = provider.complete(&context);
+        assert!(
+            output
+                .candidates
+                .iter()
+                .any(|candidate| candidate.display.primary == head),
+            "hash prefix {typed:?} must keep {head} in the capped rows"
+        );
+    }
+
+    #[test]
+    fn ref_first_slots_keep_commits_at_the_tail() {
+        let Some(root) = ref_repository() else { return };
+        let provider = warm_provider(root.path(), &[root.path()]);
+        let head = git_output(root.path(), &["rev-parse", "--short", "HEAD"]);
+
+        for text in [
+            "git log ",
+            "git show ",
+            "git diff ",
+            "git merge ",
+            "git checkout ", // detached-HEAD targets trail the named refs
+        ] {
+            let output = provider.complete(&context(root.path(), text));
+            let commit_index = output
+                .candidates
+                .iter()
+                .position(|candidate| candidate.display.primary == head)
+                .unwrap_or_else(|| panic!("{text:?} must offer commit {head}"));
+            let main_index = output
+                .candidates
+                .iter()
+                .position(|candidate| candidate.display.primary == "main")
+                .unwrap_or_else(|| panic!("{text:?} must offer branch main"));
+            assert!(
+                main_index < commit_index,
+                "{text:?}: named refs must outrank commits"
+            );
+        }
+
+        // `git switch` needs `--detach` for commits — plain `git switch `
+        // stays branch-only.
+        let rows = primaries(&context(root.path(), "git switch "), &provider);
+        assert!(
+            !rows.contains(&head),
+            "switch must not offer commit {head}: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn tag_slots_distinguish_delete_target_and_new_name() {
+        let Some(root) = ref_repository() else { return };
+        let provider = warm_provider(root.path(), &[root.path()]);
+
+        // `git tag -d` completes existing tags only — no branches, no commits.
+        let rows = primaries(&context(root.path(), "git tag -d "), &provider);
+        assert_eq!(rows, ["v1"], "rows: {rows:?}");
+        let rows = primaries(&context(root.path(), "git tag --delete "), &provider);
+        assert_eq!(rows, ["v1"], "rows: {rows:?}");
+
+        // `git tag <new-name>` and `git tag -l` are not ref slots.
+        for text in ["git tag ", "git tag -l "] {
+            let context = context(root.path(), text);
+            assert!(
+                provider.complete(&context).candidates.is_empty(),
+                "{text:?} must not offer refs"
+            );
+        }
+    }
+
+    #[test]
+    fn branch_delete_long_flag_lists_only_non_current_locals() {
+        let Some(root) = ref_repository() else { return };
+        let provider = warm_provider(root.path(), &[root.path()]);
+        let rows = primaries(&context(root.path(), "git branch --delete "), &provider);
+        assert_eq!(rows, ["feature/mars"], "rows: {rows:?}");
+    }
+
     #[test]
     fn wrapper_prefix_is_preserved_in_row_edits() {
         let directory = tempfile::tempdir().expect("directory");
-        let provider = GitProvider::new(
-            Arc::new(GitStatusCache::default()),
-            Arc::new(GitRefsCache::default()),
-            git_on_path(directory.path()),
-        );
+        let provider = warm_provider(directory.path(), &[directory.path()]);
         // `sudo git ` still recommends from state, and the row fills only
         // the empty subcommand slot so every wrapper/global prefix survives.
         let sudo_git = context(directory.path(), "sudo git ");
@@ -1189,11 +1485,7 @@ mod tests {
     #[test]
     fn wrapper_prefixed_checkout_completes_refs() {
         let Some(root) = ref_repository() else { return };
-        let provider = GitProvider::new(
-            Arc::new(GitStatusCache::default()),
-            Arc::new(GitRefsCache::default()),
-            git_on_path(root.path()),
-        );
+        let provider = warm_provider(root.path(), &[root.path()]);
         let context = context(root.path(), "sudo git checkout fea");
         assert!(provider.applies(&context));
         let rows = primaries(&context, &provider);
@@ -1209,11 +1501,7 @@ mod tests {
         let app = root.path().join("app");
         fs::create_dir(&app).expect("app");
         git(&app, &["init", "-q", "-b", "main"]);
-        let provider = GitProvider::new(
-            Arc::new(GitStatusCache::default()),
-            Arc::new(GitRefsCache::default()),
-            git_on_path(root.path()),
-        );
+        let provider = warm_provider(root.path(), &[&app]);
         let context = context(root.path(), "sudo -D app git ");
         let rows = primaries(&context, &provider);
         assert!(
@@ -1226,11 +1514,7 @@ mod tests {
     #[test]
     fn double_dash_ends_the_ref_slot() {
         let Some(root) = ref_repository() else { return };
-        let provider = GitProvider::new(
-            Arc::new(GitStatusCache::default()),
-            Arc::new(GitRefsCache::default()),
-            git_on_path(root.path()),
-        );
+        let provider = warm_provider(root.path(), &[root.path()]);
         // After `--` the slot is a pathspec: no ref rows.
         for text in ["git checkout -- ", "git checkout -- ma"] {
             let context = context(root.path(), text);
@@ -1248,11 +1532,7 @@ mod tests {
     #[test]
     fn checkout_dash_b_and_switch_dash_c_take_a_new_branch_name() {
         let Some(root) = ref_repository() else { return };
-        let provider = GitProvider::new(
-            Arc::new(GitStatusCache::default()),
-            Arc::new(GitRefsCache::default()),
-            git_on_path(root.path()),
-        );
+        let provider = warm_provider(root.path(), &[root.path()]);
         // The word after `-b`/`-c` is a NEW branch name, not an existing ref.
         for text in ["git checkout -b ", "git checkout -b ne", "git switch -c "] {
             let context = context(root.path(), text);
@@ -1266,11 +1546,7 @@ mod tests {
     #[test]
     fn ref_rows_mix_with_history_through_the_engine() {
         let Some(root) = ref_repository() else { return };
-        let provider = GitProvider::new(
-            Arc::new(GitStatusCache::default()),
-            Arc::new(GitRefsCache::default()),
-            git_on_path(root.path()),
-        );
+        let provider = warm_provider(root.path(), &[root.path()]);
         let mut engine = CompletionEngine::new(100, 12);
         engine.register(provider);
         let output = engine.complete(&context(root.path(), "git checkout fea"));
@@ -1286,11 +1562,7 @@ mod tests {
     #[test]
     fn engine_mixes_git_rows_with_history() {
         let directory = tempfile::tempdir().expect("directory");
-        let provider = GitProvider::new(
-            Arc::new(GitStatusCache::default()),
-            Arc::new(GitRefsCache::default()),
-            git_on_path(directory.path()),
-        );
+        let provider = warm_provider(directory.path(), &[directory.path()]);
         let mut engine = CompletionEngine::new(100, 12);
         engine.register(provider);
         let output = engine.complete(&context(directory.path(), "git in"));

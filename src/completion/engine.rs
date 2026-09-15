@@ -18,7 +18,30 @@ pub struct ProviderMetric {
 pub struct ProviderDiagnostic {
     pub provider: &'static str,
     pub code: &'static str,
+    pub level: DiagnosticLevel,
     pub message: String,
+}
+
+/// Severity of a provider diagnostic. `Info` entries record normal
+/// degradation — budget cutoffs, partial scans — and stay out of the
+/// overlay status line; `Warning` marks a provider that failed to produce
+/// its result, which the status line surfaces so an incomplete row set
+/// does not look like a correct one.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DiagnosticLevel {
+    Info,
+    #[default]
+    Warning,
+}
+
+impl DiagnosticLevel {
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Warning => "warning",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -122,19 +145,20 @@ impl CompletionEngine {
             return;
         }
         let provider_count = providers.len();
-        let started = std::time::Instant::now();
+        // The budget counts provider execution only — ranking, dedupe, and
+        // emit work happen outside provider implementations and must not
+        // starve later providers on slower machines.
+        let mut provider_elapsed = Duration::ZERO;
+        let mut last_ranked: Vec<Candidate> = Vec::new();
         for (index, provider) in providers.into_iter().enumerate() {
             if cancelled() {
                 return;
             }
-            if index > 0
-                && started.elapsed() >= self.local_timeout
-                && !rank_and_dedupe(context, combined.candidates.clone(), self.max_candidates)
-                    .is_empty()
-            {
+            if index > 0 && provider_elapsed >= self.local_timeout && !last_ranked.is_empty() {
                 combined.diagnostics.push(ProviderDiagnostic {
                     provider: "engine",
                     code: "HK-CMP-001",
+                    level: DiagnosticLevel::Info,
                     message: format!(
                         "local provider budget reached after {} ms",
                         self.local_timeout.as_millis()
@@ -142,11 +166,7 @@ impl CompletionEngine {
                 });
                 emit(
                     ProviderOutput {
-                        candidates: rank_and_dedupe(
-                            context,
-                            combined.candidates,
-                            self.max_candidates,
-                        ),
+                        candidates: last_ranked,
                         diagnostics: combined.diagnostics,
                     },
                     true,
@@ -159,6 +179,7 @@ impl CompletionEngine {
                     candidates: Vec::new(),
                     diagnostics: vec![provider_panic(provider.id())],
                 });
+            provider_elapsed += provider_started.elapsed();
             let was_cancelled = cancelled();
             observe(ProviderMetric {
                 provider: provider.id(),
@@ -171,13 +192,11 @@ impl CompletionEngine {
             }
             combined.candidates.append(&mut output.candidates);
             combined.diagnostics.append(&mut output.diagnostics);
+            last_ranked =
+                rank_and_dedupe(context, combined.candidates.clone(), self.max_candidates);
             emit(
                 ProviderOutput {
-                    candidates: rank_and_dedupe(
-                        context,
-                        combined.candidates.clone(),
-                        self.max_candidates,
-                    ),
+                    candidates: last_ranked.clone(),
                     diagnostics: combined.diagnostics.clone(),
                 },
                 index + 1 == provider_count,
@@ -190,6 +209,7 @@ fn provider_panic(provider: &'static str) -> ProviderDiagnostic {
     ProviderDiagnostic {
         provider,
         code: "HK-CMP-002",
+        level: DiagnosticLevel::Warning,
         message: format!("provider {provider} failed internally; other sources remain available"),
     }
 }

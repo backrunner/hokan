@@ -10,14 +10,39 @@ use crate::{
     terminal::RiskLevel,
 };
 
+/// Interface membership changes rarely, but the `ifconfig`/`/sys` lookup
+/// (250 ms bound) must not run per keystroke: one probe per TTL while an
+/// interface slot is being typed. Failures are cached too.
+const INTERFACE_CACHE_TTL: Duration = Duration::from_secs(2);
+
+/// `(name, status)` rows for the interface list.
+type InterfaceRows = Vec<(String, String)>;
+
 pub struct NetworkInterfaceProvider {
     commands: Arc<CommandPathCache>,
+    interfaces: super::TtlSlot<Result<InterfaceRows, String>>,
+    list: fn() -> Result<InterfaceRows, String>,
 }
 
 impl NetworkInterfaceProvider {
     #[must_use]
     pub fn new(commands: Arc<CommandPathCache>) -> Self {
-        Self { commands }
+        Self {
+            commands,
+            interfaces: super::TtlSlot::new(INTERFACE_CACHE_TTL),
+            list: interface_names,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_loader(
+        commands: Arc<CommandPathCache>,
+        list: fn() -> Result<InterfaceRows, String>,
+    ) -> Self {
+        Self {
+            list,
+            ..Self::new(commands)
+        }
     }
 }
 
@@ -35,7 +60,8 @@ impl CandidateProvider for NetworkInterfaceProvider {
     }
 
     fn complete(&self, context: &CompletionContext) -> ProviderOutput {
-        let interfaces = match interface_names() {
+        let interfaces = self.interfaces.get_or(|| (self.list)());
+        let interfaces = match interfaces.as_ref() {
             Ok(interfaces) => interfaces,
             Err(error) => {
                 return ProviderOutput {
@@ -43,17 +69,18 @@ impl CandidateProvider for NetworkInterfaceProvider {
                     diagnostics: vec![ProviderDiagnostic {
                         provider: self.id(),
                         code: "HK-NET-001",
-                        message: error,
+                        level: crate::completion::DiagnosticLevel::Warning,
+                        message: error.clone(),
                     }],
                 };
             }
         };
         let candidates = interfaces
-            .into_iter()
+            .iter()
             .map(|(name, status)| {
                 Candidate::new(
                     context.query_id,
-                    &name,
+                    name,
                     status,
                     Some(TextEdit {
                         range: context.parsed.replacement.clone(),
@@ -76,7 +103,7 @@ impl CandidateProvider for NetworkInterfaceProvider {
     }
 }
 
-fn interface_names() -> Result<Vec<(String, String)>, String> {
+fn interface_names() -> Result<InterfaceRows, String> {
     if cfg!(target_os = "linux") {
         let entries = fs::read_dir("/sys/class/net").map_err(|error| error.to_string())?;
         let mut interfaces = Vec::new();
@@ -227,5 +254,34 @@ mod tests {
                 "unexpected interface slot for {text:?}"
             );
         }
+    }
+
+    #[test]
+    fn interface_list_is_cached_for_a_keystroke_burst() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn counting_loader() -> Result<InterfaceRows, String> {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![("en0".to_owned(), "network interface".to_owned())])
+        }
+
+        let provider = NetworkInterfaceProvider::with_loader(
+            Arc::new(CommandPathCache::default()),
+            counting_loader,
+        );
+        for text in ["ifconfig ", "ifconfig e", "ifconfig en"] {
+            let output = provider.complete(&context(text));
+            assert_eq!(
+                output.candidates.len(),
+                1,
+                "expected the cached interface row for {text:?}"
+            );
+        }
+        assert_eq!(
+            CALLS.load(Ordering::SeqCst),
+            1,
+            "a burst of interface-slot queries must share one probe"
+        );
     }
 }

@@ -68,6 +68,7 @@ impl CandidateProvider for FilesystemProvider {
                     diagnostics: vec![ProviderDiagnostic {
                         provider: self.id(),
                         code: "HK-FS-001",
+                        level: crate::completion::DiagnosticLevel::Warning,
                         message: format!("cannot read {}: {error}", scan_directory.display()),
                     }],
                 };
@@ -178,6 +179,7 @@ impl CandidateProvider for FilesystemProvider {
                 .then_some(ProviderDiagnostic {
                     provider: self.id(),
                     code: "HK-FS-002",
+                    level: crate::completion::DiagnosticLevel::Info,
                     message: format!(
                         "partial directory results for {} (80 ms / 5000 entry budget)",
                         scan_directory.display()

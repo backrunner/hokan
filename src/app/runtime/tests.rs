@@ -1043,6 +1043,49 @@ fn provider_result(state: &RuntimeState, candidates: Vec<Candidate>) -> Provider
 }
 
 #[test]
+fn info_level_diagnostics_stay_out_of_the_status_line() {
+    let directory = tempfile::tempdir().expect("directory");
+    let mut state = runtime_state(directory.path());
+    let (output, _join) = test_output();
+
+    state.buffer.set_exact("x".into(), 1).expect("buffer");
+    refresh_context(&mut state, QueryId::new(1));
+
+    // A budget-cutoff note is informational: the row set is complete as far
+    // as the budget allowed, so nothing reaches the status line.
+    let mut info_only = provider_result(&state, Vec::new());
+    info_only
+        .output
+        .diagnostics
+        .push(crate::completion::ProviderDiagnostic {
+            provider: "engine",
+            code: "HK-CMP-001",
+            level: crate::completion::DiagnosticLevel::Info,
+            message: "local provider budget reached after 100 ms".into(),
+        });
+    handle_provider_result(info_only, &mut state, &output).expect("provider result");
+    assert!(state.status.is_none());
+
+    // A provider failure still surfaces: without it, an empty or partial
+    // row set would look like a correct answer.
+    let mut warning = provider_result(&state, Vec::new());
+    warning
+        .output
+        .diagnostics
+        .push(crate::completion::ProviderDiagnostic {
+            provider: "engine",
+            code: "HK-CMP-002",
+            level: crate::completion::DiagnosticLevel::Warning,
+            message: "provider x failed internally".into(),
+        });
+    handle_provider_result(warning, &mut state, &output).expect("provider result");
+    assert_eq!(
+        state.status.as_deref(),
+        Some("HK-CMP-002 provider x failed internally")
+    );
+}
+
+#[test]
 fn navigation_intent_is_reapplied_when_queued_buffer_events_move_the_query() {
     let directory = tempfile::tempdir().expect("directory");
     let mut state = runtime_state(directory.path());

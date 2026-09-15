@@ -10,7 +10,8 @@ pub use candidate::{
 };
 pub use context::{BufferSnapshot, CompletionContext, CompletionMode, SyncQuality};
 pub use engine::{
-    CandidateProvider, CompletionEngine, ProviderDiagnostic, ProviderMetric, ProviderOutput,
+    CandidateProvider, CompletionEngine, DiagnosticLevel, ProviderDiagnostic, ProviderMetric,
+    ProviderOutput,
 };
 pub(crate) use ranking::FoldedMatcher;
 pub use ranking::{match_quality, rank_and_dedupe, stricter_risk};

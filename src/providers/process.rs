@@ -17,7 +17,40 @@ struct ProcessInfo {
     command: String,
 }
 
-pub struct ProcessProvider;
+/// The process table is only valid for a moment, but `ps` (250 ms bound,
+/// worse on a slow machine) must not run per keystroke: one run per TTL
+/// while a `kill` PID slot is being typed. Failures are cached too so a
+/// broken `ps` is not retried every query.
+const PROCESS_CACHE_TTL: Duration = Duration::from_millis(1_000);
+
+pub struct ProcessProvider {
+    processes: super::TtlSlot<Result<Vec<ProcessInfo>, String>>,
+    list: fn() -> Result<Vec<ProcessInfo>, String>,
+}
+
+impl Default for ProcessProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ProcessProvider {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            processes: super::TtlSlot::new(PROCESS_CACHE_TTL),
+            list: process_list,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_loader(list: fn() -> Result<Vec<ProcessInfo>, String>) -> Self {
+        Self {
+            list,
+            ..Self::new()
+        }
+    }
+}
 
 impl CandidateProvider for ProcessProvider {
     fn id(&self) -> &'static str {
@@ -29,7 +62,8 @@ impl CandidateProvider for ProcessProvider {
     }
 
     fn complete(&self, context: &CompletionContext) -> ProviderOutput {
-        let processes = match process_list() {
+        let processes = self.processes.get_or(|| (self.list)());
+        let processes = match processes.as_ref() {
             Ok(processes) => processes,
             Err(error) => {
                 return ProviderOutput {
@@ -37,7 +71,8 @@ impl CandidateProvider for ProcessProvider {
                     diagnostics: vec![ProviderDiagnostic {
                         provider: self.id(),
                         code: "HK-PROC-001",
-                        message: error,
+                        level: crate::completion::DiagnosticLevel::Warning,
+                        message: error.clone(),
                     }],
                 };
             }
@@ -45,7 +80,7 @@ impl CandidateProvider for ProcessProvider {
         let current_pid = std::process::id();
         let prefix = context.parsed.current_prefix.as_str();
         let candidates = processes
-            .into_iter()
+            .iter()
             .filter(|process| process.pid != current_pid && process.ppid != current_pid)
             .filter(|process| process_matches(prefix, process))
             .take(500)
@@ -259,6 +294,82 @@ mod tests {
                 "unexpected PID slot for {text:?}"
             );
         }
+    }
+
+    #[test]
+    fn process_list_is_cached_for_a_keystroke_burst() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn counting_loader() -> Result<Vec<ProcessInfo>, String> {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![ProcessInfo {
+                pid: 4242,
+                ppid: 1,
+                owner: "alice".into(),
+                command: "release-worker".into(),
+            }])
+        }
+
+        let provider = ProcessProvider::with_loader(counting_loader);
+        let context = |text: &str| {
+            CompletionContext::new(
+                QueryId::new(1),
+                ShellKind::Zsh,
+                PathBuf::from("/tmp"),
+                BufferSnapshot::new(text, text.len(), BufferRevision::new(1), SyncQuality::Exact)
+                    .expect("buffer"),
+            )
+            .expect("context")
+        };
+        for text in ["kill ", "kill 4", "kill 42"] {
+            let output = provider.complete(&context(text));
+            assert_eq!(
+                output.candidates.len(),
+                1,
+                "expected the cached process row for {text:?}"
+            );
+        }
+        assert_eq!(
+            CALLS.load(Ordering::SeqCst),
+            1,
+            "a burst of PID-slot queries must share one process scan"
+        );
+    }
+
+    #[test]
+    fn process_list_failures_are_cached_within_the_ttl() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn failing_loader() -> Result<Vec<ProcessInfo>, String> {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            Err("ps failed".to_owned())
+        }
+
+        let provider = ProcessProvider::with_loader(failing_loader);
+        let context = |text: &str| {
+            CompletionContext::new(
+                QueryId::new(1),
+                ShellKind::Zsh,
+                PathBuf::from("/tmp"),
+                BufferSnapshot::new(text, text.len(), BufferRevision::new(1), SyncQuality::Exact)
+                    .expect("buffer"),
+            )
+            .expect("context")
+        };
+        for _ in 0..3 {
+            let output = provider.complete(&context("kill "));
+            assert_eq!(
+                output.diagnostics.first().map(|diagnostic| diagnostic.code),
+                Some("HK-PROC-001")
+            );
+        }
+        assert_eq!(
+            CALLS.load(Ordering::SeqCst),
+            1,
+            "a broken `ps` must not respawn on every keystroke"
+        );
     }
 
     #[test]
