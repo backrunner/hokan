@@ -16,6 +16,9 @@ list steadier while providers and shell redraws catch up.
   committed, even when no further provider result arrives.
 - Shell output that can scroll the screen erases the overlay before forwarding
   those bytes, preventing suggestion cells from leaking into scrollback.
+- Git recommendations chosen from repository state retain their priority when
+  generic command help finishes loading, keeping `git init` and `git clone`
+  visible outside a repository.
 - Installation checks Nerd Font availability and installs the pinned,
   checksum-verified Symbols-Only fonts into the user font directory when local
   coverage is missing. Remote sessions keep font setup on the client terminal.

@@ -881,7 +881,7 @@ fn row_candidate(
             line.strip_prefix("git ").unwrap_or(line).to_owned(),
         )
     };
-    Candidate::new(
+    let mut candidate = Candidate::new(
         context.query_id,
         line.trim_end(),
         description,
@@ -908,7 +908,12 @@ fn row_candidate(
         },
         crate::safety::classify_command(line).level,
         format!("git:{line}"),
-    )
+    );
+    // These rows are chosen from repository state, while generic help assigns
+    // up to 200 points for document order. Give curated recommendations the
+    // same priority so warming help cannot displace them from the first page.
+    candidate.score.spec_priority = 200;
+    candidate
 }
 
 /// Only the `git` word itself or its first argument: ref-taking deeper
@@ -1048,6 +1053,63 @@ mod tests {
         let edit = init.edit.as_ref().expect("edit");
         assert_eq!(edit.range, 4..4, "bare `git ` fills the subcommand slot");
         assert_eq!(edit.replacement, "init");
+    }
+
+    #[test]
+    fn repository_recommendations_stay_ahead_of_warmed_generic_help() {
+        use crate::providers::command_help::{CommandHelp, HelpEntry};
+        use crate::providers::{CommandHelpCache, CommandHelpProvider};
+
+        for text in ["git", "git ", "git c"] {
+            let directory = tempfile::tempdir().expect("directory");
+            let provider = warm_provider(directory.path(), &[directory.path()]);
+            let help = Arc::new(CommandHelpCache::default());
+            help.seed(
+                "git",
+                CommandHelp {
+                    subcommands: [
+                        "add", "am", "archive", "bisect", "branch", "checkout", "clean", "clone",
+                        "commit", "init",
+                    ]
+                    .into_iter()
+                    .map(|name| HelpEntry {
+                        name: name.into(),
+                        description: "generic Git help".into(),
+                        takes_value: false,
+                    })
+                    .collect(),
+                    ..CommandHelp::default()
+                },
+            );
+            let help_provider = CommandHelpProvider::new(
+                Arc::new(crate::specs::SpecRegistry::default()),
+                Arc::clone(&provider.commands),
+                help,
+            );
+            let mut engine = CompletionEngine::new(100, 6);
+            engine.register(provider);
+            engine.register(help_provider);
+            let output = engine.complete(&context(directory.path(), text));
+            let expected = if text == "git c" {
+                vec!["git clone"]
+            } else {
+                vec!["git init", "git clone"]
+            };
+            assert_eq!(
+                output.candidates[..expected.len()]
+                    .iter()
+                    .map(|candidate| candidate.display.primary.as_str())
+                    .collect::<Vec<_>>(),
+                expected,
+                "contextual rows must survive the final merged batch for {text:?}",
+            );
+            assert!(
+                output.candidates[..expected.len()]
+                    .iter()
+                    .all(|candidate| candidate.source == CandidateSource::Project),
+                "contextual actions and descriptions must survive dedupe",
+            );
+        }
     }
 
     #[test]
