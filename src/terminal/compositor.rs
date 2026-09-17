@@ -88,6 +88,11 @@ pub struct OverlayCompositor {
     /// epoch change makes the coordinates meaningless.
     footprint: Option<(SurfaceKey, Buffer)>,
     generation: u64,
+    /// Bumped only by `commit`: distinguishes "a new frame painted different
+    /// cells" from bookkeeping bumps (`invalidate_diff_base`, `shift_up`)
+    /// that leave the painted cells untouched. A pending hide armed against
+    /// one commit must not erase a newer frame's box.
+    paint_serial: u64,
 }
 
 impl OverlayCompositor {
@@ -272,6 +277,7 @@ impl OverlayCompositor {
         self.footprint = Some((prepared.staged.key, prepared.target.clone()));
         self.previous = Some((prepared.staged.key, prepared.target));
         self.generation = self.generation.saturating_add(1);
+        self.paint_serial = self.paint_serial.saturating_add(1);
         Ok(())
     }
 
@@ -311,6 +317,22 @@ impl OverlayCompositor {
     #[must_use]
     pub const fn generation(&self) -> u64 {
         self.generation
+    }
+
+    #[must_use]
+    pub const fn paint_serial(&self) -> u64 {
+        self.paint_serial
+    }
+
+    /// Whether the footprint still holds painted (non-blank) cells. After a
+    /// hide commit the footprint stays as a blank buffer — keeping it around
+    /// is harmless, but re-erasing it on every scroll-risky child segment
+    /// would be wasted work.
+    #[must_use]
+    pub fn has_painted_footprint(&self) -> bool {
+        self.footprint
+            .as_ref()
+            .is_some_and(|(_, buffer)| buffer.content.iter().any(|cell| *cell != Cell::default()))
     }
 
     #[must_use]

@@ -4,7 +4,7 @@ use super::super::{
     AnchorConfidence, CellPos, CursorRestore, FrameTicket, RenderReadiness, SurfaceGeometry,
     SyncOutputCapability, SyncOwnership,
 };
-use super::{OutputError, actor::OutputActor};
+use super::{OutputError, actor::OutputActor, actor::segment_may_scroll};
 
 impl<W: Write> OutputActor<W> {
     pub(super) fn try_commit_latest(&mut self, now: Instant) -> Result<(), OutputError> {
@@ -59,33 +59,78 @@ impl<W: Write> OutputActor<W> {
 
     pub(super) fn hide_overlay(&mut self) -> Result<(), OutputError> {
         self.latest_frame = None;
-        let Some(key) = self.compositor.footprint_key() else {
+        if self.compositor.footprint_key().is_none() {
+            self.pending_hide = None;
             return Ok(());
-        };
-        let Some(last_ticket) = self.last_committed_ticket else {
-            self.compositor.invalidate();
-            return Ok(());
-        };
-        let rejected_guard = if !self.scanner.is_safe() {
-            Some("scanner-unsafe")
-        } else if self.model.confidence() == AnchorConfidence::Unknown {
-            Some("confidence-unknown")
-        } else if key.screen_epoch != self.model.screen_epoch() {
-            Some("epoch-mismatch")
-        } else if self.model.sync_ownership() == SyncOwnership::External {
-            Some("external-sync")
-        } else {
-            None
-        };
-        if let Some(guard) = rejected_guard {
+        }
+        if let Some(guard) = self.hide_rejection() {
             if let Some(log) = &self.debug_log {
                 log.overlay_hide_rejected(guard);
             }
             // The committed overlay is still on screen: keep the footprint so
-            // a later frame can still blank whatever its rect vacates.
+            // a later frame can still blank whatever its rect vacates, and arm
+            // a pending hide so the erase is retried once the guard clears
+            // instead of leaving a dead box on screen.
             self.compositor.invalidate_diff_base();
+            self.pending_hide = Some(self.compositor.paint_serial());
             return Ok(());
         }
+        self.pending_hide = None;
+        self.erase_footprint()
+    }
+
+    /// Retry a hide that was armed while the stream was unsafe to touch.
+    /// A frame committed since the rejection supersedes the hide — the
+    /// runtime's newest intent wins.
+    pub(super) fn retry_pending_hide(&mut self) -> Result<(), OutputError> {
+        let Some(serial) = self.pending_hide else {
+            return Ok(());
+        };
+        if self.compositor.paint_serial() != serial
+            || !self.compositor.has_painted_footprint()
+            || self.latest_frame.is_some()
+        {
+            self.pending_hide = None;
+            return Ok(());
+        }
+        self.hide_overlay()
+    }
+
+    /// Why an erase must not be written right now, or `None` when the
+    /// footprint coordinates are trustworthy and the byte stream is at a
+    /// safe injection point.
+    fn hide_rejection(&mut self) -> Option<&'static str> {
+        if !self.scanner.is_safe() {
+            Some("scanner-unsafe")
+        } else if self.model.confidence() == AnchorConfidence::Unknown {
+            Some("confidence-unknown")
+        } else if self
+            .compositor
+            .footprint_key()
+            .is_some_and(|key| key.screen_epoch != self.model.screen_epoch())
+        {
+            Some("epoch-mismatch")
+        } else if self.model.sync_ownership() == SyncOwnership::External {
+            Some("external-sync")
+        } else if self.capability == SyncOutputCapability::BusyExternal {
+            // prepare_hide refuses to compose while the terminal reports a
+            // busy external transaction; surface it as a retryable rejection
+            // instead of an error.
+            Some("busy-external")
+        } else {
+            None
+        }
+    }
+
+    /// Blank the committed footprint while its coordinates are still valid.
+    /// Shared by `hide_overlay`, the scroll-risk pre-erase, and the
+    /// suspend/exit paths — anything that must not leave painted cells it can
+    /// no longer address.
+    pub(super) fn erase_footprint(&mut self) -> Result<(), OutputError> {
+        let Some(last_ticket) = self.last_committed_ticket else {
+            self.compositor.invalidate();
+            return Ok(());
+        };
         let ticket = FrameTicket {
             buffer_revision: self.buffer_revision,
             frame_revision: last_ticket.frame_revision,
@@ -109,6 +154,43 @@ impl<W: Write> OutputActor<W> {
         // the sync-output window that held the redisplay marker.
         self.observe_drain(self.last_read_cycle);
         Ok(())
+    }
+
+    /// Erase painted cells before a child segment that may scroll the screen
+    /// is forwarded. Cells that scroll into the terminal's scrollback can
+    /// never be addressed again, so the footprint must come down while its
+    /// coordinates still match the real screen. The model has not seen this
+    /// segment yet, so its cells still reflect what the terminal shows.
+    pub(super) fn erase_before_risky_child(&mut self, segment: &[u8]) -> Result<(), OutputError> {
+        if segment.is_empty()
+            || !self.compositor.has_painted_footprint()
+            || !segment_may_scroll(segment, &self.model, self.size)
+        {
+            return Ok(());
+        }
+        if self.hide_rejection().is_some() {
+            return Ok(());
+        }
+        self.erase_footprint()
+    }
+
+    /// Last-chance erase for suspend and shutdown: identical to
+    /// `erase_before_risky_child` minus the byte-stream guards. The model is
+    /// still an accurate copy of the screen, so the per-cell comparison in
+    /// `prepare_hide` keeps shell text safe; only an externally owned
+    /// synchronized-output transaction stays off-limits.
+    pub(super) fn force_erase_footprint(&mut self) -> Result<(), OutputError> {
+        if !self.compositor.has_painted_footprint()
+            || self.model.sync_ownership() == SyncOwnership::External
+            || self.capability == SyncOutputCapability::BusyExternal
+            || self
+                .compositor
+                .footprint_key()
+                .is_some_and(|key| key.screen_epoch != self.model.screen_epoch())
+        {
+            return Ok(());
+        }
+        self.erase_footprint()
     }
 
     pub(super) fn prepare_surface_geometry(

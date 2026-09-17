@@ -42,6 +42,10 @@ pub struct OutputActor<W: Write> {
     pub(super) cursor_probe_ready: bool,
     pub(super) cursor_probe_revision: Option<BufferRevision>,
     pub(super) foreground: bool,
+    /// A hide that arrived while the byte stream was unsafe to touch. Holds
+    /// the compositor's paint serial at rejection time so a newer committed
+    /// frame supersedes it instead of being erased by the retry.
+    pub(super) pending_hide: Option<u64>,
     pub(super) size: TerminalSize,
     pub(super) report: OutputReport,
     pub(super) debug_log: Option<DebugLog>,
@@ -90,6 +94,7 @@ impl<W: Write> OutputActor<W> {
             cursor_probe_ready: false,
             cursor_probe_revision: None,
             foreground: false,
+            pending_hide: None,
             size,
             report: OutputReport::default(),
             debug_log: None,
@@ -120,6 +125,11 @@ impl<W: Write> OutputActor<W> {
             match command {
                 ActorCommand::Tick => {}
                 ActorCommand::RestoreAndExit => {
+                    // Erase a painted footprint before the decoder tail can
+                    // scroll it away and before `finish` restores the
+                    // terminal: an orphaned box cannot be addressed after
+                    // the writer is returned.
+                    let _ = self.force_erase_footprint();
                     self.flush_decoder_tail()?;
                     let writer = self.guard.finish()?;
                     return Ok(OutputActorExit {
@@ -141,6 +151,7 @@ impl<W: Write> OutputActor<W> {
                 ActorCommand::Frame(frame) => self.accept_frame(frame),
                 ActorCommand::Barrier(sender) => barrier = Some(sender),
             }
+            self.retry_pending_hide()?;
             self.try_commit_latest(Instant::now())?;
             if let Some(sender) = barrier {
                 let _ = sender.send(());
@@ -317,6 +328,7 @@ impl<W: Write> OutputActor<W> {
         let mut written_bytes = 0usize;
         for boundary in &decoded.boundaries {
             let segment = &decoded.passthrough[start..boundary.passthrough_offset];
+            self.erase_before_risky_child(segment)?;
             self.process_child_segment(segment)?;
             self.guard.write_child(segment)?;
             written_bytes = written_bytes.saturating_add(segment.len());
@@ -337,6 +349,7 @@ impl<W: Write> OutputActor<W> {
             }
         }
         let tail = &decoded.passthrough[start..];
+        self.erase_before_risky_child(tail)?;
         self.process_child_segment(tail)?;
         self.guard.write_child(tail)?;
         written_bytes = written_bytes.saturating_add(tail.len());
@@ -390,4 +403,142 @@ impl<W: Write> OutputActor<W> {
         }
         Ok(())
     }
+}
+
+/// True when forwarding `segment` could scroll the screen: newline-class
+/// bytes, index/reverse-index escapes, scrolling or scroll-region CSI
+/// commands, or enough printable cells to wrap past the bottom-right corner.
+/// Painted overlay cells must be erased before such bytes reach the
+/// terminal — once they scroll into scrollback they can never be removed.
+/// The scan is deliberately conservative: a false positive only costs an
+/// extra erase + repaint cycle.
+pub(super) fn segment_may_scroll(
+    segment: &[u8],
+    model: &TerminalModel,
+    size: TerminalSize,
+) -> bool {
+    let mut printable_cells = 0_u64;
+    let mut index = 0;
+    while index < segment.len() {
+        match segment[index] {
+            b'\n' | 0x0b | 0x0c => return true,
+            0x84 | 0x85 | 0x8d => return true, // C1 IND, NEL, RI
+            0x1b => {
+                index += 1;
+                match segment.get(index) {
+                    // ESC D/E/M: IND, NEL, RI. ESC c: RIS (the reset clears
+                    // the box anyway; flagging it keeps ordering simple).
+                    Some(b'D' | b'E' | b'M' | b'c') => return true,
+                    Some(b'[') => {
+                        index += 1;
+                        if let Some((final_byte, has_params)) = scan_csi_final(segment, &mut index)
+                            && (matches!(final_byte, b'S' | b'T' | b'L' | b'M' | b'r' | b'b')
+                                // Bare CSI s is SCOSC (save cursor — no
+                                // scroll); with params it is DECSLRM.
+                                || final_byte == b's' && has_params)
+                        {
+                            return true;
+                        }
+                        continue;
+                    }
+                    // Opaque strings (OSC/DCS/SOS/PM/APC): skip their payload
+                    // so embedded text cannot trip the newline checks. A bare
+                    // ESC aborts the string — re-dispatch it as an escape.
+                    Some(b']' | b'P' | b'X' | b'^' | b'_') => {
+                        index += 1;
+                        if skip_string(segment, &mut index) {
+                            continue;
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            0x9b => {
+                index += 1;
+                if let Some((final_byte, has_params)) = scan_csi_final(segment, &mut index)
+                    && (matches!(final_byte, b'S' | b'T' | b'L' | b'M' | b'r' | b'b')
+                        || final_byte == b's' && has_params)
+                {
+                    return true;
+                }
+                continue;
+            }
+            0x90 | 0x98 | 0x9d..=0x9f => {
+                if skip_string(segment, &mut index) {
+                    continue;
+                }
+                continue;
+            }
+            0x20..=0x7e => printable_cells += 1,
+            // UTF-8 lead bytes occupy one cell each; stepping over the
+            // continuation bytes keeps C1-looking code units out of the scan.
+            0xc0..=0xdf => {
+                printable_cells += 1;
+                index += 1;
+            }
+            0xe0..=0xef => {
+                printable_cells += 1;
+                index += 2;
+            }
+            0xf0..=0xf7 => {
+                printable_cells += 1;
+                index += 3;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    // Autowrap at the bottom-right corner scrolls on the next cell; a pending
+    // wrap leaves the cursor parked at the last column, so `>=` also catches
+    // the first printable byte of the following segment.
+    let cursor = model.cursor();
+    let last_row = size.rows.saturating_sub(1);
+    let to_corner = u64::from(last_row.saturating_sub(cursor.row)) * u64::from(size.cols)
+        + u64::from(size.cols.saturating_sub(cursor.col));
+    printable_cells != 0 && printable_cells >= to_corner
+}
+
+/// Advance `index` past a CSI's parameter and intermediate bytes and return
+/// its final byte (0x40..=0x7e) plus whether any parameter bytes were seen,
+/// leaving `index` on the byte after the final. A truncated or malformed
+/// sequence consumes the rest of the segment.
+fn scan_csi_final(segment: &[u8], index: &mut usize) -> Option<(u8, bool)> {
+    let mut has_params = false;
+    while let Some(&byte) = segment.get(*index) {
+        if (0x40..=0x7e).contains(&byte) {
+            *index += 1;
+            return Some((byte, has_params));
+        }
+        if !(0x20..=0x3f).contains(&byte) {
+            break;
+        }
+        has_params |= (0x30..=0x3f).contains(&byte);
+        *index += 1;
+    }
+    None
+}
+
+/// Advance `index` past an OSC/DCS/SOS/PM/APC payload: everything up to and
+/// including a BEL or ST terminator. Returns `true` when a bare ESC aborted
+/// the string — `index` then sits on the ESC so the caller can re-dispatch
+/// it as a new escape sequence.
+fn skip_string(segment: &[u8], index: &mut usize) -> bool {
+    while let Some(&byte) = segment.get(*index) {
+        match byte {
+            0x07 | 0x9c => {
+                *index += 1;
+                return false;
+            }
+            0x1b => {
+                if segment.get(*index + 1) == Some(&b'\\') {
+                    *index += 2;
+                    return false;
+                }
+                return true;
+            }
+            _ => *index += 1,
+        }
+    }
+    false
 }

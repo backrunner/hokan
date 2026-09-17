@@ -3,8 +3,8 @@ use std::time::Duration;
 use super::frame::scroll_room_bytes;
 use super::*;
 use crate::terminal::{
-    CellPos, CursorRestore, DrainState, FrameRevision, OverlayRow, RenderBoundaryEvent, RiskLevel,
-    WidthPolicy, render_boundary::encode_marker,
+    AnchorConfidence, CellPos, CursorRestore, DrainState, FrameRevision, OverlayRow,
+    RenderBoundaryEvent, RiskLevel, TerminalModel, WidthPolicy, render_boundary::encode_marker,
 };
 
 fn token() -> SessionToken {
@@ -885,4 +885,293 @@ fn mailbox_priority_is_restore_child_hide_control_frame() {
             .expect("control command should be available"),
         ActorCommand::Control(_)
     ));
+}
+
+#[test]
+fn segment_may_scroll_flags_scroll_capable_bytes() {
+    let size = TerminalSize::new(24, 80).expect("fixture terminal size is valid");
+    let mut model = TerminalModel::new(size);
+    model
+        .confirm_cursor(CellPos::new(10, 5))
+        .expect("cursor should anchor");
+
+    // Newline-class bytes and explicit scroll commands.
+    assert!(super::actor::segment_may_scroll(b"line\n", &model, size));
+    assert!(super::actor::segment_may_scroll(b"\x0b\x0c", &model, size));
+    assert!(super::actor::segment_may_scroll(b"\x1bD", &model, size));
+    assert!(super::actor::segment_may_scroll(b"\x1bE", &model, size));
+    assert!(super::actor::segment_may_scroll(b"\x1bM", &model, size));
+    assert!(super::actor::segment_may_scroll(
+        b"\x84\x85\x8d",
+        &model,
+        size
+    ));
+    assert!(super::actor::segment_may_scroll(b"\x1b[3S", &model, size));
+    assert!(super::actor::segment_may_scroll(b"\x1b[2T", &model, size));
+    assert!(super::actor::segment_may_scroll(b"\x1b[L", &model, size));
+    assert!(super::actor::segment_may_scroll(b"\x1b[M", &model, size));
+    assert!(super::actor::segment_may_scroll(
+        b"\x1b[1;20r",
+        &model,
+        size
+    ));
+    assert!(super::actor::segment_may_scroll(b"\x1b[4b", &model, size));
+    assert!(super::actor::segment_may_scroll(b"\x9b3S", &model, size));
+    assert!(super::actor::segment_may_scroll(
+        b"\x1b[5;10s",
+        &model,
+        size
+    ));
+
+    // Cursor moves, styles, erases, and save/restore do not scroll.
+    assert!(!super::actor::segment_may_scroll(
+        b"plain text",
+        &model,
+        size
+    ));
+    assert!(!super::actor::segment_may_scroll(
+        b"\x1b[31mred",
+        &model,
+        size
+    ));
+    assert!(!super::actor::segment_may_scroll(
+        b"\x1b[2J\x1b[K",
+        &model,
+        size
+    ));
+    assert!(!super::actor::segment_may_scroll(
+        b"\x1b[10;5H",
+        &model,
+        size
+    ));
+    assert!(!super::actor::segment_may_scroll(
+        b"\x1b7\x1b8",
+        &model,
+        size
+    ));
+    assert!(!super::actor::segment_may_scroll(
+        b"\x1b[s\x1b[u",
+        &model,
+        size
+    ));
+    // A newline inside an OSC payload is string content, not a scroll.
+    assert!(!super::actor::segment_may_scroll(
+        b"\x1b]8;;https://x\ny\x1b\\link\x1b]8;;\x07",
+        &model,
+        size
+    ));
+    // But an escape that aborts a string is still a scroll command.
+    assert!(super::actor::segment_may_scroll(
+        b"\x1b]8;;https://x\x1bD",
+        &model,
+        size
+    ));
+    // Multibyte text must not trip the C1 checks.
+    assert!(!super::actor::segment_may_scroll(
+        "héllo→".as_bytes(),
+        &model,
+        size
+    ));
+}
+
+#[test]
+fn segment_may_scroll_flags_overflow_past_the_bottom_corner() {
+    let size = TerminalSize::new(4, 10).expect("fixture terminal size is valid");
+    let mut model = TerminalModel::new(size);
+    model
+        .confirm_cursor(CellPos::new(3, 8))
+        .expect("cursor should anchor");
+    // Two cells remain before the bottom-right corner.
+    assert!(!super::actor::segment_may_scroll(b"x", &model, size));
+    assert!(super::actor::segment_may_scroll(b"xy", &model, size));
+    assert!(super::actor::segment_may_scroll(b"xyz", &model, size));
+
+    model
+        .confirm_cursor(CellPos::new(0, 0))
+        .expect("cursor should anchor");
+    // Forty cells fill rows 0..3 completely — the corner is reached.
+    assert!(super::actor::segment_may_scroll(&[b'x'; 40], &model, size));
+    assert!(!super::actor::segment_may_scroll(&[b'x'; 39], &model, size));
+}
+
+#[test]
+fn scrolling_child_segment_erases_footprint_before_forwarding() {
+    let size = TerminalSize::new(24, 80).expect("fixture terminal size is valid");
+    let mut actor = OutputActor::new(Vec::new(), token(), size, 3);
+    actor.model.invalidate().expect("fixture epoch");
+    actor.model.establish_anchor();
+
+    let frame = frame_request();
+    let buffer = actor.renderer.render(frame.geometry, &frame.view);
+    let prepared = actor
+        .compositor
+        .prepare(
+            frame.key,
+            buffer,
+            frame.ticket,
+            &actor.model.cursor_restore(),
+            SyncOutputCapability::UnsupportedFallback,
+            Some(&actor.model),
+        )
+        .expect("frame should compose");
+    let frame_bytes = prepared.staged().bytes.clone();
+    actor
+        .guard
+        .write_staged(prepared.staged())
+        .expect("frame should be written");
+    actor.model.apply_hokan_frame(&frame_bytes);
+    actor
+        .compositor
+        .commit(prepared)
+        .expect("frame should commit");
+    actor.last_committed_ticket = Some(frame.ticket);
+    assert!(actor.compositor.has_painted_footprint());
+
+    // Twenty newline-terminated lines guarantee real scrolling wherever the
+    // cursor sits. The footprint must be erased before these bytes reach the
+    // terminal, or the painted cells are pushed into scrollback forever.
+    let mut scroll = Vec::new();
+    for _ in 0..20 {
+        scroll.extend_from_slice(b"line\n");
+    }
+    actor
+        .handle_child(ChildOutputBatch {
+            read_cycle: 1,
+            bytes: scroll.clone(),
+            drain: DrainState::DrainedToEagain,
+        })
+        .expect("child output should be written");
+
+    let output = actor.guard.finish().expect("guard should finish");
+    let child_at = output
+        .windows(scroll.len())
+        .position(|window| window == scroll.as_slice())
+        .expect("child bytes should be forwarded");
+    assert!(
+        child_at > frame_bytes.len(),
+        "erase must land between the painted frame and the child bytes"
+    );
+
+    // Replay the whole transcript: the box is erased before the scroll, so
+    // neither the screen nor the scrollback can hold painted cells.
+    let mut parser = vt100::Parser::new(24, 80, 64);
+    parser.process(&output);
+    let screen = parser.screen();
+    for row in 0..24 {
+        for col in 0..80 {
+            let cell = screen.cell(row, col).expect("cell");
+            assert!(
+                !cell.contents().contains('╭')
+                    && !cell.contents().contains('╰')
+                    && !cell.contents().contains('│'),
+                "overlay glyph survived at ({row}, {col})"
+            );
+            assert_eq!(
+                cell.bgcolor(),
+                vt100::Color::Default,
+                "painted background survived at ({row}, {col})"
+            );
+        }
+    }
+    assert!(!actor.compositor.has_painted_footprint());
+}
+
+#[test]
+fn rejected_hide_retries_once_the_stream_is_safe() {
+    let size = TerminalSize::new(24, 80).expect("fixture terminal size is valid");
+    let mut actor = OutputActor::new(Vec::new(), token(), size, 3);
+    actor.model.invalidate().expect("fixture epoch");
+    actor.model.establish_anchor();
+
+    let frame = frame_request();
+    let buffer = actor.renderer.render(frame.geometry, &frame.view);
+    let prepared = actor
+        .compositor
+        .prepare(
+            frame.key,
+            buffer,
+            frame.ticket,
+            &actor.model.cursor_restore(),
+            SyncOutputCapability::UnsupportedFallback,
+            Some(&actor.model),
+        )
+        .expect("frame should compose");
+    actor
+        .guard
+        .write_staged(prepared.staged())
+        .expect("frame should be written");
+    actor.model.apply_hokan_frame(&prepared.staged().bytes);
+    actor
+        .compositor
+        .commit(prepared)
+        .expect("frame should commit");
+    actor.last_committed_ticket = Some(frame.ticket);
+
+    // A hide while the anchor confidence is unknown is rejected but stays
+    // armed: the box remains on screen until the erase can be written. An
+    // out-of-bounds CPR reply drops confidence without an epoch change, so
+    // the footprint coordinates remain valid for the retry.
+    actor
+        .model
+        .confirm_cursor(CellPos::new(200, 200))
+        .expect("probe should process");
+    assert_eq!(actor.model.confidence(), AnchorConfidence::Unknown);
+    actor.hide_overlay().expect("hide should not error");
+    assert!(actor.compositor.has_painted_footprint());
+    assert!(actor.pending_hide.is_some());
+
+    // The retry fires as soon as the guard clears (here: a fresh anchor).
+    actor.model.establish_anchor();
+    actor.retry_pending_hide().expect("retry should not error");
+    assert!(!actor.compositor.has_painted_footprint());
+    assert!(actor.pending_hide.is_none());
+}
+
+#[test]
+fn pending_hide_does_not_erase_a_newer_frame() {
+    let size = TerminalSize::new(24, 80).expect("fixture terminal size is valid");
+    let mut actor = OutputActor::new(Vec::new(), token(), size, 3);
+    actor.model.invalidate().expect("fixture epoch");
+    actor.model.establish_anchor();
+
+    let frame = frame_request();
+    for ticket in [
+        frame.ticket,
+        FrameTicket {
+            frame_revision: FrameRevision::new(2),
+            ..frame.ticket
+        },
+    ] {
+        let buffer = actor.renderer.render(frame.geometry, &frame.view);
+        let prepared = actor
+            .compositor
+            .prepare(
+                frame.key,
+                buffer,
+                ticket,
+                &actor.model.cursor_restore(),
+                SyncOutputCapability::UnsupportedFallback,
+                Some(&actor.model),
+            )
+            .expect("frame should compose");
+        actor
+            .guard
+            .write_staged(prepared.staged())
+            .expect("frame should be written");
+        actor.model.apply_hokan_frame(&prepared.staged().bytes);
+        actor
+            .compositor
+            .commit(prepared)
+            .expect("frame should commit");
+        actor.last_committed_ticket = Some(ticket);
+        if actor.pending_hide.is_none() {
+            actor.model.invalidate().expect("lose the anchor");
+            actor.hide_overlay().expect("hide should not error");
+            assert!(actor.pending_hide.is_some());
+            actor.model.establish_anchor();
+        }
+    }
+    actor.retry_pending_hide().expect("retry should not error");
+    // The second commit superseded the armed hide: the new box stays.
+    assert!(actor.compositor.has_painted_footprint());
 }

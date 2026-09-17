@@ -312,12 +312,45 @@ impl TerminalSession {
         Self::spawn_command_with_private_cpr(home, work, command, sync_status, true)
     }
 
+    /// A colored session (no `NO_COLOR`) with scrollback captured in the
+    /// fixture parser, for residue checks that need to inspect rows that
+    /// scrolled off the top of the screen.
+    fn spawn_colored_with_scrollback(scrollback: usize) -> Self {
+        let (home, work) = fixture_directories();
+        let mut command = CommandBuilder::new(hokan_test_bin());
+        command.arg("--shell");
+        command.arg("zsh");
+        configure_command(&mut command, &home, &work);
+        command.env_remove("NO_COLOR");
+        Self::spawn_command_with_private_cpr_and_scrollback(
+            home, work, command, 2, true, scrollback,
+        )
+    }
+
     fn spawn_command_with_private_cpr(
         home: TempDir,
         work: TempDir,
         command: CommandBuilder,
         sync_status: u8,
         private_cpr_supported: bool,
+    ) -> Self {
+        Self::spawn_command_with_private_cpr_and_scrollback(
+            home,
+            work,
+            command,
+            sync_status,
+            private_cpr_supported,
+            0,
+        )
+    }
+
+    fn spawn_command_with_private_cpr_and_scrollback(
+        home: TempDir,
+        work: TempDir,
+        command: CommandBuilder,
+        sync_status: u8,
+        private_cpr_supported: bool,
+        scrollback: usize,
     ) -> Self {
         let pty = native_pty_system();
         let pair = pty
@@ -366,7 +399,7 @@ impl TerminalSession {
             child,
             chunks,
             reader: Some(reader),
-            terminal: vt100::Parser::new(24, 80, 0),
+            terminal: vt100::Parser::new(24, 80, scrollback),
             rows: 24,
             cols: 80,
             transcript: Vec::new(),
@@ -657,6 +690,56 @@ impl TerminalSession {
             }
         }
         strays
+    }
+
+    /// Every visible cell carrying a non-default background color. Hokan's
+    /// colored overlay is the only painter in these fixtures, so painted
+    /// cells after dismissal are residue.
+    fn painted_screen_cells(&self) -> Vec<String> {
+        let screen = self.terminal.screen();
+        let mut painted = Vec::new();
+        for row in 0..self.rows {
+            for col in 0..self.cols {
+                if let Some(cell) = screen.cell(row, col)
+                    && cell.bgcolor() != vt100::Color::Default
+                {
+                    painted.push(format!(
+                        "({row}, {col}) bg={:?} {:?}",
+                        cell.bgcolor(),
+                        cell.contents()
+                    ));
+                }
+            }
+        }
+        painted
+    }
+
+    /// Painted cells in the scrollback rows above the current screen. Once a
+    /// row is pushed there no terminal sequence can reach it, so overlay
+    /// cells found here are permanently visible when scrolling up.
+    fn painted_scrollback_cells(&mut self) -> Vec<String> {
+        let screen = self.terminal.screen_mut();
+        // Clamping the view offset to the maximum reports the scrollback
+        // length; restoring offset 0 returns the view to the live screen.
+        screen.set_scrollback(usize::MAX);
+        let count = screen.scrollback();
+        let mut painted = Vec::new();
+        for offset in 1..=count {
+            screen.set_scrollback(offset);
+            for col in 0..self.cols {
+                if let Some(cell) = screen.cell(0, col)
+                    && cell.bgcolor() != vt100::Color::Default
+                {
+                    painted.push(format!(
+                        "scrollback[{offset}] (0, {col}) bg={:?} {:?}",
+                        cell.bgcolor(),
+                        cell.contents()
+                    ));
+                }
+            }
+        }
+        screen.set_scrollback(0);
+        painted
     }
 
     fn screen_text(&self) -> String {
@@ -3335,4 +3418,107 @@ fn tail(bytes: &[u8], max: usize) -> String {
 
 fn head(bytes: &[u8], max: usize) -> String {
     String::from_utf8_lossy(&bytes[..bytes.len().min(max)]).into_owned()
+}
+
+/// Regression test: child output that scrolls the screen while the overlay
+/// is painted must not carry painted cells into the terminal's scrollback,
+/// where they could never be erased. Before the fix, a background job
+/// printing a screenful of text scrolled the whole box (border glyphs plus
+/// their panel background) into scrollback and it stayed there forever.
+#[test]
+fn background_output_cannot_scroll_painted_overlay_into_scrollback() {
+    if !command_exists("zsh") {
+        return;
+    }
+    let mut terminal = TerminalSession::spawn_colored_with_scrollback(200);
+    terminal.wait_for_screen("HK> ");
+    terminal.wait_for_sync_replies(1);
+    // Seed history so typing `seq` offers candidates and paints the box.
+    terminal.write(b"seq 1 5\r");
+    terminal.wait_for_screen("HK> seq 1 5");
+    terminal.wait_for_screen("HK> ");
+
+    // A background job that prints a full screen one second from now.
+    terminal.write(b"{ sleep 1; seq 100 140 } &\r");
+    terminal.wait_for_screen("HK> ");
+
+    // Open the overlay before the job fires.
+    terminal.write(b"seq");
+    terminal.wait_for_clean_overlay("seq");
+    assert!(
+        !terminal.painted_screen_cells().is_empty(),
+        "colored overlay should be painted before the scroll"
+    );
+
+    // The job output scrolls the screen while the box is (or was) painted.
+    terminal.settle(Duration::from_millis(2500));
+
+    // Whatever repaint happened, dismissal must leave nothing behind —
+    // neither on the live screen nor in scrollback.
+    terminal.write(b"\x1b");
+    terminal.settle(Duration::from_millis(500));
+
+    let text = terminal.screen_text();
+    for glyph in ['╭', '╮', '╰', '╯', '│', '─'] {
+        assert!(
+            !text.contains(glyph),
+            "overlay glyph {glyph:?} left on screen:\n{text}"
+        );
+    }
+    let painted = terminal.painted_screen_cells();
+    assert!(
+        painted.is_empty(),
+        "painted cells left on screen: {painted:?}"
+    );
+    let scrollback = terminal.painted_scrollback_cells();
+    assert!(
+        scrollback.is_empty(),
+        "painted cells scrolled into scrollback: {} cells, first={:?}",
+        scrollback.len(),
+        scrollback.first()
+    );
+
+    terminal.exit_shell();
+    terminal.wait_until_exit();
+}
+
+/// A partial scroll is the same hazard with less margin: the overlay's top
+/// rows are pushed into scrollback while the rest stays on screen.
+#[test]
+fn small_background_output_leaves_no_overlay_residue() {
+    if !command_exists("zsh") {
+        return;
+    }
+    let mut terminal = TerminalSession::spawn_colored_with_scrollback(200);
+    terminal.wait_for_screen("HK> ");
+    terminal.wait_for_sync_replies(1);
+    // Fill the screen so the next prompt — and the overlay under it — sits
+    // at the bottom, where even a small burst scrolls the box's top rows
+    // into scrollback.
+    terminal.write(b"seq 1 20\r");
+    terminal.wait_for_screen("HK> seq 1 20");
+    terminal.wait_for_screen("HK> ");
+
+    terminal.write(b"{ sleep 1; seq 200 225 } &\r");
+    terminal.wait_for_screen("HK> ");
+    terminal.write(b"seq");
+    terminal.wait_for_clean_overlay("seq");
+
+    terminal.settle(Duration::from_millis(2500));
+    terminal.write(b"\x1b");
+    terminal.settle(Duration::from_millis(500));
+
+    let painted = terminal.painted_screen_cells();
+    assert!(
+        painted.is_empty(),
+        "painted cells left on screen: {painted:?}"
+    );
+    let scrollback = terminal.painted_scrollback_cells();
+    assert!(
+        scrollback.is_empty(),
+        "painted cells in scrollback: {scrollback:?}"
+    );
+
+    terminal.exit_shell();
+    terminal.wait_until_exit();
 }

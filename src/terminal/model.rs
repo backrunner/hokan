@@ -85,6 +85,11 @@ impl vte::Perform for EffectObserver {
             | ([b'?'], 'n' | 'u' | 'p')
             | ([b'?', b'$'], 'p')
             | ([b'>'], 'c') => {}
+            // Bare CSI s is SCOSC (save cursor): no cell change on the real
+            // terminal.  TerminalModel feeds it to vt100 as DECSC so a later
+            // CSI u/ESC 8 restore lands where the shell expects.  Parameter
+            // forms (DECSLRM) still invalidate the epoch.
+            ([], 's') if params.is_empty() => {}
             ([], 't') => self.unknown_screen_effect = true,
             ([], 'h' | 'l') => {
                 for param in params {
@@ -233,7 +238,7 @@ impl TerminalModel {
         }
 
         let was_alternate = self.parser.screen().alternate_screen();
-        self.parser.process(bytes);
+        self.parser.process(&translate_scosc_scorc(bytes));
         self.observer_parser.advance(&mut self.observer, bytes);
         self.screen_revision = self
             .screen_revision
@@ -431,6 +436,36 @@ impl TerminalModel {
             epoch_changed,
         }
     }
+}
+
+/// vt100 only models DECSC/DECRC (`ESC 7`/`ESC 8`); the xterm-style
+/// SCOSC/SCORC pair (`CSI s`/`CSI u`) is ignored, so a `tput rc` cursor
+/// restore would move the real cursor without the model knowing. Rewrite the
+/// bare forms for the parser feed only — the effect observer still sees the
+/// original bytes. Parameter forms are left untouched: `CSI Ps;Ps s` is
+/// DECSLRM, not a save.
+fn translate_scosc_scorc(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    if !bytes
+        .windows(3)
+        .any(|window| window == b"\x1b[s" || window == b"\x1b[u")
+    {
+        return std::borrow::Cow::Borrowed(bytes);
+    }
+    let mut translated = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index..].starts_with(b"\x1b[s") {
+            translated.extend_from_slice(b"\x1b7");
+            index += 3;
+        } else if bytes[index..].starts_with(b"\x1b[u") {
+            translated.extend_from_slice(b"\x1b8");
+            index += 3;
+        } else {
+            translated.push(bytes[index]);
+            index += 1;
+        }
+    }
+    std::borrow::Cow::Owned(translated)
 }
 
 #[cfg(test)]

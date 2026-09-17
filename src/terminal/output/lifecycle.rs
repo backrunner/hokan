@@ -10,13 +10,19 @@ impl<W: Write> OutputActor<W> {
         let hide_result = self
             .hide_overlay()
             .map_err(|error| io::Error::other(error.to_string()));
+        // A hide rejected by the byte-stream guards leaves the painted box
+        // on screen for the whole suspension. The model is still an accurate
+        // copy (nothing else has run), so the cell-compared erase is safe.
+        let force_result = self
+            .force_erase_footprint()
+            .map_err(|error| io::Error::other(error.to_string()));
         self.latest_frame = None;
         self.compositor.invalidate();
         self.readiness = RenderReadiness::Unknown;
         self.cursor_probe_ready = false;
         self.cursor_probe_revision = None;
         let restore_result = self.guard.suspend();
-        hide_result.and(restore_result)
+        hide_result.and(force_result).and(restore_result)
     }
 
     pub(super) fn resume_terminal(&mut self, size: TerminalSize) -> io::Result<()> {
