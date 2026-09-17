@@ -22,7 +22,23 @@ pub(super) fn render_current(state: &mut RuntimeState, output: &OutputHandle) ->
         || state.suspended
     {
         state.repaint_pending = false;
+        state.in_flight_frame = None;
         state.scheduler.discard_pending();
+        return Ok(());
+    }
+    if state.overlay_visible
+        && state.pending_confirm.is_none()
+        && state.selected.is_none()
+        && !state.pending_accept
+        && state
+            .provider_batch_deadline
+            .is_some_and(|deadline| Instant::now() < deadline)
+    {
+        // Keep an existing list stable while fast providers finish within one
+        // frame, instead of shrinking it and immediately growing/reordering
+        // it. First appearance and navigation remain immediate; slower refreshes
+        // can paint their partial result after this bounded delay.
+        state.repaint_pending = true;
         return Ok(());
     }
     if !state.overlay_visible
@@ -36,6 +52,7 @@ pub(super) fn render_current(state: &mut RuntimeState, output: &OutputHandle) ->
     if state.candidates.is_empty() && state.status.is_none() && state.pending_confirm.is_none() {
         state.overlay_visible = false;
         state.repaint_pending = false;
+        state.scheduler.discard_pending();
         output.hide_overlay().map_err(output_error)?;
         return Ok(());
     }
@@ -185,11 +202,9 @@ pub(super) fn render_current(state: &mut RuntimeState, output: &OutputHandle) ->
         geometry,
         view,
     };
-    state
-        .scheduler
-        .submit(state.frame_revision, request.clone());
+    state.scheduler.submit(state.frame_revision, request);
     if let Some((_, frame)) = state.scheduler.take_ready(Instant::now()) {
-        output.commit_latest(frame).map_err(output_error)?;
+        commit_frame(state, output, frame)?;
     }
     state.overlay_visible = true;
     state.repaint_pending = false;
@@ -202,12 +217,43 @@ pub(super) fn flush_scheduled_frame(
 ) -> crate::Result<()> {
     if !state.overlay_visible {
         state.scheduler.discard_pending();
+        state.in_flight_frame = None;
+    }
+    if let Some(ticket) = state.in_flight_frame {
+        let current = output.state().map_err(output_error)?;
+        if current
+            .last_committed_frame
+            .is_some_and(|committed| committed.frame_revision >= ticket.frame_revision)
+        {
+            state.in_flight_frame = None;
+        } else if current.screen_revision != ticket.screen_revision
+            || current.screen_epoch != ticket.screen_epoch
+            || matches!(current.readiness, RenderReadiness::Unknown)
+        {
+            // The actor cannot commit this ticket anymore. Rebuild from the
+            // current screen even when this was the query's final result and
+            // no provider or PTY event will arrive to trigger another paint.
+            state.in_flight_frame = None;
+            state.repaint_pending = true;
+        }
     }
     if state.repaint_pending {
         render_current(state, output)?;
     }
     if let Some((_, frame)) = state.scheduler.take_ready(Instant::now()) {
-        output.commit_latest(frame).map_err(output_error)?;
+        commit_frame(state, output, frame)?;
+    }
+    Ok(())
+}
+
+fn commit_frame(
+    state: &mut RuntimeState,
+    output: &OutputHandle,
+    frame: FrameRequest,
+) -> crate::Result<()> {
+    let ticket = frame.ticket;
+    if output.commit_latest(frame).map_err(output_error)? {
+        state.in_flight_frame = Some(ticket);
     }
     Ok(())
 }

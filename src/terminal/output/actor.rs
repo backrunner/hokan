@@ -296,6 +296,7 @@ impl<W: Write> OutputActor<W> {
             screen_revision: self.model.screen_revision(),
             screen_epoch: self.model.screen_epoch(),
             readiness: self.readiness,
+            last_committed_frame: self.last_committed_ticket,
             alternate_screen: self.model.alternate_screen(),
             foreground: self.foreground,
             cursor_probe_ready: self.cursor_probe_ready,

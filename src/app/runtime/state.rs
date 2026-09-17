@@ -19,7 +19,8 @@ use crate::{
     shell::ShellKind,
     specs::SpecRegistry,
     terminal::{
-        BufferRevision, FrameRequest, FrameRevision, LatestFrameScheduler, QueryId, TerminalSize,
+        BufferRevision, FrameRequest, FrameRevision, FrameTicket, LatestFrameScheduler, QueryId,
+        TerminalSize,
     },
 };
 use tokio_util::sync::CancellationToken;
@@ -45,6 +46,9 @@ pub(super) struct RuntimeState {
     pub(super) history_only: bool,
     pub(super) history_navigation: bool,
     pub(super) provider_pending: bool,
+    /// Give partial rows one frame to accumulate before replacing a visible
+    /// list. First appearance, final results and navigation bypass the delay.
+    pub(super) provider_batch_deadline: Option<Instant>,
     pub(super) overlay_visible: bool,
     /// Explicit dismissal lasts until the buffer changes or the user reopens
     /// the list, including across background help/config refreshes.
@@ -53,6 +57,9 @@ pub(super) struct RuntimeState {
     /// ready (render gate, anchor, or geometry) — the main loop retries the
     /// repaint on every tick until it lands or the query moves on.
     pub(super) repaint_pending: bool,
+    /// A queued output frame is not necessarily committed: child output can
+    /// invalidate its ticket before the actor gets to it.
+    pub(super) in_flight_frame: Option<FrameTicket>,
     pub(super) frame_revision: FrameRevision,
     pub(super) editing: bool,
     /// Enter was forwarded before the shell's first PROMPT control event.
@@ -139,9 +146,11 @@ impl RuntimeState {
             history_only: false,
             history_navigation: false,
             provider_pending: false,
+            provider_batch_deadline: None,
             overlay_visible: false,
             dismissed_revision: None,
             repaint_pending: false,
+            in_flight_frame: None,
             frame_revision: FrameRevision::ZERO,
             editing: false,
             queued_startup_enter: false,
@@ -209,6 +218,8 @@ impl RuntimeState {
         self.cancel_ai();
         self.ai_owns_candidates = false;
         self.repaint_pending = false;
+        self.in_flight_frame = None;
+        self.provider_batch_deadline = None;
         self.scheduler.discard_pending();
         self.status = None;
         self.pending_confirm = None;
@@ -216,6 +227,7 @@ impl RuntimeState {
             || self.buffer.sync == SyncQuality::Uncertain
             || (self.buffer.text.trim().is_empty() && !self.history_only)
         {
+            worker.cancel();
             self.context = None;
             self.candidates_context = None;
             self.candidates.clear();
@@ -272,8 +284,10 @@ impl RuntimeState {
         self.pending_accept = false;
         self.pending_confirm = None;
         self.provider_pending = false;
+        self.provider_batch_deadline = None;
         self.overlay_visible = false;
         self.repaint_pending = false;
+        self.in_flight_frame = None;
         self.status = None;
         self.scheduler.discard_pending();
     }

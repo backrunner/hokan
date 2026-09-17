@@ -76,6 +76,7 @@ pub(super) fn handle_control_message(
             state.selection_intent = None;
             state.pending_accept = false;
             state.provider_pending = false;
+            state.provider_batch_deadline = None;
             state.overlay_visible = false;
             state.pending_confirm = None;
             state.foreground_process = queued_enter;

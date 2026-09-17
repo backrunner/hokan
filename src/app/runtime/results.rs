@@ -1,4 +1,8 @@
-use std::{sync::Arc, thread};
+use std::{
+    sync::Arc,
+    thread,
+    time::{Duration, Instant},
+};
 
 use super::{
     output_error,
@@ -146,6 +150,7 @@ pub(super) fn start_ai_request(
         cancel,
     });
     state.ai_owns_candidates = true;
+    state.provider_batch_deadline = None;
     if let Some(log) = &state.debug_log {
         log.ai_event("started");
     }
@@ -187,6 +192,12 @@ pub(super) fn handle_provider_result(
             .output
             .candidates
             .retain(|candidate| candidate.source == CandidateSource::History);
+    }
+    // A partial empty result must not replace the still-visible list. Keep
+    // its original context so stale rows continue to fail activation checks.
+    // The final batch alone decides whether the query has no matches.
+    if !result.final_batch && result.output.candidates.is_empty() {
+        return Ok(());
     }
     // No implicit selection: the first row is never pre-selected, but a
     // selection the user already made survives batches while the candidate
@@ -231,6 +242,13 @@ pub(super) fn handle_provider_result(
                 })
         });
     state.provider_pending = !result.final_batch;
+    if result.final_batch {
+        state.provider_batch_deadline = None;
+    } else {
+        state
+            .provider_batch_deadline
+            .get_or_insert_with(|| Instant::now() + Duration::from_millis(16));
+    }
     state.status = result
         .output
         .diagnostics
@@ -247,6 +265,8 @@ pub(super) fn handle_provider_result(
     }
     if state.candidates.is_empty() && state.status.is_none() {
         state.overlay_visible = false;
+        state.repaint_pending = false;
+        state.scheduler.discard_pending();
         output.hide_overlay().map_err(output_error)?;
     } else {
         render_current(state, output)?;

@@ -11,7 +11,7 @@ use crate::{
     completion::{CompletionContext, CompletionEngine, ProviderOutput},
     diagnostics::DebugLog,
 };
-use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, unbounded};
+use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 
 pub(super) struct ProviderResult {
     pub(super) context: Arc<CompletionContext>,
@@ -35,7 +35,8 @@ impl ProviderWorker {
     ) -> crate::Result<Self> {
         let (sender, receiver) = bounded::<Arc<CompletionContext>>(1);
         let pending = receiver.clone();
-        let (result_sender, results) = unbounded();
+        let (result_sender, results) = bounded(1);
+        let superseded_results = results.clone();
         let latest_query = Arc::new(AtomicU64::new(0));
         let worker_latest_query = Arc::clone(&latest_query);
         let engine = Arc::new(RwLock::new(engine));
@@ -62,14 +63,15 @@ impl ProviderWorker {
                     engine.complete_incremental_with_metrics(
                         &context,
                         |output, final_batch| {
-                            if result_sender
-                                .send(ProviderResult {
+                            if !publish_latest(
+                                &result_sender,
+                                &superseded_results,
+                                ProviderResult {
                                     context: Arc::clone(&context),
                                     output,
                                     final_batch,
-                                })
-                                .is_err()
-                            {
+                                },
+                            ) {
                                 disconnected.set(true);
                             }
                         },
@@ -127,6 +129,11 @@ impl ProviderWorker {
         &self.results
     }
 
+    pub(super) fn cancel(&self) {
+        self.latest_query.store(0, Ordering::Release);
+        let _ = self.pending.try_recv();
+    }
+
     pub(super) fn replace_engine(&self, engine: Arc<CompletionEngine>) -> crate::Result<()> {
         *self
             .engine
@@ -138,10 +145,28 @@ impl ProviderWorker {
 
 impl Drop for ProviderWorker {
     fn drop(&mut self) {
+        self.cancel();
         self.sender.take();
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
+    }
+}
+
+// Provider batches are cumulative. Keeping only the newest unread batch bounds
+// memory and prevents the input loop from replaying obsolete intermediate lists.
+fn publish_latest(
+    sender: &Sender<ProviderResult>,
+    pending: &Receiver<ProviderResult>,
+    result: ProviderResult,
+) -> bool {
+    match sender.try_send(result) {
+        Ok(()) => true,
+        Err(TrySendError::Full(result)) => {
+            let _ = pending.try_recv();
+            sender.try_send(result).is_ok()
+        }
+        Err(TrySendError::Disconnected(_)) => false,
     }
 }
 
@@ -155,7 +180,7 @@ mod tests {
         shell::ShellKind,
         terminal::{BufferRevision, QueryId},
     };
-    use crossbeam_channel::RecvTimeoutError;
+    use crossbeam_channel::{RecvTimeoutError, unbounded};
 
     /// Every `complete` call announces its query id and then blocks until the
     /// test releases it, so scheduling/interleaving is fully deterministic.
@@ -240,5 +265,53 @@ mod tests {
             ),
             "superseded queries must not emit batches"
         );
+    }
+
+    #[test]
+    fn unread_batches_are_replaced_by_the_latest_final_result() {
+        let (sender, receiver) = bounded(1);
+        for query_id in 1..=100 {
+            assert!(publish_latest(
+                &sender,
+                &receiver,
+                ProviderResult {
+                    context: context(query_id),
+                    output: ProviderOutput::default(),
+                    final_batch: query_id == 100,
+                },
+            ));
+            assert_eq!(receiver.len(), 1);
+        }
+        let result = receiver.try_recv().expect("latest result");
+        assert_eq!(result.context.query_id, QueryId::new(100));
+        assert!(result.final_batch);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn cancellation_discards_active_and_queued_queries() {
+        let (started_sender, started) = unbounded();
+        let (release, released) = unbounded::<()>();
+        let mut engine = CompletionEngine::new(8, 12);
+        engine.register(BlockingProvider {
+            started: started_sender,
+            release: released,
+        });
+        let worker = ProviderWorker::start(Arc::new(engine), None).expect("worker");
+        worker.schedule(context(1)).expect("active query");
+        assert_eq!(started.recv_timeout(Duration::from_secs(5)), Ok(1));
+        worker.schedule(context(2)).expect("queued query");
+        worker.cancel();
+        release.send(()).expect("release cancelled query");
+        worker.schedule(context(3)).expect("fresh query");
+        assert_eq!(started.recv_timeout(Duration::from_secs(5)), Ok(3));
+        release.send(()).expect("release fresh query");
+        let result = worker
+            .results()
+            .recv_timeout(Duration::from_secs(5))
+            .expect("fresh result");
+        assert_eq!(result.context.query_id, QueryId::new(3));
+        assert!(result.final_batch);
+        assert!(worker.results().try_recv().is_err());
     }
 }

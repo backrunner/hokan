@@ -66,6 +66,7 @@ pub struct OutputState {
     pub screen_revision: ScreenRevision,
     pub screen_epoch: ScreenEpoch,
     pub readiness: RenderReadiness,
+    pub last_committed_frame: Option<FrameTicket>,
     pub alternate_screen: bool,
     pub foreground: bool,
     pub cursor_probe_ready: bool,

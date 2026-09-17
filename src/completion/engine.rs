@@ -1,10 +1,14 @@
 use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crate::completion::{Candidate, CompletionContext, CompletionMode, rank_and_dedupe};
+
+// Match the overlay's frame cadence: publish the first usable result promptly,
+// then merge fast sources before paying for another cumulative rank and clone.
+const BATCH_INTERVAL: Duration = Duration::from_millis(16);
 
 #[derive(Clone, Copy, Debug)]
 pub struct ProviderMetric {
@@ -113,10 +117,24 @@ impl CompletionEngine {
     pub fn complete_incremental_with_metrics(
         &self,
         context: &CompletionContext,
+        emit: impl FnMut(ProviderOutput, bool),
+        cancelled: impl FnMut() -> bool,
+        observe: impl FnMut(ProviderMetric),
+    ) {
+        self.complete_with_clock(context, emit, cancelled, observe, Instant::now);
+    }
+
+    fn complete_with_clock(
+        &self,
+        context: &CompletionContext,
         mut emit: impl FnMut(ProviderOutput, bool),
         mut cancelled: impl FnMut() -> bool,
         mut observe: impl FnMut(ProviderMetric),
+        mut now: impl FnMut() -> Instant,
     ) {
+        if cancelled() {
+            return;
+        }
         if context.buffer.sync == crate::completion::SyncQuality::Uncertain {
             emit(ProviderOutput::default(), true);
             return;
@@ -132,6 +150,9 @@ impl CompletionEngine {
         let mut combined = ProviderOutput::default();
         let mut providers = Vec::new();
         for provider in &self.providers {
+            if cancelled() {
+                return;
+            }
             match catch_unwind(AssertUnwindSafe(|| {
                 provider.supports_mode(context.mode) && provider.applies(context)
             })) {
@@ -150,11 +171,56 @@ impl CompletionEngine {
         // starve later providers on slower machines.
         let mut provider_elapsed = Duration::ZERO;
         let mut last_ranked: Vec<Candidate> = Vec::new();
+        let mut candidates_changed = false;
+        let mut last_emitted: Option<Instant> = None;
         for (index, provider) in providers.into_iter().enumerate() {
             if cancelled() {
                 return;
             }
-            if index > 0 && provider_elapsed >= self.local_timeout && !last_ranked.is_empty() {
+            let provider_started = now();
+            let mut output = catch_unwind(AssertUnwindSafe(|| provider.complete(context)))
+                .unwrap_or_else(|_| ProviderOutput {
+                    candidates: Vec::new(),
+                    diagnostics: vec![provider_panic(provider.id())],
+                });
+            let duration = now().saturating_duration_since(provider_started);
+            provider_elapsed += duration;
+            let was_cancelled = cancelled();
+            observe(ProviderMetric {
+                provider: provider.id(),
+                duration,
+                candidate_count: output.candidates.len(),
+                cancelled: was_cancelled,
+            });
+            if was_cancelled {
+                return;
+            }
+            candidates_changed |= !output.candidates.is_empty();
+            combined.candidates.append(&mut output.candidates);
+            combined.diagnostics.append(&mut output.diagnostics);
+            let final_provider = index + 1 == provider_count;
+            let budget_reached = provider_elapsed >= self.local_timeout;
+            let batch_due = last_emitted
+                .is_none_or(|last| now().saturating_duration_since(last) >= BATCH_INTERVAL);
+            if !final_provider && !budget_reached && (!candidates_changed || !batch_due) {
+                continue;
+            }
+            if candidates_changed {
+                // The final pass owns the raw candidates; intermediate passes
+                // keep them so cross-source matching and dedupe stay correct.
+                let candidates = if final_provider {
+                    std::mem::take(&mut combined.candidates)
+                } else {
+                    combined.candidates.clone()
+                };
+                last_ranked = rank_and_dedupe(context, candidates, self.max_candidates);
+                candidates_changed = false;
+            }
+            if cancelled() {
+                return;
+            }
+            let budget_cutoff = !final_provider && budget_reached && !last_ranked.is_empty();
+            if budget_cutoff {
                 combined.diagnostics.push(ProviderDiagnostic {
                     provider: "engine",
                     code: "HK-CMP-001",
@@ -164,6 +230,8 @@ impl CompletionEngine {
                         self.local_timeout.as_millis()
                     ),
                 });
+            }
+            if final_provider || budget_cutoff {
                 emit(
                     ProviderOutput {
                         candidates: last_ranked,
@@ -173,34 +241,20 @@ impl CompletionEngine {
                 );
                 return;
             }
-            let provider_started = std::time::Instant::now();
-            let mut output = catch_unwind(AssertUnwindSafe(|| provider.complete(context)))
-                .unwrap_or_else(|_| ProviderOutput {
-                    candidates: Vec::new(),
-                    diagnostics: vec![provider_panic(provider.id())],
-                });
-            provider_elapsed += provider_started.elapsed();
-            let was_cancelled = cancelled();
-            observe(ProviderMetric {
-                provider: provider.id(),
-                duration: provider_started.elapsed(),
-                candidate_count: output.candidates.len(),
-                cancelled: was_cancelled,
-            });
-            if was_cancelled {
-                return;
+            // An empty intermediate batch is not evidence of no matches:
+            // later providers can still supply rows. Never close the overlay
+            // just because an earlier source had nothing to contribute.
+            if last_ranked.is_empty() {
+                continue;
             }
-            combined.candidates.append(&mut output.candidates);
-            combined.diagnostics.append(&mut output.diagnostics);
-            last_ranked =
-                rank_and_dedupe(context, combined.candidates.clone(), self.max_candidates);
             emit(
                 ProviderOutput {
                     candidates: last_ranked.clone(),
                     diagnostics: combined.diagnostics.clone(),
                 },
-                index + 1 == provider_count,
+                false,
             );
+            last_emitted = Some(now());
         }
     }
 }
@@ -427,6 +481,98 @@ mod tests {
     }
 
     #[test]
+    fn fast_sources_coalesce_without_losing_final_candidates() {
+        let context = context();
+        let mut engine = CompletionEngine::new(100, 3);
+        engine.register(EmptyProvider);
+        for primary in ["x-first", "x-second", "x-third"] {
+            engine.register(OneProvider {
+                id: "fixture",
+                primary,
+            });
+        }
+        engine.register(EmptyProvider);
+        let mut batches = Vec::new();
+        let now = Instant::now();
+        engine.complete_with_clock(
+            &context,
+            |output, final_batch| batches.push((output.candidates.len(), final_batch)),
+            || false,
+            |_| {},
+            || now,
+        );
+        assert_eq!(batches, vec![(1, false), (3, true)]);
+    }
+
+    #[test]
+    fn slower_sources_keep_publishing_at_the_frame_cadence() {
+        let context = context();
+        let mut engine = CompletionEngine::new(100, 3);
+        for primary in ["x-first", "x-second", "x-third"] {
+            engine.register(OneProvider {
+                id: "fixture",
+                primary,
+            });
+        }
+        let clock = Cell::new(Instant::now());
+        let mut batches = Vec::new();
+        engine.complete_with_clock(
+            &context,
+            |output, final_batch| batches.push((output.candidates.len(), final_batch)),
+            || false,
+            |_| clock.set(clock.get() + BATCH_INTERVAL),
+            || clock.get(),
+        );
+        assert_eq!(batches, vec![(1, false), (2, false), (3, true)]);
+    }
+
+    #[test]
+    fn empty_sources_only_publish_a_final_result() {
+        let mut engine = CompletionEngine::new(100, 3);
+        engine.register(EmptyProvider);
+        engine.register(EmptyProvider);
+        let mut batches = Vec::new();
+        engine.complete_incremental(
+            &context(),
+            |output, final_batch| batches.push((output.candidates.len(), final_batch)),
+            || false,
+        );
+        assert_eq!(batches, vec![(0, true)]);
+    }
+
+    #[test]
+    fn budget_cutoff_includes_candidates_accumulated_since_the_last_batch() {
+        let context = context();
+        let mut engine = CompletionEngine::new(100, 3).with_local_timeout(Duration::from_millis(3));
+        for primary in ["x-first", "x-second", "x-third", "x-never"] {
+            engine.register(OneProvider {
+                id: "fixture",
+                primary,
+            });
+        }
+        let clock = Cell::new(Instant::now());
+        let mut batches = Vec::new();
+        engine.complete_with_clock(
+            &context,
+            |output, final_batch| {
+                batches.push((
+                    output.candidates.len(),
+                    output.diagnostics.len(),
+                    final_batch,
+                ));
+            },
+            || false,
+            |_| {},
+            || {
+                let now = clock.get();
+                clock.set(now + Duration::from_millis(1));
+                now
+            },
+        );
+        assert_eq!(batches, vec![(1, 0, false), (3, 1, true)]);
+    }
+
+    #[test]
     fn history_only_mode_excludes_normal_providers_before_ranking() {
         let context = CompletionContext::new(
             QueryId::new(1),
@@ -496,7 +642,7 @@ mod tests {
             },
             || false,
         );
-        assert_eq!(*batches.borrow(), vec![(1, 0, false), (1, 1, true)]);
+        assert_eq!(*batches.borrow(), vec![(1, 1, true)]);
     }
 
     #[test]

@@ -1043,6 +1043,227 @@ fn provider_result(state: &RuntimeState, candidates: Vec<Candidate>) -> Provider
 }
 
 #[test]
+fn a_final_frame_invalidated_by_child_output_is_retried_without_another_result() {
+    let directory = tempfile::tempdir().expect("directory");
+    let mut state = runtime_state(directory.path());
+    let (output, join) = test_output();
+    state.editing = true;
+    state.buffer.set_exact("ec".into(), 2).expect("buffer");
+    refresh_context(&mut state, QueryId::new(1));
+    output
+        .allow_cursor_probe(state.buffer.revision)
+        .expect("probe");
+    output
+        .confirm_cursor(crate::terminal::CellPos::new(0, 6))
+        .expect("cursor");
+    state.candidates = vec![history_candidate(QueryId::new(1), "echo final")];
+    state.scheduler = crate::terminal::LatestFrameScheduler::new(1);
+    render_current(&mut state, &output).expect("initial frame");
+    output.barrier().expect("initial commit");
+    flush_scheduled_frame(&mut state, &output).expect("acknowledge initial frame");
+    assert!(state.in_flight_frame.is_none());
+
+    move_selection(&mut state, 1);
+    render_current(&mut state, &output).expect("queue final frame");
+    let future = Instant::now() + Duration::from_secs(2);
+    let (_, frame) = state.scheduler.take_ready(future).expect("queued frame");
+    let stale_ticket = frame.ticket;
+    // Advance the screen after layout but before the output actor admits the
+    // frame. Its query is still current, but its screen ticket is unusable.
+    output
+        .child_output(crate::terminal::ChildOutputBatch {
+            bytes: b"x".to_vec(),
+            read_cycle: 1,
+            drain: crate::terminal::DrainState::DrainedToEagain,
+        })
+        .expect("late shell output");
+    output.commit_latest(frame).expect("submit stale frame");
+    state.in_flight_frame = Some(stale_ticket);
+    output.barrier().expect("actor rejected stale ticket");
+    assert_ne!(
+        output.state().expect("state").last_committed_frame,
+        Some(stale_ticket),
+    );
+
+    flush_scheduled_frame(&mut state, &output).expect("retry without provider or PTY event");
+    assert!(state.frame_revision > stale_ticket.frame_revision);
+    let (_, replacement) = state
+        .scheduler
+        .take_ready(future + Duration::from_secs(2))
+        .expect("fresh replacement frame");
+    let fresh_ticket = replacement.ticket;
+    output.commit_latest(replacement).expect("replacement");
+    state.in_flight_frame = Some(fresh_ticket);
+    output.barrier().expect("replacement committed");
+    flush_scheduled_frame(&mut state, &output).expect("acknowledge replacement");
+    assert_eq!(
+        output.state().expect("state").last_committed_frame,
+        Some(fresh_ticket),
+    );
+    assert!(state.in_flight_frame.is_none());
+    assert!(state.scheduler.is_idle());
+    assert_eq!(state.frame_revision, fresh_ticket.frame_revision);
+    output.restore_and_exit().expect("shutdown");
+    join.join().expect("actor joins").expect("actor exits");
+}
+
+#[test]
+fn partial_refresh_waits_one_frame_but_final_results_and_navigation_are_immediate() {
+    for trigger in ["final", "navigation", "deadline"] {
+        let directory = tempfile::tempdir().expect("directory");
+        let mut state = runtime_state(directory.path());
+        let (output, join) = test_output();
+        state.editing = true;
+        state.buffer.set_exact("ec".into(), 2).expect("buffer");
+        refresh_context(&mut state, QueryId::new(1));
+        output
+            .allow_cursor_probe(state.buffer.revision)
+            .expect("probe");
+        output
+            .confirm_cursor(crate::terminal::CellPos::new(0, 6))
+            .expect("cursor");
+        state.candidates = vec![history_candidate(QueryId::new(1), "echo original")];
+        render_current(&mut state, &output).expect("initial list");
+        let previous_frame = state.frame_revision;
+        refresh_context(&mut state, QueryId::new(2));
+        // Use a controlled deadline so host scheduling cannot turn the test
+        // into a timing race. Production arms this for only one frame.
+        state.provider_batch_deadline = Some(Instant::now() + Duration::from_secs(60));
+        let mut partial = provider_result(
+            &state,
+            vec![history_candidate(QueryId::new(2), "echo partial")],
+        );
+        partial.final_batch = false;
+        handle_provider_result(partial, &mut state, &output).expect("partial result");
+        flush_scheduled_frame(&mut state, &output).expect("early tick");
+        assert!(state.overlay_visible);
+        assert!(state.repaint_pending);
+        assert_eq!(state.frame_revision, previous_frame);
+
+        match trigger {
+            "final" => {
+                let final_result = provider_result(
+                    &state,
+                    vec![history_candidate(QueryId::new(2), "echo final")],
+                );
+                handle_provider_result(final_result, &mut state, &output).expect("final result");
+                assert!(state.provider_batch_deadline.is_none());
+                assert_eq!(state.candidates[0].display.primary, "echo final");
+            }
+            "navigation" => {
+                move_selection(&mut state, 1);
+                render_current(&mut state, &output).expect("navigation");
+            }
+            _ => {
+                state.provider_batch_deadline = Some(Instant::now());
+                flush_scheduled_frame(&mut state, &output).expect("deadline tick");
+            }
+        }
+        assert!(state.overlay_visible, "failed to paint after {trigger}");
+        assert!(!state.repaint_pending);
+        assert!(state.frame_revision > previous_frame);
+        output.restore_and_exit().expect("shutdown");
+        join.join().expect("actor joins").expect("actor exits");
+    }
+}
+
+#[test]
+fn empty_partial_results_preserve_the_visible_list_and_its_activation_context() {
+    let directory = tempfile::tempdir().expect("directory");
+    let mut state = runtime_state(directory.path());
+    let (output, join) = test_output();
+    state.editing = true;
+    state.buffer.set_exact("ec".into(), 2).expect("buffer");
+    refresh_context(&mut state, QueryId::new(1));
+    output
+        .allow_cursor_probe(state.buffer.revision)
+        .expect("probe");
+    output
+        .confirm_cursor(crate::terminal::CellPos::new(0, 6))
+        .expect("cursor");
+    let mut candidate = history_candidate(QueryId::new(1), "echo original");
+    candidate.edit.as_mut().expect("edit").range = 0..2;
+    handle_provider_result(
+        provider_result(&state, vec![candidate]),
+        &mut state,
+        &output,
+    )
+    .expect("initial result");
+    assert!(state.overlay_visible);
+    let previous_frame = state.frame_revision;
+
+    state.buffer.set_exact("ech".into(), 3).expect("new buffer");
+    refresh_context(&mut state, QueryId::new(2));
+    state.provider_pending = true;
+    let mut empty = provider_result(&state, Vec::new());
+    empty.final_batch = false;
+    handle_provider_result(empty, &mut state, &output).expect("partial empty result");
+    assert!(state.overlay_visible);
+    assert!(state.provider_pending);
+    assert_eq!(state.frame_revision, previous_frame);
+    assert_eq!(state.candidates[0].display.primary, "echo original");
+    assert_eq!(
+        state
+            .candidates_context
+            .as_ref()
+            .expect("list context")
+            .query_id,
+        QueryId::new(1),
+    );
+    state.selected = Some(state.candidates[0].id);
+    assert!(matches!(
+        resolve_selected_activation(&state).expect("activation"),
+        SelectedActivation::Rejected,
+    ));
+
+    let mut replacement = history_candidate(QueryId::new(2), "echo refreshed");
+    replacement.edit.as_mut().expect("edit").range = 0..3;
+    handle_provider_result(
+        provider_result(&state, vec![replacement]),
+        &mut state,
+        &output,
+    )
+    .expect("final result");
+    assert_eq!(state.candidates[0].display.primary, "echo refreshed");
+    assert!(!state.provider_pending);
+    output.restore_and_exit().expect("shutdown");
+    join.join().expect("actor joins").expect("actor exits");
+}
+
+#[test]
+fn final_empty_result_discards_queued_frames_so_the_list_cannot_reappear() {
+    let directory = tempfile::tempdir().expect("directory");
+    let mut state = runtime_state(directory.path());
+    let (output, join) = test_output();
+    state.editing = true;
+    state.buffer.set_exact("ec".into(), 2).expect("buffer");
+    refresh_context(&mut state, QueryId::new(1));
+    output
+        .allow_cursor_probe(state.buffer.revision)
+        .expect("probe");
+    output
+        .confirm_cursor(crate::terminal::CellPos::new(0, 6))
+        .expect("cursor");
+    state.scheduler = crate::terminal::LatestFrameScheduler::new(1);
+    state.candidates = vec![history_candidate(QueryId::new(1), "echo old")];
+    render_current(&mut state, &output).expect("first frame");
+    move_selection(&mut state, 1);
+    render_current(&mut state, &output).expect("queued frame");
+    assert!(!state.scheduler.is_idle());
+
+    handle_provider_result(provider_result(&state, Vec::new()), &mut state, &output)
+        .expect("final empty result");
+    assert!(!state.overlay_visible);
+    assert!(!state.repaint_pending);
+    assert!(!state.provider_pending);
+    assert!(state.scheduler.is_idle());
+    flush_scheduled_frame(&mut state, &output).expect("tick");
+    assert!(!state.overlay_visible);
+    output.restore_and_exit().expect("shutdown");
+    join.join().expect("actor joins").expect("actor exits");
+}
+
+#[test]
 fn info_level_diagnostics_stay_out_of_the_status_line() {
     let directory = tempfile::tempdir().expect("directory");
     let mut state = runtime_state(directory.path());
