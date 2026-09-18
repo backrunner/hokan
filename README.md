@@ -370,11 +370,16 @@ hokan upgrade
 hokan upgrade --channel beta
 ```
 
-Each new Hokan session can start a silent background check and install a newer
-release. Checks and failed retries are limited to once every 30 minutes;
-running sessions keep their current binary, and the update takes effect on the
-next launch. Updates use an installation lock, keep a `.bak` backup, and stage
-beside the installed binary so a cache on another disk works too.
+When automatic updates are enabled, each new Hokan session starts a silent
+background check. Long-running sessions revisit the shared cache every minute
+and check the network when the configured interval expires. Checks and failed retries are
+limited to once every 30 minutes by default; running sessions keep their
+current binary, and the update takes effect on the next launch. Updates use an
+installation lock, keep a `.bak` backup, and stage beside the installed binary
+so a cache on another disk works too. Known package-manager installations
+(including writable Homebrew Cellar paths) are left to their package manager.
+Self-updates require a user-owned installation directory without group/other
+write access, and preserve the executable's permissions.
 
 New beta installations default to the beta channel; stable builds default to
 stable. An explicitly configured channel is preserved. Existing beta users

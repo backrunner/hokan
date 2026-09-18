@@ -107,7 +107,7 @@ enum Command {
         /// Skip the confirmation prompt (scripted usage).
         #[arg(long)]
         yes: bool,
-        /// Headless background check spawned at session start.
+        /// Headless background check spawned at startup and during a session.
         #[arg(long, hide = true)]
         auto: bool,
     },

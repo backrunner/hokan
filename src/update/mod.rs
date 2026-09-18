@@ -12,6 +12,7 @@
 mod api;
 mod cache;
 mod install;
+mod local_io;
 #[cfg(test)]
 pub(crate) mod test_support;
 
@@ -127,7 +128,7 @@ pub fn read_cached_check(state_dir: &std::path::Path) -> Option<CachedCheck> {
     })
 }
 
-pub(crate) use install::directory_writable;
+pub(crate) use install::{directory_writable, managed_install};
 
 /// What an upgrade run did or found.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -143,6 +144,8 @@ pub enum UpgradeOutcome {
     /// The executable's directory is not writable (package-manager install);
     /// the user must upgrade through their package manager.
     NotWritable { path: PathBuf },
+    /// Known package-manager layout, even when its files are user-writable.
+    ManagedInstall { path: PathBuf },
 }
 
 /// Update failures with stable `HK-UPD-*` codes. `Display` messages never
@@ -167,6 +170,8 @@ pub enum UpdateError {
     SmokeTest,
     #[error("this platform has no release archive naming scheme")]
     UnsupportedPlatform,
+    #[error("another update is holding the installation lock; retry later")]
+    Busy,
     #[error("I/O error during update: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -185,6 +190,7 @@ impl UpdateError {
             Self::ChecksumMismatch => "HK-UPD-HASH",
             Self::SmokeTest => "HK-UPD-SMOKE",
             Self::UnsupportedPlatform => "HK-UPD-PLATFORM",
+            Self::Busy => "HK-UPD-BUSY",
             Self::Io(_) => "HK-UPD-IO",
         }
     }
@@ -204,17 +210,6 @@ pub fn run_upgrade(
         Version::parse(env!("CARGO_PKG_VERSION")).map_err(|_| UpdateError::InvalidResponse)?;
     let cache_path = paths.state_dir.join("update-check.json");
 
-    // Serialize and throttle background attempts, including failed requests
-    // and downloads. Opening many shells must not bypass the configured TTL.
-    let _auto_lock = if options.auto && !options.force && !options.check_only {
-        let Some(lock) = cache::begin_auto_attempt(paths, options, &current)? else {
-            return Ok(UpgradeOutcome::Deferred);
-        };
-        Some(lock)
-    } else {
-        None
-    };
-
     if !options.force
         && !options.check_only
         && let Some(entry) =
@@ -226,15 +221,18 @@ pub fn run_upgrade(
         return Ok(UpgradeOutcome::AlreadyCurrent { version: current });
     }
 
-    let release = fetch_latest(options.channel, &paths.api_base, &paths.repo)?;
+    // Cache hits are not attempts: otherwise opening a shell just before
+    // cache expiry postpones the next network check by another full interval.
+    let _auto_lock = if options.auto && !options.force && !options.check_only {
+        let Some(lock) = cache::begin_auto_attempt(paths, options, &current)? else {
+            return Ok(UpgradeOutcome::Deferred);
+        };
+        Some(lock)
+    } else {
+        None
+    };
 
-    // Best-effort: a failed cache write must not fail the upgrade itself.
-    let _ = cache::CheckCache {
-        last_check_epoch: cache::now_epoch_secs(),
-        channel: options.channel.as_str().to_owned(),
-        latest_known: release.version.to_string(),
-    }
-    .write(&cache_path);
+    let release = check_release(options.channel, paths)?;
 
     let latest = release.version.clone();
     if options.check_only {
@@ -245,6 +243,23 @@ pub fn run_upgrade(
     }
     install::download_and_install(&release, paths, &current)
 }
+
+pub(crate) fn check_release(
+    channel: Channel,
+    paths: &UpgradePaths,
+) -> Result<ReleaseInfo, UpdateError> {
+    let release = fetch_latest(channel, &paths.api_base, &paths.repo)?;
+    // A cache write failure must not prevent a manual upgrade.
+    let _ = cache::CheckCache {
+        last_check_epoch: cache::now_epoch_secs(),
+        channel: channel.as_str().to_owned(),
+        latest_known: release.version.to_string(),
+    }
+    .write(&paths.state_dir.join("update-check.json"));
+    Ok(release)
+}
+
+pub(crate) use install::download_and_install as install_checked_release;
 
 #[cfg(test)]
 mod tests {
@@ -353,6 +368,10 @@ mod tests {
         let outcome =
             run_upgrade(&auto, &paths(root.path(), "http://127.0.0.1:1")).expect("cached run");
         assert!(matches!(outcome, UpgradeOutcome::AlreadyCurrent { .. }));
+        assert!(
+            !root.path().join("state/update-auto-attempt.json").exists(),
+            "a cache hit must not postpone the next network attempt"
+        );
 
         // A fresh cache for another channel must not short-circuit.
         let mut opts = options();

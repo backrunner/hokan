@@ -3,7 +3,7 @@
 //! 设计要点：
 //! - 与 AI 向导一样，交互式提示直接读写标准输入/输出（即时回显），不走
 //!   `cli::run` 的缓冲输出；脚本化场景用 `--yes` 或 `--check`。
-//! - `--auto` 是隐藏的无头模式（由会话启动时的分离子进程调用）：全程零输出，
+//! - `--auto` 是隐藏的无头模式（由会话启动及定时检查调用）：全程零输出，
 //!   退出码是唯一信号（0 成功 / 1 失败），错误被静默吞掉。
 //! - `--channel` 会把选择持久化到 `[update].channel`（原子写回配置文件），
 //!   发生在任何网络请求之前。
@@ -79,7 +79,12 @@ fn run_auto(paths: &ConfigPaths, upgrade_paths: &UpgradePaths) -> u8 {
         auto: true,
         interval_secs: config.update.interval_secs,
     };
-    run_upgrade(&options, upgrade_paths).map_or(1, |_| 0)
+    match run_upgrade(&options, upgrade_paths) {
+        Ok(UpgradeOutcome::NotWritable { .. } | UpgradeOutcome::ManagedInstall { .. }) | Err(_) => {
+            1
+        }
+        Ok(_) => 0,
+    }
 }
 
 /// 测试注入点：输入、输出、TTY 状态、路径与 API 端点全部可替换，
@@ -122,31 +127,22 @@ fn run_with_io(
         ));
     }
 
-    let options = UpgradeOptions {
-        channel,
-        check_only: true,
-        force: args.force,
-        auto: false,
-        interval_secs: config.update.interval_secs,
-    };
     // 先只做检查，拿到“当前 → 最新”供用户确认；确认后再走完整升级。
-    let checked = run_upgrade(&options, upgrade_paths).map_err(update_failure)?;
-    let UpgradeOutcome::Checked { current, latest } = checked else {
-        return Err(crate::Error::Config(
-            "内部错误：升级检查返回了非预期结果".into(),
-        ));
-    };
+    let release = crate::update::check_release(channel, upgrade_paths).map_err(update_failure)?;
+    let current = semver::Version::parse(env!("CARGO_PKG_VERSION"))
+        .map_err(|_| update_failure(UpdateError::InvalidResponse))?;
+    let latest = &release.version;
     writeln!(output, "当前 v{current} → 最新 v{latest} [{channel}]")?;
 
     if args.check {
-        if latest > current {
+        if latest > &current {
             writeln!(output, "可升级：运行 hokan upgrade 安装")?;
         } else {
             writeln!(output, "已是最新版本")?;
         }
         return Ok(());
     }
-    if latest < current || (latest == current && !args.force) {
+    if latest < &current || (latest == &current && !args.force) {
         writeln!(output, "已是最新版本 v{current}")?;
         return Ok(());
     }
@@ -157,14 +153,10 @@ fn run_with_io(
     }
 
     writeln!(output, "正在下载并校验 v{latest} …")?;
-    let outcome = run_upgrade(
-        &UpgradeOptions {
-            check_only: false,
-            ..options
-        },
-        upgrade_paths,
-    )
-    .map_err(update_failure)?;
+    // Install exactly the release the user just reviewed, even if another
+    // release is published while the confirmation prompt is open.
+    let outcome = crate::update::install_checked_release(&release, upgrade_paths, &current)
+        .map_err(update_failure)?;
     match outcome {
         UpgradeOutcome::Upgraded { from, to } => {
             writeln!(output, "SHA256 校验与冒烟测试通过")?;
@@ -176,7 +168,7 @@ fn run_with_io(
             Ok(())
         }
         UpgradeOutcome::NotWritable { path } => {
-            writeln!(err, "当前安装路径不可写，未做任何改动。")?;
+            writeln!(err, "当前安装目录不可写或权限不安全，未做任何改动。")?;
             writeln!(
                 err,
                 "请使用你的包管理器升级（路径不可写: {}）",
@@ -184,6 +176,13 @@ fn run_with_io(
             )?;
             Err(crate::Error::Config(format!(
                 "升级未完成：可执行文件路径不可写（{}）",
+                path.display()
+            )))
+        }
+        UpgradeOutcome::ManagedInstall { path } => {
+            writeln!(err, "此安装由包管理器管理，请使用对应的包管理器升级。")?;
+            Err(crate::Error::Config(format!(
+                "升级未完成：包管理器安装（{}）",
                 path.display()
             )))
         }
@@ -260,8 +259,7 @@ mod tests {
         }
     }
 
-    /// Serves the four requests of a full confirmed upgrade: the pre-check,
-    /// the real run's release lookup, the archive, and its SHA256SUMS.
+    /// Serves the release lookup, archive, and SHA256SUMS for a confirmed upgrade.
     fn serve_full_upgrade(version: &str, requests: usize) -> (String, std::thread::JoinHandle<()>) {
         let archive = build_archive(&format!("#!/bin/sh\necho hokan {version}\n"));
         let sums = sha256sums_for(&[(
@@ -352,7 +350,7 @@ mod tests {
     #[test]
     fn interactive_confirm_yes_upgrades() {
         let root = tempfile::tempdir().expect("tempdir");
-        let (base, join) = serve_full_upgrade("9.9.9", 4);
+        let (base, join) = serve_full_upgrade("9.9.9", 3);
         let paths = test_paths(root.path());
         let upgrade_paths = make_upgrade_paths(root.path(), &base);
 
@@ -467,7 +465,7 @@ mod tests {
             return;
         }
         let root = tempfile::tempdir().expect("tempdir");
-        let (base, join) = serve_full_upgrade("9.9.9", 2);
+        let (base, join) = serve_full_upgrade("9.9.9", 1);
         let paths = test_paths(root.path());
         let upgrade_paths = make_upgrade_paths(root.path(), &base);
         let bin = root.path().join("bin");

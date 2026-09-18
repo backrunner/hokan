@@ -314,6 +314,12 @@ pub(super) fn inspect_update(
 /// Writability of the running executable's directory: package-manager
 /// installs live in system paths that self-update must not touch.
 fn inspect_update_exe(exe: &Path) -> Check {
+    if crate::update::managed_install(exe) {
+        return Check::new(
+            CheckLevel::Warn,
+            "managed installation; upgrade through your package manager",
+        );
+    }
     let directory = exe.parent().unwrap_or(exe);
     if crate::update::directory_writable(directory) {
         Check::new(
@@ -327,7 +333,7 @@ fn inspect_update_exe(exe: &Path) -> Check {
         Check::new(
             CheckLevel::Warn,
             format!(
-                "{} is not writable; upgrade through your package manager",
+                "{} is not writable or has unsafe ownership/permissions; check installation permissions or upgrade through your package manager",
                 directory.display()
             ),
         )

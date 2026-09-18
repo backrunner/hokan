@@ -9,7 +9,7 @@ use std::{
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use fs2::FileExt;
@@ -33,6 +33,13 @@ pub(crate) fn download_and_install(
     paths: &UpgradePaths,
     current_version: &Version,
 ) -> Result<UpgradeOutcome, UpdateError> {
+    let mut paths = paths.clone();
+    paths.current_exe = fs::canonicalize(&paths.current_exe)?;
+    if managed_install(&paths.current_exe) {
+        return Ok(UpgradeOutcome::ManagedInstall {
+            path: paths.current_exe,
+        });
+    }
     let parent = paths
         .current_exe
         .parent()
@@ -44,18 +51,28 @@ pub(crate) fn download_and_install(
     }
     // All sessions updating this installation share one persistent lock.
     // Never unlink it: a waiter may already hold the old lock file open.
-    let lock = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(parent.join(".hokan-update.lock"))?;
-    lock.lock_exclusive()?;
+    let lock = super::local_io::open_lock(&parent.join(".hokan-update.lock"))?;
+    let started = Instant::now();
+    loop {
+        match lock.try_lock_exclusive() {
+            Ok(()) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if started.elapsed() >= Duration::from_secs(5) {
+                    return Err(UpdateError::Busy);
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let original = super::local_io::read_file(&paths.current_exe)?;
+    let permissions = original.metadata()?.permissions();
     let installed = binary_version(&paths.current_exe)?;
     if installed > *current_version && installed >= release.version {
         return Ok(UpgradeOutcome::AlreadyCurrent { version: installed });
     }
     let downloads = paths.cache_dir.join("downloads");
-    fs::create_dir_all(&downloads)?;
+    super::local_io::private_directory(&downloads)?;
     let archive_name = api::archive_name(&release.version)?;
     let target = api::target_triple().ok_or(UpdateError::UnsupportedPlatform)?;
     let mut archive_file = tempfile::Builder::new()
@@ -92,6 +109,7 @@ pub(crate) fn download_and_install(
 
     let package = format!("hokan-{}-{target}", release.version);
     extract_binary(&archive, &staged, &package)?;
+    fs::set_permissions(&staged, permissions.clone())?;
     smoke_test(&staged, &release.version)?;
 
     let mut backup_name = paths.current_exe.as_os_str().to_owned();
@@ -100,10 +118,8 @@ pub(crate) fn download_and_install(
     let mut backup_tmp = tempfile::Builder::new()
         .prefix(".hokan-backup.")
         .tempfile_in(parent)?;
-    std::io::copy(&mut fs::File::open(&paths.current_exe)?, &mut backup_tmp)?;
-    backup_tmp
-        .as_file()
-        .set_permissions(fs::metadata(&paths.current_exe)?.permissions())?;
+    std::io::copy(&mut &original, &mut backup_tmp)?;
+    backup_tmp.as_file().set_permissions(permissions)?;
     backup_tmp.as_file().sync_all()?;
     backup_tmp.persist(&backup).map_err(|error| error.error)?;
     staged
@@ -130,7 +146,7 @@ fn expected_sha256(checksums: &str, archive_name: &str) -> Option<String> {
 
 /// Extracts `bin/hokan` from the tar.gz archive to `staged`, mode 0755.
 fn extract_binary(archive: &[u8], staged: &Path, package: &str) -> Result<(), UpdateError> {
-    let decoder = flate2::read::GzDecoder::new(archive);
+    let decoder = flate2::read::GzDecoder::new(archive).take((DOWNLOAD_MAX_BYTES * 2) as u64);
     let mut tar = tar::Archive::new(decoder);
     let mut binary = None;
     for entry in tar.entries().map_err(|_| UpdateError::InvalidResponse)? {
@@ -195,10 +211,48 @@ fn binary_version(path: &Path) -> Result<Version, UpdateError> {
 /// Probe-writes the executable's directory: package-manager installs live
 /// in system paths we must not touch. Also used by `hokan doctor`.
 pub(crate) fn directory_writable(directory: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let Ok(metadata) = fs::metadata(directory) else {
+            return false;
+        };
+        // A writable installation directory must belong to the account doing
+        // the upgrade and must not be writable by a group or other user. This
+        // prevents a world-writable/shared directory from becoming an update
+        // substitution point.
+        if !metadata.is_dir()
+            || metadata.uid() != nix::unistd::geteuid().as_raw()
+            || metadata.permissions().mode() & 0o022 != 0
+        {
+            return false;
+        }
+    }
     tempfile::Builder::new()
         .prefix(".hokan-write-probe.")
         .tempfile_in(directory)
         .is_ok()
+}
+
+/// Common package-manager layouts must not be edited behind their manager's
+/// back. Homebrew's Cellar is often writable by the logged-in user.
+pub(crate) fn managed_install(exe: &Path) -> bool {
+    let resolved = fs::canonicalize(exe).unwrap_or_else(|_| exe.to_owned());
+    resolved
+        .components()
+        .any(|part| part.as_os_str() == "Cellar")
+        || [
+            "/opt/local",
+            "/nix/store",
+            "/snap",
+            "/usr/bin",
+            "/bin",
+            "/usr/sbin",
+            "/sbin",
+        ]
+        .iter()
+        .any(|prefix| resolved.starts_with(prefix))
 }
 
 #[cfg(test)]
@@ -334,9 +388,28 @@ mod tests {
         let current = Version::parse("0.1.0").expect("current");
         let outcome = download_and_install(&release(base, "9.9.9"), &paths, &current)
             .expect("not writable is an outcome, not an error");
-        assert_eq!(outcome, UpgradeOutcome::NotWritable { path: bin.clone() });
+        assert_eq!(
+            outcome,
+            UpgradeOutcome::NotWritable {
+                path: fs::canonicalize(&bin).expect("resolved bin")
+            }
+        );
         fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).expect("restore bin");
         assert!(current_exe.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_install_directories_are_not_update_targets() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().expect("tempdir");
+        let shared = root.path().join("shared");
+        fs::create_dir(&shared).expect("shared dir");
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).expect("shared mode");
+        assert!(!directory_writable(&shared));
+        let file = root.path().join("file");
+        fs::write(&file, b"not a directory").expect("file");
+        assert!(!directory_writable(&file));
     }
 
     #[test]

@@ -74,6 +74,92 @@ fn simultaneous_updates_preserve_the_original_backup() {
 }
 
 #[test]
+fn writable_homebrew_install_is_left_to_the_package_manager() {
+    let root = tempfile::tempdir().expect("root");
+    let (mut paths, _) = upgrade_paths(root.path(), "http://127.0.0.1:1");
+    paths.current_exe = root.path().join("Cellar/hokan/0.1.0/bin/hokan");
+    fs::create_dir_all(paths.current_exe.parent().expect("parent")).expect("cellar");
+    write_stub_binary(&paths.current_exe, "#!/bin/sh\necho hokan 0.1.0\n");
+    let before = fs::read(&paths.current_exe).expect("original");
+    assert!(matches!(
+        download_and_install(
+            &release("http://127.0.0.1:1", "9.9.9"),
+            &paths,
+            &Version::new(0, 1, 0)
+        ),
+        Ok(UpgradeOutcome::ManagedInstall { .. })
+    ));
+    assert_eq!(fs::read(&paths.current_exe).expect("unchanged"), before);
+}
+
+#[test]
+fn symlink_install_keeps_the_link_and_private_executable_mode() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let root = tempfile::tempdir().expect("root");
+    let (base, join) = serve_release("9.9.9", build_archive("#!/bin/sh\necho hokan 9.9.9\n"));
+    let (mut paths, exe) = upgrade_paths(root.path(), &base);
+    fs::set_permissions(&exe, fs::Permissions::from_mode(0o700)).expect("private binary");
+    let link = root.path().join("hokan");
+    symlink(&exe, &link).expect("link");
+    paths.current_exe = link.clone();
+    assert!(matches!(
+        download_and_install(&release(&base, "9.9.9"), &paths, &Version::new(0, 1, 0)),
+        Ok(UpgradeOutcome::Upgraded { .. })
+    ));
+    assert!(
+        fs::symlink_metadata(link)
+            .expect("link metadata")
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        fs::metadata(exe).expect("mode").permissions().mode() & 0o777,
+        0o700
+    );
+    join.join().expect("server");
+}
+
+#[test]
+fn older_release_never_replaces_a_newer_installed_binary() {
+    let root = tempfile::tempdir().expect("root");
+    let (paths, exe) = upgrade_paths(root.path(), "http://127.0.0.1:1");
+    write_stub_binary(&exe, "#!/bin/sh\necho hokan 10.0.0\n");
+    assert_eq!(
+        download_and_install(
+            &release("http://127.0.0.1:1", "9.9.9"),
+            &paths,
+            &Version::new(0, 1, 0)
+        )
+        .expect("already upgraded"),
+        UpgradeOutcome::AlreadyCurrent {
+            version: Version::new(10, 0, 0)
+        }
+    );
+}
+
+#[test]
+fn held_install_lock_times_out_without_downloading_or_replacing() {
+    let root = tempfile::tempdir().expect("root");
+    let (paths, exe) = upgrade_paths(root.path(), "http://127.0.0.1:1");
+    let before = fs::read(&exe).expect("original");
+    let lock = super::super::local_io::open_lock(
+        &exe.parent().expect("parent").join(".hokan-update.lock"),
+    )
+    .expect("lock");
+    lock.lock_exclusive().expect("hold lock");
+    assert!(matches!(
+        download_and_install(
+            &release("http://127.0.0.1:1", "9.9.9"),
+            &paths,
+            &Version::new(0, 1, 0)
+        ),
+        Err(UpdateError::Busy)
+    ));
+    assert_eq!(fs::read(exe).expect("unchanged"), before);
+    assert!(!paths.cache_dir.exists());
+}
+
+#[test]
 fn smoke_test_requires_the_exact_program_and_version() {
     let root = tempfile::tempdir().expect("tempdir");
     let binary = root.path().join("hokan");

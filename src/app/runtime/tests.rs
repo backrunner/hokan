@@ -1782,13 +1782,3 @@ fn unready_terminal_arms_repaint_retry_and_probe_recovery() {
     output.restore_and_exit().expect("shutdown");
     join.join().expect("actor joins").expect("actor exits");
 }
-
-#[test]
-fn auto_update_spawn_requires_enabled_config_and_no_env_opt_out() {
-    let mut config = Config::default();
-    assert!(should_spawn_auto_update(&config, false));
-    assert!(!should_spawn_auto_update(&config, true));
-    config.update.enabled = false;
-    assert!(!should_spawn_auto_update(&config, false));
-    assert!(!should_spawn_auto_update(&config, true));
-}

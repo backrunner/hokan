@@ -1,3 +1,4 @@
+mod auto_update;
 mod control;
 mod cursor_probe;
 mod engine;
@@ -69,14 +70,8 @@ pub fn run_session(options: SessionOptions) -> crate::Result<u8> {
 
     let paths = ConfigPaths::discover()?;
     let mut config = Arc::new(Config::load(&paths.config_file)?);
-    // Background self-update: a detached `hokan upgrade --auto` child with all
-    // stdio set to null. On Unix stdio separation alone keeps the child alive
-    // after the parent exits — no setsid, so no unsafe under
-    // `#![forbid(unsafe_code)]`. A helper thread reaps the child so it cannot
-    // linger as a zombie for the session's lifetime; the session never waits.
-    if should_spawn_auto_update(&config, std::env::var_os("HOKAN_NO_AUTO_UPDATE").is_some()) {
-        spawn_auto_update();
-    }
+    let mut auto_update = auto_update::AutoUpdateScheduler::new();
+    auto_update.tick(&config.update, Instant::now());
     let watched_credential =
         crate::config::resolve_credential_path(&config.ai, &paths.credentials_file)
             .unwrap_or_else(|| paths.credentials_file.clone());
@@ -349,6 +344,9 @@ pub fn run_session(options: SessionOptions) -> crate::Result<u8> {
             &mut state,
             output.handle(),
         )?;
+        if !terminating {
+            auto_update.tick(&config.update, now);
+        }
         detect_foreground_process(&mut state, &pty, output.handle())?;
         exit_status = pty.try_wait()?;
         if terminating {
@@ -422,37 +420,6 @@ fn drain_terminal_queries_before_exit(router: &mut TerminalReplyRouter, input: &
         }
     }
     router.cancel();
-}
-
-/// Whether session start should spawn the detached `upgrade --auto` child:
-/// auto-update must be enabled in the config and not opted out via
-/// `HOKAN_NO_AUTO_UPDATE` (the env check is injected so tests stay pure).
-fn should_spawn_auto_update(config: &Config, no_auto_update_env: bool) -> bool {
-    config.update.enabled && !no_auto_update_env
-}
-
-/// Spawns `current_exe upgrade --auto` fully detached and never waits on it.
-/// Spawn failure is silent by design: updates must never disturb a session.
-fn spawn_auto_update() {
-    let Ok(exe) = std::env::current_exe() else {
-        return;
-    };
-    let spawned = std::process::Command::new(exe)
-        .arg("upgrade")
-        .arg("--auto")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
-    if let Ok(mut child) = spawned {
-        // Reap on a helper thread so the short-lived child cannot linger as a
-        // zombie; the session loop itself never blocks on it.
-        let _ = thread::Builder::new()
-            .name("hokan-auto-update".into())
-            .spawn(move || {
-                let _ = child.wait();
-            });
-    }
 }
 
 fn validate_terminal_session() -> crate::Result<()> {

@@ -7,7 +7,7 @@
 
 use std::{
     fs,
-    io::Write,
+    io::{Read, Write},
     path::Path,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -22,12 +22,8 @@ pub(super) fn begin_auto_attempt(
     options: &UpgradeOptions,
     current: &semver::Version,
 ) -> Result<Option<fs::File>, UpdateError> {
-    fs::create_dir_all(&paths.state_dir)?;
-    let lock = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(paths.state_dir.join("update-auto.lock"))?;
+    super::local_io::private_directory(&paths.state_dir)?;
+    let lock = super::local_io::open_lock(&paths.state_dir.join("update-auto.lock"))?;
     match lock.try_lock_exclusive() {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
@@ -55,6 +51,7 @@ pub(super) fn begin_auto_attempt(
 /// Grace for small clock adjustments; beyond it a future-dated file means
 /// the clock jumped backwards and the entry cannot be trusted.
 const CLOCK_SKEW_TOLERANCE: Duration = Duration::from_secs(60);
+const CACHE_MAX_BYTES: u64 = 16 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct CheckCache {
@@ -74,7 +71,17 @@ impl CheckCache {
     /// Loads the cache file; a missing, unreadable, or corrupt file is
     /// simply absent (treated as stale by callers).
     pub(crate) fn load(path: &Path) -> Option<Self> {
-        let text = fs::read_to_string(path).ok()?;
+        let file = super::local_io::read_file(path).ok()?;
+        if file.metadata().ok()?.len() > CACHE_MAX_BYTES {
+            return None;
+        }
+        let mut text = String::new();
+        file.take(CACHE_MAX_BYTES + 1)
+            .read_to_string(&mut text)
+            .ok()?;
+        if text.len() as u64 > CACHE_MAX_BYTES {
+            return None;
+        }
         serde_json::from_str(&text).ok()
     }
 
@@ -114,8 +121,7 @@ impl CheckCache {
                 "cache path has no parent directory",
             ))
         })?;
-        fs::create_dir_all(parent)?;
-        set_private_directory_permissions(parent)?;
+        let directory = super::local_io::private_directory(parent)?;
         let rendered = serde_json::to_string(self).map_err(|_| UpdateError::InvalidResponse)?;
         let mut temporary = tempfile::Builder::new()
             .prefix(".update-check.")
@@ -124,22 +130,9 @@ impl CheckCache {
         temporary.write_all(rendered.as_bytes())?;
         temporary.as_file().sync_all()?;
         temporary.persist(path).map_err(|error| error.error)?;
-        set_private_file_permissions(&fs::File::open(path)?)?;
-        fs::File::open(parent)?.sync_all()?;
+        directory.sync_all()?;
         Ok(())
     }
-}
-
-#[cfg(unix)]
-fn set_private_directory_permissions(path: &Path) -> Result<(), UpdateError> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_private_directory_permissions(_: &Path) -> Result<(), UpdateError> {
-    Ok(())
 }
 
 #[cfg(unix)]
@@ -211,6 +204,26 @@ mod tests {
         fs::write(&path, "{ not json").expect("corrupt cache");
         assert!(CheckCache::load(&path).is_none());
         assert!(CheckCache::read_fresh(&path, Duration::from_secs(1_800)).is_none());
+    }
+
+    #[test]
+    fn special_linked_and_oversized_caches_are_ignored() {
+        let root = tempfile::tempdir().expect("root");
+        let path = root.path().join("cache");
+        nix::unistd::mkfifo(
+            &path,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .expect("fifo");
+        assert!(CheckCache::load(&path).is_none());
+        fs::remove_file(&path).expect("remove fifo");
+        let target = root.path().join("target");
+        entry(now_epoch_secs()).write(&target).expect("valid cache");
+        std::os::unix::fs::symlink(&target, &path).expect("link");
+        assert!(CheckCache::load(&path).is_none());
+        fs::remove_file(&path).expect("remove link");
+        fs::write(&path, vec![b' '; CACHE_MAX_BYTES as usize + 1]).expect("oversize");
+        assert!(CheckCache::load(&path).is_none());
     }
 
     #[test]
