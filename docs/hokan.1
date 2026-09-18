@@ -167,6 +167,10 @@ selection (Up/Down), Enter executes the selected candidate instead;
 candidates classified High or Unknown risk first show a confirmation
 row (Enter confirms, Esc cancels). Typed input never triggers a
 confirmation.
+For a selected cd directory, Enter executes cd by default. Set
+cd_enter_behavior = "continue" in the [completion] section of config.toml
+to fill the path and suggest child directories instead; "execute" restores
+the default. Tab continues directory completion in either mode.
 .TP
 .B Tab
 Insert or continue the selected candidate. Tab never executes a command.

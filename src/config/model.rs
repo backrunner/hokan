@@ -411,6 +411,15 @@ impl Default for HistoryConfig {
 pub struct CompletionConfig {
     pub local_timeout_ms: u64,
     pub max_candidates: usize,
+    pub cd_enter_behavior: CdEnterBehavior,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CdEnterBehavior {
+    #[default]
+    Execute,
+    Continue,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -436,6 +445,7 @@ impl Default for CompletionConfig {
         Self {
             local_timeout_ms: 100,
             max_candidates: 1_000,
+            cd_enter_behavior: CdEnterBehavior::default(),
         }
     }
 }
@@ -610,6 +620,35 @@ mod tests {
         let rendered = toml::to_string(&config).expect("serialize config");
         assert!(rendered.contains("activate = \"disabled\""));
         assert!(toml::from_str::<Config>(&rendered).is_ok());
+    }
+
+    #[test]
+    fn cd_enter_behavior_defaults_and_preferences_roundtrip() {
+        for legacy in ["", "[completion]\nmax_candidates = 200\n"] {
+            let config: Config = toml::from_str(legacy).expect("legacy config");
+            assert_eq!(
+                config.completion.cd_enter_behavior,
+                CdEnterBehavior::Execute
+            );
+        }
+        for (value, expected) in [
+            ("execute", CdEnterBehavior::Execute),
+            ("continue", CdEnterBehavior::Continue),
+        ] {
+            let config: Config =
+                toml::from_str(&format!("[completion]\ncd_enter_behavior = \"{value}\"\n"))
+                    .expect("cd preference");
+            config.validate().expect("valid preference");
+            assert_eq!(config.completion.cd_enter_behavior, expected);
+            let rendered = toml::to_string(&config).expect("serialize");
+            assert_eq!(
+                toml::from_str::<Config>(&rendered).expect("roundtrip"),
+                config
+            );
+        }
+        assert!(
+            toml::from_str::<Config>("[completion]\ncd_enter_behavior = \"invalid\"\n").is_err()
+        );
     }
 
     #[test]

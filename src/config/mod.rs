@@ -13,8 +13,8 @@ pub(crate) use model::AI_NO_AUTH_PROVIDER_SLUGS;
 #[cfg(test)]
 pub(crate) use model::{AI_OAUTH_PROVIDER_SLUGS, AI_PROVIDER_SLUGS};
 pub use model::{
-    AiAuth, AiConfig, Config, HistoryConfig, KeyBinding, KeysConfig, LoggingConfig, UiConfig,
-    UpdateConfig,
+    AiAuth, AiConfig, CdEnterBehavior, Config, HistoryConfig, KeyBinding, KeysConfig,
+    LoggingConfig, UiConfig, UpdateConfig,
 };
 pub use paths::ConfigPaths;
 pub use reload::{ConfigReload, ConfigWatcher};

@@ -74,6 +74,7 @@ Use `disabled` to turn off a binding. Enabled bindings cannot conflict. See [you
 [completion]
 local_timeout_ms = 100
 max_candidates = 1000
+cd_enter_behavior = "execute"
 
 [history]
 enabled = true
@@ -82,6 +83,13 @@ exclude = []
 ```
 
 Completion timeout accepts `10–5000` milliseconds; the candidate limit accepts `10–10000`. History's command size limit accepts `100–100000` bytes. History exclusions use regular expressions. Local command history can contain sensitive text, so treat it as private data.
+
+`cd_enter_behavior` controls `Enter` on a selected directory candidate for `cd`:
+
+- `"execute"` (default): fill the selected path and execute `cd` immediately.
+- `"continue"`: fill the path and suggest child directories without executing.
+
+`Tab` always fills the path and continues completion. With no selection, `Enter` executes the input as typed.
 
 ## Diagnostic logging
 

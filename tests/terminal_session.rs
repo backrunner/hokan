@@ -2522,6 +2522,73 @@ fn overlay_opens_without_a_default_selection() {
 }
 
 #[test]
+fn cd_completion_enter_executes_by_default() {
+    check_cd_completion_key(None, b"\r", true);
+}
+
+#[test]
+fn cd_completion_enter_can_continue_to_child_directories() {
+    check_cd_completion_key(Some("continue"), b"\r", false);
+}
+
+#[test]
+fn cd_completion_tab_still_continues_without_executing() {
+    check_cd_completion_key(None, b"\t", false);
+}
+
+fn check_cd_completion_key(preference: Option<&str>, key: &[u8], executes: bool) {
+    if !command_exists("zsh") {
+        return;
+    }
+    let (home, work) = empty_fixture_directories();
+    fs::write(
+        home.path().join(".zshrc"),
+        "PROMPT='HK> '\nRPROMPT=''\nsetopt no_beep\n",
+    )
+    .expect("zshrc");
+    fs::create_dir_all(work.path().join("chosen folder/child-dir")).expect("directory tree");
+    if let Some(preference) = preference {
+        fs::write(
+            home.path().join(".config/hokan/config.toml"),
+            format!("[completion]\ncd_enter_behavior = \"{preference}\"\n"),
+        )
+        .expect("cd preference");
+    }
+    let original_name = work
+        .path()
+        .file_name()
+        .expect("work basename")
+        .to_str()
+        .expect("UTF-8 basename")
+        .to_owned();
+    let mut terminal = TerminalSession::spawn_hokan(home, work, 2);
+    terminal.wait_for_sync_replies(1);
+    terminal.wait_for_screen("HK> ");
+    terminal.write(b"cd cho");
+    terminal.wait_for_screen("chosen folder/");
+    terminal.write(b"\x1b[B");
+    terminal.wait_for_screen("▶");
+    terminal.write(key);
+    if executes {
+        terminal.wait_for_bare_row("HK>");
+    } else {
+        terminal.wait_for_screen("child-dir/");
+        terminal.write(b"\x15");
+        terminal.wait_for_bare_row("HK>");
+    }
+    // Read the shell's actual cwd; a filled command line alone is not proof
+    // that Enter ran cd (or that Tab/continue left the cwd unchanged).
+    terminal.write(b"print -r -- $PWD:t\r");
+    terminal.wait_for_bare_row(if executes {
+        "chosen folder"
+    } else {
+        &original_name
+    });
+    terminal.exit_shell();
+    terminal.wait_until_exit();
+}
+
+#[test]
 fn enter_executes_the_selected_history_candidate() {
     if !command_exists("zsh") {
         return;

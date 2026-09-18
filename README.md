@@ -259,6 +259,17 @@ nerd_fonts = true
 
 Set `nerd_fonts = false` if icons render as empty squares.
 
+Selecting a directory for `cd` and pressing `Enter` executes `cd` immediately
+by default. To fill the path and keep suggesting child directories instead,
+set `cd_enter_behavior = "continue"`:
+
+```toml
+[completion]
+cd_enter_behavior = "execute" # default; or "continue"
+```
+
+`Tab` always fills the path and continues completion without executing.
+
 Diagnostic logging is opt-in and bounded:
 
 ```toml

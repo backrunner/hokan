@@ -6,6 +6,7 @@ use crate::{
         Completeness, CompletionContext, CursorPlacement, ProviderDiagnostic, ProviderOutput,
         SlotKind, TextEdit,
     },
+    config::CdEnterBehavior,
     parser::escape_for_shell,
     providers::{CommandHelpCache, argument_progress},
     shell::{AliasCache, AliasKind},
@@ -18,6 +19,7 @@ const DIRECTORY_BUDGET_MS: u128 = 80;
 
 pub struct FilesystemProvider {
     show_hidden: bool,
+    cd_enter_behavior: CdEnterBehavior,
     specs: Arc<SpecRegistry>,
     help: Arc<CommandHelpCache>,
     aliases: Arc<AliasCache>,
@@ -33,10 +35,17 @@ impl FilesystemProvider {
     ) -> Self {
         Self {
             show_hidden,
+            cd_enter_behavior: CdEnterBehavior::default(),
             specs,
             help,
             aliases,
         }
+    }
+
+    #[must_use]
+    pub fn with_cd_enter_behavior(mut self, behavior: CdEnterBehavior) -> Self {
+        self.cd_enter_behavior = behavior;
+        self
     }
 }
 
@@ -75,6 +84,15 @@ impl CandidateProvider for FilesystemProvider {
             }
         };
         let file_next_slot = required_file_followup_slot(context, slot.kind);
+        // A directory completes cd's argument. Tab can still descend through
+        // the trailing slash; Enter runs the command unless the user opts out.
+        // Redirects and external wrapper directory options are not cd targets.
+        let execute_cd = self.cd_enter_behavior == CdEnterBehavior::Execute
+            && context.command() == Some("cd")
+            && slot.kind == SlotKind::Directory
+            && wrapper_filesystem_slot(context).is_none()
+            && crate::providers::command_resolution_kind(context)
+                != crate::parser::EffectiveCommandKind::External;
         let show_hidden = self.show_hidden || basename.starts_with('.');
         let mut candidates = Vec::new();
         let mut partial = false;
@@ -126,14 +144,16 @@ impl CandidateProvider for FilesystemProvider {
             }
             let executable = crate::platform::is_executable(&path);
             let next_slot = if directory {
-                Some(SlotKind::Path)
+                (!execute_cd).then_some(SlotKind::Path)
             } else {
                 file_next_slot
             };
             let mut candidate = Candidate::new(
                 context.query_id,
                 &logical,
-                if directory {
+                if directory && execute_cd {
+                    "切换到此目录"
+                } else if directory {
                     "进入目录继续补全"
                 } else if matches!(slot.kind, SlotKind::Executable) {
                     "当前目录中的可执行文件"
@@ -3466,6 +3486,91 @@ mod tests {
                 .is_empty(),
             "directory-stack indices are values, not filesystem paths"
         );
+    }
+
+    #[test]
+    fn cd_directories_are_runnable_by_default_and_can_continue_instead() {
+        let directory = tempfile::tempdir().expect("directory");
+        fs::create_dir(directory.path().join("nested folder")).expect("nested directory");
+        for behavior in [CdEnterBehavior::Execute, CdEnterBehavior::Continue] {
+            let provider =
+                provider(Arc::new(SpecRegistry::default())).with_cd_enter_behavior(behavior);
+            for buffer in [
+                "cd ne",
+                "cd -- ne",
+                "command cd ne",
+                "builtin cd ne",
+                "time cd ne",
+            ] {
+                let context = context(directory.path(), buffer, 1);
+                let output = provider.complete(&context);
+                let candidate = output
+                    .candidates
+                    .iter()
+                    .find(|candidate| candidate.display.primary == "nested folder/")
+                    .expect("cd directory");
+                if behavior == CdEnterBehavior::Execute {
+                    assert_eq!(candidate.action, CandidateAction::Insert, "{buffer}");
+                    assert_eq!(candidate.completeness, Completeness::Runnable, "{buffer}");
+                } else {
+                    assert!(matches!(
+                        candidate.action,
+                        CandidateAction::InsertAndContinue { .. }
+                    ));
+                    assert!(matches!(
+                        candidate.completeness,
+                        Completeness::NeedsInput { .. }
+                    ));
+                }
+                let activation =
+                    crate::completion::activate_candidate(candidate, &context, &context.buffer)
+                        .expect("activate cd directory");
+                let crate::completion::Activation::ReplaceBuffer { text, cursor } = activation
+                else {
+                    panic!("expected directory edit");
+                };
+                let parsed = crate::parser::parse_line(&text, cursor).expect("parse filled cd");
+                assert_eq!(parsed.current_prefix, "nested folder/", "{buffer}");
+            }
+        }
+    }
+
+    #[test]
+    fn other_directory_slots_still_continue_with_the_default_cd_preference() {
+        let directory = tempfile::tempdir().expect("directory");
+        fs::create_dir(directory.path().join("nested")).expect("nested directory");
+        let provider = provider(Arc::new(SpecRegistry::default()));
+        for buffer in [
+            "ls ne",
+            "pushd ne",
+            "cd > ne",
+            "env -C ne cd",
+            "sudo -D ne cd",
+        ] {
+            let cursor = buffer.find("ne").expect("directory prefix") + 2;
+            let context = CompletionContext::new(
+                QueryId::new(1),
+                ShellKind::Zsh,
+                directory.path().to_owned(),
+                BufferSnapshot::new(buffer, cursor, BufferRevision::new(1), SyncQuality::Exact)
+                    .expect("buffer"),
+            )
+            .expect("context");
+            let output = provider.complete(&context);
+            let candidate = output
+                .candidates
+                .iter()
+                .find(|candidate| candidate.display.primary == "nested/")
+                .unwrap_or_else(|| panic!("directory missing for {buffer}"));
+            assert!(
+                matches!(candidate.action, CandidateAction::InsertAndContinue { .. }),
+                "{buffer}"
+            );
+            assert!(
+                matches!(candidate.completeness, Completeness::NeedsInput { .. }),
+                "{buffer}"
+            );
+        }
     }
 
     #[test]

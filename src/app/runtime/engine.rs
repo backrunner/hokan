@@ -191,12 +191,15 @@ pub(super) fn build_engine(
     // Directory scans have the largest local latency budget. Keep semantic,
     // PATH, and history providers ahead of them so a large cwd cannot starve
     // the rows that already know what the active slot means.
-    engine.register(FilesystemProvider::new(
-        config.ui.show_hidden,
-        Arc::clone(&specs),
-        Arc::clone(&help),
-        Arc::clone(&aliases),
-    ));
+    engine.register(
+        FilesystemProvider::new(
+            config.ui.show_hidden,
+            Arc::clone(&specs),
+            Arc::clone(&help),
+            Arc::clone(&aliases),
+        )
+        .with_cd_enter_behavior(config.completion.cd_enter_behavior),
+    );
     engine.register(AiActionProvider::new(
         Arc::new(config.ai.clone()),
         crate::config::configured_credential_available(&config.ai, &paths.credentials_file),
