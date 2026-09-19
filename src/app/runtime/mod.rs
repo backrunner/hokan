@@ -8,6 +8,7 @@ mod render;
 mod results;
 mod shutdown;
 mod state;
+mod title;
 mod worker;
 
 #[cfg(test)]
@@ -121,6 +122,11 @@ pub fn run_session(options: SessionOptions) -> crate::Result<u8> {
             .map_err(output_error)?;
     let mut output = OutputLease::new(output_handle, output_join);
     configure_overlay(output.handle(), &config)?;
+    output
+        .handle()
+        .configure_title(config.ui.sync_title.then(|| shell.name().to_owned()))
+        .map_err(output_error)?;
+    let mut title_probe = title::ForegroundTitleProbe::start();
     // Normalize any mode leaked by a previous process before child output is
     // forwarded. Native line editors re-enable bracketed paste themselves.
     output
@@ -348,6 +354,14 @@ pub fn run_session(options: SessionOptions) -> crate::Result<u8> {
             auto_update.tick(&config.update, now);
         }
         detect_foreground_process(&mut state, &pty, output.handle())?;
+        if let Some(probe) = &mut title_probe {
+            probe.tick(
+                config.ui.sync_title && state.foreground_process,
+                &pty,
+                output.handle(),
+                now,
+            )?;
+        }
         exit_status = pty.try_wait()?;
         if terminating {
             let started = *termination_started.get_or_insert(now);

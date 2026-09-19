@@ -72,6 +72,9 @@ impl<W: Write> OutputActor<W> {
     /// called at a byte-order boundary, never merely when the shell control
     /// message arrives, so a late PTY batch cannot re-enable the leaked modes.
     pub(super) fn recover_prompt_terminal_state(&mut self) -> Result<(), OutputError> {
+        if !self.foreground {
+            self.title.prompt();
+        }
         let mode_recovery = self.model.recover_foreground_modes();
         if !mode_recovery.is_empty() {
             self.guard.write_control(&mode_recovery)?;

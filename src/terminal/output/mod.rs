@@ -4,6 +4,7 @@ mod gate;
 mod lifecycle;
 #[cfg(test)]
 mod tests;
+mod title;
 
 use std::{
     collections::VecDeque,
@@ -61,6 +62,7 @@ pub struct OutputActorExit<W> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OutputState {
+    pub title_generation: Option<u64>,
     pub cursor: super::CellPos,
     pub confidence: AnchorConfidence,
     pub screen_revision: ScreenRevision,
@@ -99,6 +101,16 @@ pub struct OutputHandle {
 }
 
 impl OutputHandle {
+    pub fn configure_title(&self, shell: Option<String>) -> Result<(), OutputError> {
+        self.mailbox
+            .push_control(ControlCommand::ConfigureTitle(shell))
+    }
+
+    pub fn foreground_title(&self, generation: u64, title: String) -> Result<(), OutputError> {
+        self.mailbox
+            .push_control(ControlCommand::ForegroundTitle { generation, title })
+    }
+
     pub fn child_output(&self, batch: ChildOutputBatch) -> Result<(), OutputError> {
         self.mailbox.push_child(batch)
     }
@@ -252,6 +264,11 @@ impl OutputHandle {
 
 #[derive(Debug)]
 enum ControlCommand {
+    ConfigureTitle(Option<String>),
+    ForegroundTitle {
+        generation: u64,
+        title: String,
+    },
     ArmPromptGate(BoundaryId),
     ArmRenderGate(RenderGateRequest),
     ConfirmCursor(super::CellPos),

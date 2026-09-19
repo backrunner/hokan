@@ -14,6 +14,7 @@ use super::{
 use crate::diagnostics::DebugLog;
 
 pub struct OutputActor<W: Write> {
+    pub(super) title: super::title::TitleSync,
     pub(super) mailbox: Arc<OutputMailbox>,
     pub(super) guard: TerminalGuard<W>,
     pub(super) decoder: RenderBoundaryDecoder,
@@ -69,6 +70,7 @@ impl<W: Write> OutputActor<W> {
         let surface_theme = SurfaceTheme::default();
         let current_height = overlay_height.min(size.rows.saturating_sub(1)).max(1);
         Self {
+            title: super::title::TitleSync::default(),
             mailbox: Arc::new(OutputMailbox::default()),
             guard,
             decoder: RenderBoundaryDecoder::new(token),
@@ -131,6 +133,8 @@ impl<W: Write> OutputActor<W> {
                     // the writer is returned.
                     let _ = self.force_erase_footprint();
                     self.flush_decoder_tail()?;
+                    self.title.prompt();
+                    self.flush_title()?;
                     let writer = self.guard.finish()?;
                     return Ok(OutputActorExit {
                         writer,
@@ -152,6 +156,7 @@ impl<W: Write> OutputActor<W> {
                 ActorCommand::Barrier(sender) => barrier = Some(sender),
             }
             self.retry_pending_hide()?;
+            self.flush_title()?;
             self.try_commit_latest(Instant::now())?;
             if let Some(sender) = barrier {
                 let _ = sender.send(());
@@ -170,6 +175,12 @@ impl<W: Write> OutputActor<W> {
 
     pub(super) fn handle_control(&mut self, control: ControlCommand) -> Result<(), OutputError> {
         match control {
+            ControlCommand::ConfigureTitle(shell) => self.title.configure(shell),
+            ControlCommand::ForegroundTitle { generation, title } => {
+                if self.foreground {
+                    self.title.foreground_title(generation, title);
+                }
+            }
             ControlCommand::ArmPromptGate(boundary_id) => self.arm_prompt_gate(boundary_id)?,
             ControlCommand::ArmRenderGate(request) => self.arm_gate(request),
             ControlCommand::ConfirmCursor(position) => {
@@ -234,6 +245,9 @@ impl<W: Write> OutputActor<W> {
                 self.latest_frame = None;
             }
             ControlCommand::SetForeground(foreground) => {
+                if foreground && !self.foreground {
+                    self.title.next_command();
+                }
                 self.foreground = foreground;
                 if foreground {
                     self.model.begin_foreground();
@@ -291,6 +305,7 @@ impl<W: Write> OutputActor<W> {
 
     fn output_state(&self) -> OutputState {
         OutputState {
+            title_generation: self.title.probe_generation(),
             cursor: self.model.cursor(),
             confidence: self.model.confidence(),
             screen_revision: self.model.screen_revision(),
@@ -377,6 +392,7 @@ impl<W: Write> OutputActor<W> {
         if tail.is_empty() {
             return Ok(());
         }
+        self.scanner.feed(&tail);
         self.guard.write_child(&tail)?;
         self.report.child_bytes = self.report.child_bytes.saturating_add(tail.len() as u64);
         Ok(())
@@ -388,6 +404,9 @@ impl<W: Write> OutputActor<W> {
         }
         let scan = self.scanner.feed(bytes);
         let update = self.model.process(bytes)?;
+        if self.model.take_title_changed() {
+            self.title.child_title(self.foreground);
+        }
         if (scan.became_desynchronized || scan.opaque_control_seen) && !update.epoch_changed {
             self.model.invalidate()?;
         }

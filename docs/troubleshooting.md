@@ -41,6 +41,36 @@ HOKAN_AUTO_START=0 zsh -l
 `HOKAN_AUTO_START=0` 时不会自动启动。移动或重装二进制后重新运行 install，以更新受管块
 中固定的可执行文件路径。
 
+## 终端标题始终显示 hokan
+
+PTY 包装模式下，宿主终端识别到的外层前台进程仍是 `hokan`。Hokan 默认通过标准
+OSC 0 同步显示标题：提示符处显示 `zsh` / `bash` / `fish`，运行前台程序时显示内层
+PTY 前台进程组首进程的可执行文件名，不携带命令参数。进程查询在后台执行，有超时
+和刷新间隔；很快结束的命令可能不会显示，查询不可用时保留当前标题。
+
+程序自己的 OSC 0/1/2 标题会透传，并在本次命令内优先于 Hokan 的自动标题。
+启动时已发送标题的 shell/主题继续管理提示符标题。如果希望完全由自己的主题管理，
+设置（支持热重载）：
+
+```toml
+[ui]
+sync_title = false
+```
+
+- **Cursor / VS Code**：在用户设置 JSON 中设置
+  `"terminal.integrated.tabs.title": "${sequence}"`。`${process}` 读取外层进程名，
+  无法通过 OSC 改成内层程序名；手动重命名的终端标签也可能覆盖动态标题。
+- **macOS Terminal**：在设置 → 描述文件 → 当前配置的「窗口」/「标签页」标题选项
+  中取消「活跃进程名称」，避免标题继续附加外层的 `hokan`。如果启用了「Shell 命令
+  名称」，也可以取消这个附加项。
+- **tmux**：OSC 标题会更新 pane title；若还需要更新外层终端窗口标题，在
+  `~/.tmux.conf` 中加入 `set -g set-titles on` 和
+  `set -g set-titles-string '#{pane_title}'`。
+- **SSH**：标准标题序列随终端输出传输；远端程序自己的标题仍然优先。宿主终端和
+  中间复用器需要允许程序设置标题。
+
+标题同步不会修改宿主终端设置，也不会改变进程身份或关闭窗口时的确认策略。
+
 ## 终端没有回显或输入模式异常
 
 Hokan 会在正常退出、panic 和可处理信号路径恢复 canonical mode、echo、SGR 和光标。

@@ -143,6 +143,10 @@ impl RenderBoundaryDecoder {
         pending
     }
 
+    pub(crate) fn has_pending_bytes(&self) -> bool {
+        !self.candidate.is_empty()
+    }
+
     fn push_byte(&mut self, byte: u8, decoded: &mut DecodedChildOutput) {
         if self.candidate.is_empty() {
             if byte == 0x1b && (self.scanner.is_safe() || self.scanner.is_desynchronized()) {

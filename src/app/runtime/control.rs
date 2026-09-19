@@ -194,6 +194,9 @@ pub(super) fn handle_config_reload(
             state.pending_confirm = None;
             state.update_overlay_height(u16::try_from(live.ui.max_rows).unwrap_or(u16::MAX).max(1));
             configure_overlay(output, &live)?;
+            output
+                .configure_title(live.ui.sync_title.then(|| state.shell.name().to_owned()))
+                .map_err(output_error)?;
             *config = live;
             if state.editing
                 && state.buffer.sync != SyncQuality::Uncertain

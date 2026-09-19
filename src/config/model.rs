@@ -261,6 +261,8 @@ pub struct UiConfig {
     pub color: String,
     /// Render the Nerd Font icon column (requires a Nerd Font in the terminal).
     pub nerd_fonts: bool,
+    /// Publish shell/foreground program titles through OSC 0.
+    pub sync_title: bool,
     /// Removed in favor of `nerd_fonts`; accepted so old configs still load.
     #[serde(skip_serializing)]
     pub ascii_icons: Option<bool>,
@@ -377,6 +379,7 @@ impl Default for UiConfig {
             max_width: 76,
             color: "auto".into(),
             nerd_fonts: true,
+            sync_title: true,
             ascii_icons: None,
             show_hidden: false,
         }

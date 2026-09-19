@@ -255,9 +255,28 @@ Example UI settings:
 max_rows = 8
 max_width = 76
 nerd_fonts = true
+sync_title = true
 ```
 
 Set `nerd_fonts = false` if icons render as empty squares.
+
+Hokan publishes terminal titles by default: the shell name at an idle prompt,
+and the foreground PTY process name while a program runs. Program-supplied OSC
+titles take priority during that command. Shells/themes that publish a title
+at startup keep ownership of their prompt titles. Set `sync_title = false` to
+leave all titles to your shell/theme; this setting reloads live.
+
+Cursor/VS Code tabs must use the escape-sequence title instead of the outer
+process name. Add this to the editor's user settings JSON:
+
+```json
+"terminal.integrated.tabs.title": "${sequence}"
+```
+
+In macOS Terminal, disable **Active process name** in the profile's Window/Tab
+title settings if it still appends `hokan`. This changes title presentation;
+the outer process remains Hokan, and closing-window confirmation is unchanged.
+See [terminal title troubleshooting](docs/troubleshooting.md#终端标题始终显示-hokan).
 
 Selecting a directory for `cd` and pressing `Enter` executes `cd` immediately
 by default. To fill the path and keep suggesting child directories instead,

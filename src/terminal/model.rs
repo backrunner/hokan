@@ -29,6 +29,7 @@ pub struct ScreenRegionSnapshot {
 
 #[derive(Debug, Default)]
 struct EffectObserver {
+    title_changed: bool,
     unknown_screen_effect: bool,
     sync_mode_change: Option<bool>,
     mode_changes: Vec<InputModeChange>,
@@ -45,11 +46,16 @@ enum InputModeChange {
     Reset,
 }
 
-// OSC sequences are intentionally tolerated: without an osc_dispatch override
-// they fall through to the vte::Perform default no-op. Hokan's own OSC 6973
+// OSC sequences are tolerated without changing screen confidence. Hokan's OSC 6973
 // markers never reach this observer — RenderBoundaryDecoder strips them from
 // the child stream before TerminalModel::process sees it.
 impl vte::Perform for EffectObserver {
+    fn osc_dispatch(&mut self, params: &[&[u8]], _: bool) {
+        if matches!(params.first(), Some(&b"0" | &b"1" | &b"2")) && params.len() >= 2 {
+            self.title_changed = true;
+        }
+    }
+
     fn execute(&mut self, byte: u8) {
         if !matches!(byte, 0 | 7..=15 | 0x18 | 0x1a) {
             self.unknown_screen_effect = true;
@@ -216,6 +222,10 @@ pub struct TerminalModel {
 }
 
 impl TerminalModel {
+    pub(crate) fn take_title_changed(&mut self) -> bool {
+        std::mem::take(&mut self.observer.title_changed)
+    }
+
     #[must_use]
     pub fn new(size: TerminalSize) -> Self {
         Self {
