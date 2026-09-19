@@ -124,17 +124,20 @@ fn older_release_never_replaces_a_newer_installed_binary() {
     let root = tempfile::tempdir().expect("root");
     let (paths, exe) = upgrade_paths(root.path(), "http://127.0.0.1:1");
     write_stub_binary(&exe, "#!/bin/sh\necho hokan 10.0.0\n");
-    assert_eq!(
-        download_and_install(
-            &release("http://127.0.0.1:1", "9.9.9"),
-            &paths,
-            &Version::new(0, 1, 0)
-        )
-        .expect("already upgraded"),
-        UpgradeOutcome::AlreadyCurrent {
-            version: Version::new(10, 0, 0)
-        }
-    );
+    for running in [
+        Version::new(0, 1, 0),
+        Version::new(10, 0, 0),
+        Version::new(11, 0, 0),
+    ] {
+        assert_eq!(
+            download_and_install(&release("http://127.0.0.1:1", "9.9.9"), &paths, &running)
+                .expect("never downgrade"),
+            UpgradeOutcome::AlreadyCurrent {
+                version: Version::new(10, 0, 0)
+            }
+        );
+    }
+    assert!(!paths.cache_dir.exists());
 }
 
 #[test]

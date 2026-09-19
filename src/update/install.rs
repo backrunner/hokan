@@ -68,7 +68,11 @@ pub(crate) fn download_and_install(
     let original = super::local_io::read_file(&paths.current_exe)?;
     let permissions = original.metadata()?.permissions();
     let installed = binary_version(&paths.current_exe)?;
-    if installed > *current_version && installed >= release.version {
+    if release.version.cmp_precedence(current_version).is_lt()
+        || installed.cmp_precedence(&release.version).is_gt()
+        || (installed.cmp_precedence(current_version).is_gt()
+            && installed.cmp_precedence(&release.version).is_eq())
+    {
         return Ok(UpgradeOutcome::AlreadyCurrent { version: installed });
     }
     let downloads = paths.cache_dir.join("downloads");

@@ -5,8 +5,7 @@
 //!   `cli::run` 的缓冲输出；脚本化场景用 `--yes` 或 `--check`。
 //! - `--auto` 是隐藏的无头模式（由会话启动及定时检查调用）：全程零输出，
 //!   退出码是唯一信号（0 成功 / 1 失败），错误被静默吞掉。
-//! - `--channel` 会把选择持久化到 `[update].channel`（原子写回配置文件），
-//!   发生在任何网络请求之前。
+//! - 默认跟随当前二进制的渠道；`--channel` 仅选择本次目标，不修改配置。
 //! - 真正的下载/校验/替换全部走 `update::run_upgrade`，手动与自动共用同一路径。
 
 use std::io::{BufRead, IsTerminal, Write};
@@ -69,11 +68,8 @@ fn run_auto(paths: &ConfigPaths, upgrade_paths: &UpgradePaths) -> u8 {
     if !config.update.enabled || std::env::var_os("HOKAN_NO_AUTO_UPDATE").is_some() {
         return 0;
     }
-    let Ok(channel) = Channel::parse(&config.update.channel) else {
-        return 1;
-    };
     let options = UpgradeOptions {
-        channel,
+        channel: Channel::current(),
         check_only: false,
         force: false,
         auto: true,
@@ -99,24 +95,17 @@ fn run_with_io(
     args: &UpgradeArgs,
 ) -> crate::Result<()> {
     // 先加载配置：解析失败立即中止，避免在损坏的配置上执行升级。
-    let mut config = Config::load(&paths.config_file)?;
+    Config::load(&paths.config_file)?;
 
-    // 显式指定的渠道先持久化到配置文件，再执行检查/升级。
+    // 不保存目标渠道：只有实际安装的新二进制决定后续默认渠道。
     let channel = match &args.channel {
-        Some(value) => {
-            let channel = Channel::parse(value).map_err(|error| {
-                crate::Error::Config(format!(
-                    "未知更新渠道 {value}（{}）；可选 stable 或 beta",
-                    error.code()
-                ))
-            })?;
-            config.update.channel = channel.as_str().to_owned();
-            config.write_atomic(&paths.config_file)?;
-            writeln!(output, "更新渠道已保存：{channel}")?;
-            channel
-        }
-        None => Channel::parse(&config.update.channel)
-            .map_err(|error| crate::Error::Config(error.to_string()))?,
+        Some(value) => Channel::parse(value).map_err(|error| {
+            crate::Error::Config(format!(
+                "未知更新渠道 {value}（{}）；可选 stable 或 beta",
+                error.code()
+            ))
+        })?,
+        None => Channel::current(),
     };
 
     if !tty && !args.yes && !args.check {
@@ -128,21 +117,32 @@ fn run_with_io(
     }
 
     // 先只做检查，拿到“当前 → 最新”供用户确认；确认后再走完整升级。
-    let release = crate::update::check_release(channel, upgrade_paths).map_err(update_failure)?;
+    let Some(release) =
+        crate::update::check_release(channel, upgrade_paths).map_err(update_failure)?
+    else {
+        writeln!(
+            output,
+            "{channel} 通道暂无已发布版本，保留当前版本及默认通道"
+        )?;
+        return Ok(());
+    };
     let current = semver::Version::parse(env!("CARGO_PKG_VERSION"))
         .map_err(|_| update_failure(UpdateError::InvalidResponse))?;
     let latest = &release.version;
     writeln!(output, "当前 v{current} → 最新 v{latest} [{channel}]")?;
 
     if args.check {
-        if latest > &current {
-            writeln!(output, "可升级：运行 hokan upgrade 安装")?;
+        if crate::update::should_install(&current, latest, false) {
+            writeln!(
+                output,
+                "可升级：运行 hokan upgrade --channel {channel} 安装"
+            )?;
         } else {
             writeln!(output, "已是最新版本")?;
         }
         return Ok(());
     }
-    if latest < &current || (latest == &current && !args.force) {
+    if !crate::update::should_install(&current, latest, args.force) {
         writeln!(output, "已是最新版本 v{current}")?;
         return Ok(());
     }
@@ -161,6 +161,7 @@ fn run_with_io(
         UpgradeOutcome::Upgraded { from, to } => {
             writeln!(output, "SHA256 校验与冒烟测试通过")?;
             writeln!(output, "升级完成：v{from} → v{to}，下次启动生效")?;
+            writeln!(output, "后续默认更新通道：{}", Channel::for_version(&to))?;
             Ok(())
         }
         UpgradeOutcome::AlreadyCurrent { version } => {
@@ -186,7 +187,9 @@ fn run_with_io(
                 path.display()
             )))
         }
-        UpgradeOutcome::Checked { .. } | UpgradeOutcome::Deferred => Err(crate::Error::Config(
+        UpgradeOutcome::Checked { .. }
+        | UpgradeOutcome::Deferred
+        | UpgradeOutcome::NoRelease { .. } => Err(crate::Error::Config(
             "内部错误：升级返回了非预期结果".into(),
         )),
     }
@@ -229,8 +232,15 @@ mod tests {
         spawn_server, write_stub_binary,
     };
 
+    fn stable_args() -> UpgradeArgs {
+        UpgradeArgs {
+            channel: Some("stable".into()),
+            ..UpgradeArgs::default()
+        }
+    }
+
     fn test_paths(root: &Path) -> ConfigPaths {
-        // Most CLI fixtures deliberately exercise the stable endpoint.
+        // Legacy configurations must remain byte-for-byte unchanged by an upgrade.
         fs::write(root.join("config.toml"), "[update]\nchannel = \"stable\"\n")
             .expect("fixture channel");
         ConfigPaths {
@@ -272,14 +282,7 @@ mod tests {
         spawn_server(requests, move |path| {
             if path.starts_with("/repos/") {
                 let release = release_json(&tag, &[archive_name.clone(), "SHA256SUMS".to_owned()]);
-                // The beta channel queries the release list (an array);
-                // stable queries `/releases/latest` (a single object).
-                let body = if path.contains("releases?") {
-                    serde_json::json!([release])
-                } else {
-                    release
-                };
-                json_reply("200 OK", body)
+                json_reply("200 OK", serde_json::json!([release]))
             } else if path == format!("/download/{archive_name}") {
                 raw_reply("200 OK", archive.clone())
             } else if path == "/download/SHA256SUMS" {
@@ -326,7 +329,7 @@ mod tests {
 
         let args = UpgradeArgs {
             check: true,
-            ..UpgradeArgs::default()
+            ..stable_args()
         };
         let (result, output, _) = run_scripted("", false, &paths, &upgrade_paths, &args);
         result.expect("check run");
@@ -354,8 +357,7 @@ mod tests {
         let paths = test_paths(root.path());
         let upgrade_paths = make_upgrade_paths(root.path(), &base);
 
-        let (result, output, _) =
-            run_scripted("y\n", true, &paths, &upgrade_paths, &UpgradeArgs::default());
+        let (result, output, _) = run_scripted("y\n", true, &paths, &upgrade_paths, &stable_args());
         result.expect("upgrade run");
         assert!(output.contains("确认升级？[Y/n]"), "{output}");
         assert!(output.contains("SHA256 校验与冒烟测试通过"), "{output}");
@@ -384,7 +386,7 @@ mod tests {
             let exe_before = fs::read(&upgrade_paths.current_exe).expect("exe");
 
             let (result, output, _) =
-                run_scripted(stdin, true, &paths, &upgrade_paths, &UpgradeArgs::default());
+                run_scripted(stdin, true, &paths, &upgrade_paths, &stable_args());
             result.expect("declined run");
             assert!(output.contains("已取消"), "{output}");
             join.join().expect("server thread");
@@ -396,28 +398,142 @@ mod tests {
     }
 
     #[test]
-    fn channel_flag_persists_before_checking() {
+    fn channel_flag_checks_without_changing_config() {
         let root = tempfile::tempdir().expect("tempdir");
-        // beta 渠道：release 列表 + latest 共两次请求。
-        let (base, join) = serve_full_upgrade("9.9.9-beta.1", 2);
+        // A channel override must not persist even when the check succeeds.
+        let (base, join) = serve_full_upgrade("9.9.9-beta.1", 1);
         let paths = test_paths(root.path());
         let upgrade_paths = make_upgrade_paths(root.path(), &base);
 
         let args = UpgradeArgs {
             check: true,
             channel: Some("beta".to_owned()),
-            ..UpgradeArgs::default()
+            ..stable_args()
         };
         let (result, output, _) = run_scripted("", false, &paths, &upgrade_paths, &args);
         result.expect("channel run");
-        assert!(output.contains("更新渠道已保存：beta"), "{output}");
+        assert!(!output.contains("已保存"), "{output}");
         assert!(output.contains("[beta]"), "{output}");
         join.join().expect("server thread");
 
         let saved = fs::read_to_string(&paths.config_file).expect("saved config");
-        assert!(saved.contains("channel = \"beta\""), "{saved}");
+        assert!(saved.contains("channel = \"stable\""), "{saved}");
         let reloaded = Config::load(&paths.config_file).expect("reload config");
-        assert_eq!(reloaded.update.channel, "beta");
+        assert_eq!(reloaded.update.channel.as_deref(), Some("stable"));
+    }
+
+    #[test]
+    fn default_channel_ignores_legacy_pins_for_manual_and_automatic_upgrades() {
+        let version = if Channel::current() == Channel::Beta {
+            "9.9.9-beta.1"
+        } else {
+            "9.9.9"
+        };
+        for auto in [false, true] {
+            let root = tempfile::tempdir().expect("tempdir");
+            let paths = test_paths(root.path());
+            let legacy = if Channel::current() == Channel::Beta {
+                "stable"
+            } else {
+                "beta"
+            };
+            fs::write(
+                &paths.config_file,
+                format!("[update]\nchannel = \"{legacy}\"\n"),
+            )
+            .expect("legacy pin");
+            let before = fs::read(&paths.config_file).expect("config");
+            let (base, join) = serve_full_upgrade(version, 3);
+            let upgrade_paths = make_upgrade_paths(root.path(), &base);
+            if auto {
+                assert_eq!(run_auto(&paths, &upgrade_paths), 0);
+            } else {
+                let args = UpgradeArgs {
+                    yes: true,
+                    ..UpgradeArgs::default()
+                };
+                let (result, output, _) = run_scripted("", false, &paths, &upgrade_paths, &args);
+                result.expect("default upgrade");
+                assert!(
+                    output.contains(&format!("后续默认更新通道：{}", Channel::current())),
+                    "{output}"
+                );
+            }
+            assert!(
+                fs::read_to_string(&upgrade_paths.current_exe)
+                    .expect("installed")
+                    .contains(version)
+            );
+            assert_eq!(fs::read(&paths.config_file).expect("config"), before);
+            join.join().expect("server");
+        }
+    }
+
+    #[test]
+    fn channel_override_never_writes_config_on_success_cancel_failure_or_no_upgrade() {
+        for (version, answer, yes, force, requests) in [
+            ("9.9.9-beta.1", "", true, false, 3),
+            ("9.9.9-beta.1", "n\n", false, false, 1),
+            ("0.0.1-beta.1", "", true, true, 1),
+        ] {
+            let root = tempfile::tempdir().expect("tempdir");
+            let paths = test_paths(root.path());
+            let before = fs::read(&paths.config_file).expect("config");
+            let (base, join) = serve_full_upgrade(version, requests);
+            let upgrade_paths = make_upgrade_paths(root.path(), &base);
+            let exe_before = fs::read(&upgrade_paths.current_exe).expect("binary");
+            let args = UpgradeArgs {
+                channel: Some("beta".into()),
+                yes,
+                force,
+                ..UpgradeArgs::default()
+            };
+            let (result, _, _) = run_scripted(answer, !yes, &paths, &upgrade_paths, &args);
+            result.expect("upgrade");
+            if requests == 1 {
+                assert_eq!(
+                    fs::read(&upgrade_paths.current_exe).expect("binary"),
+                    exe_before
+                );
+            }
+            assert_eq!(fs::read(&paths.config_file).expect("config"), before);
+            join.join().expect("server");
+        }
+        let root = tempfile::tempdir().expect("tempdir");
+        let paths = test_paths(root.path());
+        let before = fs::read(&paths.config_file).expect("config");
+        let upgrade_paths = make_upgrade_paths(root.path(), "http://127.0.0.1:1");
+        let args = UpgradeArgs {
+            channel: Some("beta".into()),
+            yes: true,
+            ..UpgradeArgs::default()
+        };
+        let (result, _, _) = run_scripted("", false, &paths, &upgrade_paths, &args);
+        assert!(result.is_err());
+        assert_eq!(fs::read(&paths.config_file).expect("config"), before);
+    }
+
+    #[test]
+    fn stable_with_only_beta_releases_reports_no_release_without_mutations() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let paths = test_paths(root.path());
+        let before = fs::read(&paths.config_file).expect("config");
+        let (base, join) = serve_full_upgrade("9.9.9-beta.1", 1);
+        let upgrade_paths = make_upgrade_paths(root.path(), &base);
+        let exe_before = fs::read(&upgrade_paths.current_exe).expect("binary");
+        let args = UpgradeArgs {
+            check: true,
+            ..stable_args()
+        };
+        let (result, output, _) = run_scripted("", false, &paths, &upgrade_paths, &args);
+        result.expect("no stable yet");
+        assert!(output.contains("stable 通道暂无已发布版本"), "{output}");
+        assert_eq!(
+            fs::read(&upgrade_paths.current_exe).expect("binary"),
+            exe_before
+        );
+        assert_eq!(fs::read(&paths.config_file).expect("config"), before);
+        join.join().expect("server");
     }
 
     #[test]
@@ -429,7 +545,7 @@ mod tests {
         let args = UpgradeArgs {
             check: true,
             channel: Some("nightly".to_owned()),
-            ..UpgradeArgs::default()
+            ..stable_args()
         };
         let (result, _, _) = run_scripted("", false, &paths, &upgrade_paths, &args);
         let error = result.expect_err("invalid channel must fail");
@@ -438,8 +554,9 @@ mod tests {
             Config::load(&paths.config_file)
                 .expect("config")
                 .update
-                .channel,
-            "stable"
+                .channel
+                .as_deref(),
+            Some("stable")
         );
     }
 
@@ -448,8 +565,7 @@ mod tests {
         let root = tempfile::tempdir().expect("tempdir");
         let paths = test_paths(root.path());
         let upgrade_paths = make_upgrade_paths(root.path(), "http://127.0.0.1:1");
-        let (result, _, _) =
-            run_scripted("", false, &paths, &upgrade_paths, &UpgradeArgs::default());
+        let (result, _, _) = run_scripted("", false, &paths, &upgrade_paths, &stable_args());
         let error = result.expect_err("non-TTY must fail");
         let detail = error.to_string();
         assert!(detail.contains("--yes"), "{detail}");
@@ -473,7 +589,7 @@ mod tests {
 
         let args = UpgradeArgs {
             yes: true,
-            ..UpgradeArgs::default()
+            ..stable_args()
         };
         let (result, _, err) = run_scripted("", true, &paths, &upgrade_paths, &args);
         let error = result.expect_err("not writable must fail");
@@ -496,11 +612,12 @@ mod tests {
         fs::write(
             root.path().join("state/update-check.json"),
             format!(
-                "{{\"last_check_epoch\":{},\"channel\":\"stable\",\"latest_known\":\"0.0.1\"}}",
+                "{{\"last_check_epoch\":{},\"channel\":\"{}\",\"latest_known\":\"0.0.1\"}}",
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|duration| duration.as_secs())
-                    .unwrap_or(0)
+                    .unwrap_or(0),
+                Channel::current()
             ),
         )
         .expect("seed cache");
@@ -528,7 +645,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_mode_installs_a_beta_without_a_stable_release() {
+    fn auto_mode_stays_on_its_build_channel_in_a_beta_only_repository() {
         let root = tempfile::tempdir().expect("tempdir");
         let paths = test_paths(root.path());
         fs::write(&paths.config_file, "[update]\nchannel = \"beta\"\n").expect("beta channel");
@@ -536,7 +653,8 @@ mod tests {
         let archive = build_archive(&format!("#!/bin/sh\necho hokan {version}\n"));
         let name = archive_asset(version);
         let sums = sha256sums_for(&[(&format!("{:x}", Sha256::digest(&archive)), &name)]);
-        let (base, join) = spawn_server(4, move |path| {
+        let tracks_beta = Channel::current() == Channel::Beta;
+        let (base, join) = spawn_server(if tracks_beta { 3 } else { 1 }, move |path| {
             if path.contains("releases?") {
                 json_reply(
                     "200 OK",
@@ -555,10 +673,15 @@ mod tests {
         });
         let upgrade_paths = make_upgrade_paths(root.path(), &base);
         assert_eq!(run_auto(&paths, &upgrade_paths), 0);
+        let expected = if tracks_beta {
+            version
+        } else {
+            env!("CARGO_PKG_VERSION")
+        };
         assert!(
             fs::read_to_string(&upgrade_paths.current_exe)
-                .expect("installed beta")
-                .contains(version)
+                .expect("installed binary")
+                .contains(expected)
         );
         assert_eq!(
             run_auto(&paths, &upgrade_paths),
@@ -576,7 +699,7 @@ mod tests {
         let upgrade_paths = make_upgrade_paths(root.path(), &base);
         let args = UpgradeArgs {
             check: true,
-            ..UpgradeArgs::default()
+            ..stable_args()
         };
         let (result, _, _) = run_scripted("", false, &paths, &upgrade_paths, &args);
         let error = result.expect_err("404 must fail gracefully");

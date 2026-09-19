@@ -107,8 +107,7 @@ Logs are opt-in and bounded. When enabled, they are written to `~/.hokan/debug.l
 ```toml
 [update]
 enabled = true
-channel = "beta"
 interval_secs = 1800
 ```
 
-New beta installations use the beta channel; explicit channel choices are preserved. Set `enabled = false` to disable automatic updates, or `HOKAN_NO_AUTO_UPDATE=1` for one session. The updated binary takes effect on the next launch. See [updates and maintenance](/docs/guides/updates).
+Updates follow the installed binary’s channel. Legacy `channel` values are accepted but ignored; use `hokan upgrade --channel stable` or `--channel beta` for a one-time cross-channel upgrade to a higher version. Set `enabled = false` to disable automatic updates, or `HOKAN_NO_AUTO_UPDATE=1` for one session. The updated binary takes effect on the next launch. See [updates and maintenance](/docs/guides/updates).

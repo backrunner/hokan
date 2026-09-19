@@ -39,13 +39,23 @@ out after five seconds. Cache reads are bounded and reject links and special
 files. A failed download, checksum, or binary smoke test leaves the installed
 binary unchanged. Manual upgrades install the version shown at confirmation.
 
-New beta installations default to the beta channel; stable builds default to
-stable. An explicitly configured channel is preserved. Existing beta users
-whose config says `channel = "stable"` can opt into beta updates once with:
+Updates default to the installed binary's channel: beta builds check beta
+releases, and stable builds check stable releases. Use `--channel` to target
+another channel for this invocation. Only a higher semantic version can be
+installed across channels; `--force` allows an equal-version reinstall but
+never a downgrade. After installation, future checks follow the new binary's
+channel. Checking, cancelling, or failing an upgrade never switches channels.
+Legacy `[update].channel` values are accepted but ignored.
 
 ```bash
+hokan upgrade --channel stable --check
+hokan upgrade --channel stable --yes
 hokan upgrade --channel beta --yes
 ```
+
+If the requested channel has no published release yet, Hokan reports that
+without changing the installation. A beta-only repository does not require
+a stable release for beta updates to work.
 
 Set `HOKAN_NO_AUTO_UPDATE=1` to disable automatic updating for one session, or
 configure `[update]` (set `enabled = false` to disable it persistently):
@@ -53,6 +63,5 @@ configure `[update]` (set `enabled = false` to disable it persistently):
 ```toml
 [update]
 enabled = true
-channel = "beta"
 interval_secs = 1800
 ```

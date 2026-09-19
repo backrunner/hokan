@@ -72,7 +72,7 @@ hokan upgrade
 hokan upgrade --channel beta
 ```
 
-`--check` only reports availability. `--channel` persists a stable or beta selection. `--force` reinstalls the current release, and `--yes` skips the upgrade confirmation. See [updates and maintenance](/docs/guides/updates).
+`--check` only reports availability. `--channel` selects stable or beta for this invocation; the default follows the installed binary. A cross-channel upgrade requires a higher version, and subsequent checks follow the new binary’s channel. `--force` reinstalls the current release, and `--yes` skips the upgrade confirmation. See [updates and maintenance](/docs/guides/updates).
 
 ## Uninstall
 

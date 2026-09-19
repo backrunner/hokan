@@ -291,7 +291,8 @@ pub(super) fn inspect_update(
             CheckLevel::Ok,
             format!(
                 "enabled; channel {}, checks every {}s",
-                config.update.channel, config.update.interval_secs
+                crate::update::Channel::current(),
+                config.update.interval_secs
             ),
         )
     } else {
@@ -300,11 +301,12 @@ pub(super) fn inspect_update(
             "disabled; no background update checks run",
         )
     };
-    let latest_known =
-        crate::update::read_cached_check(&paths.state_directory).map(|cached| cached.latest_known);
+    let latest_known = crate::update::read_cached_check(&paths.state_directory)
+        .filter(|cached| cached.channel == crate::update::Channel::current().as_str())
+        .map(|cached| cached.latest_known);
     UpdateDetails {
         check,
-        channel: Some(config.update.channel.clone()),
+        channel: Some(crate::update::Channel::current().as_str().to_owned()),
         interval_secs: Some(config.update.interval_secs),
         latest_known,
         exe: exe_check,

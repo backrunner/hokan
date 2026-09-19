@@ -78,32 +78,29 @@ pub(crate) fn download_client() -> Result<Client, UpdateError> {
         .map_err(|_| UpdateError::Network)
 }
 
-/// Resolves the newest release for `channel`. Beta takes the highest semver
-/// across recent releases (prereleases included) and the latest stable, so
-/// beta users never fall behind a newer stable release.
-pub fn fetch_latest(channel: Channel, base: &str, repo: &str) -> Result<ReleaseInfo, UpdateError> {
+/// Resolve the highest semver within the requested channel. The release list
+/// distinguishes an empty channel from a missing repository (HTTP 404).
+/// Paginate because publication order need not match semantic version order.
+pub fn fetch_latest(
+    channel: Channel,
+    base: &str,
+    repo: &str,
+) -> Result<Option<ReleaseInfo>, UpdateError> {
     let client = api_client()?;
     let base = base.trim_end_matches('/');
     block_on(async {
-        match channel {
-            Channel::Stable => {
-                let url = format!("{base}/repos/{repo}/releases/latest");
-                let release: Release = get_json(&client, &url).await?;
-                release_info(release)
-            }
-            Channel::Beta => {
-                let url = format!("{base}/repos/{repo}/releases?per_page=20");
-                let mut releases: Vec<Release> = get_json(&client, &url).await?;
-                // Compare with the latest stable and keep the max. A failed
-                // stable lookup degrades to beta-only instead of failing.
-                let stable_url = format!("{base}/repos/{repo}/releases/latest");
-                if let Ok(stable) = get_json::<Release>(&client, &stable_url).await {
-                    releases.push(stable);
-                }
-                let best = select_highest(releases)?;
-                release_info(best)
+        let mut best = None;
+        for page in 1.. {
+            let url = format!("{base}/repos/{repo}/releases?per_page=20&page={page}");
+            let mut releases: Vec<Release> = get_json(&client, &url).await?;
+            let last_page = releases.len() < 20;
+            releases.extend(best.take());
+            best = select_highest(releases, channel);
+            if last_page {
+                break;
             }
         }
+        best.map(release_info).transpose()
     })?
 }
 
@@ -190,14 +187,17 @@ fn map_reqwest_error(error: reqwest::Error) -> UpdateError {
 
 /// Picks the release with the highest semver tag; prereleases order below
 /// their release (`0.2.0` > `0.2.0-beta.2` > `0.2.0-beta.1`).
-fn select_highest(releases: Vec<Release>) -> Result<Release, UpdateError> {
+fn select_highest(releases: Vec<Release>, channel: Channel) -> Option<Release> {
     releases
         .into_iter()
         .filter(|release| !release.draft)
         .filter_map(|release| parse_tag_version(&release.tag_name).map(|v| (v, release)))
-        .max_by(|(left, _), (right, _)| left.cmp(right))
+        .filter(|(version, release)| {
+            Channel::for_version(version) == channel
+                && release.prerelease == (channel == Channel::Beta)
+        })
+        .max_by(|(left, _), (right, _)| left.cmp_precedence(right))
         .map(|(_, release)| release)
-        .ok_or(UpdateError::InvalidResponse)
 }
 
 /// Resolves the platform archive and SHA256SUMS assets of one release.
@@ -225,6 +225,8 @@ struct Release {
     tag_name: String,
     #[serde(default)]
     draft: bool,
+    #[serde(default)]
+    prerelease: bool,
     #[serde(default)]
     assets: Vec<Asset>,
 }
@@ -257,88 +259,104 @@ mod tests {
         join.join().expect("server thread");
     }
 
-    #[test]
-    fn stable_channel_parses_latest_release() {
-        let (base, join) = spawn_server(1, move |path| {
-            assert_eq!(path, "/repos/backrunner/hokan/releases/latest");
-            json_reply(
-                "200 OK",
-                release_json("v0.2.0", &[archive_asset("0.2.0"), "SHA256SUMS".to_owned()]),
-            )
-        });
-        let info = fetch_latest(Channel::Stable, &base, "backrunner/hokan").expect("latest");
-        assert_eq!(info.version, Version::parse("0.2.0").expect("version"));
-        assert_eq!(info.tag, "v0.2.0");
-        assert!(info.archive_url.ends_with(&archive_asset("0.2.0")));
-        assert!(info.checksums_url.ends_with("SHA256SUMS"));
-        join.join().expect("server thread");
+    fn fixture(tag: &str) -> serde_json::Value {
+        let version = tag.trim_start_matches('v');
+        release_json(tag, &[archive_asset(version), "SHA256SUMS".to_owned()])
     }
 
     #[test]
-    fn beta_channel_picks_highest_semver_including_prereleases() {
-        let (base, join) = spawn_server(2, move |path| {
-            if path.starts_with("/repos/backrunner/hokan/releases?") {
-                let beta2 = archive_asset("0.2.0-beta.2");
+    fn each_channel_selects_its_highest_semver_without_crossing_channels() {
+        for (channel, expected) in [
+            (Channel::Stable, "v0.2.0"),
+            (Channel::Beta, "v0.2.0-beta.10"),
+        ] {
+            let (base, join) = spawn_server(1, |path| {
+                assert_eq!(path, "/repos/backrunner/hokan/releases?per_page=20&page=1");
+                let mut draft = fixture("v9.9.9-beta.1");
+                draft["draft"] = serde_json::json!(true);
+                let mut mislabeled = fixture("v9.9.9");
+                mislabeled["prerelease"] = serde_json::json!(true);
                 json_reply(
                     "200 OK",
                     serde_json::json!([
-                        release_json(
-                            "v0.2.0-beta.1",
-                            &[archive_asset("0.2.0-beta.1"), "SHA256SUMS".to_owned()]
-                        ),
-                        release_json("v0.2.0-beta.2", &[beta2, "SHA256SUMS".to_owned()]),
+                        fixture("v0.2.0-beta.2"),
+                        fixture("v0.1.0"),
+                        fixture("v0.2.0-beta.10"),
+                        fixture("v0.2.0"),
                         release_json("nightly", &[]),
+                        draft,
+                        mislabeled,
                     ]),
                 )
-            } else {
-                json_reply(
-                    "200 OK",
-                    release_json("v0.1.0", &[archive_asset("0.1.0"), "SHA256SUMS".to_owned()]),
-                )
-            }
-        });
-        let info = fetch_latest(Channel::Beta, &base, "backrunner/hokan").expect("beta latest");
-        assert_eq!(info.tag, "v0.2.0-beta.2");
-        assert_eq!(
-            info.version,
-            Version::parse("0.2.0-beta.2").expect("version")
-        );
-        join.join().expect("server thread");
+            });
+            let info = fetch_latest(channel, &base, "backrunner/hokan")
+                .expect("lookup")
+                .expect("release");
+            assert_eq!(info.tag, expected);
+            assert!(
+                info.archive_url
+                    .ends_with(&archive_asset(expected.trim_start_matches('v')))
+            );
+            assert!(info.checksums_url.ends_with("SHA256SUMS"));
+            join.join().expect("server thread");
+        }
     }
 
     #[test]
-    fn beta_channel_falls_back_to_newer_stable() {
-        let (base, join) = spawn_server(2, move |path| {
-            if path.starts_with("/repos/backrunner/hokan/releases?") {
-                json_reply(
-                    "200 OK",
-                    serde_json::json!([release_json(
-                        "v0.2.0-beta.1",
-                        &[archive_asset("0.2.0-beta.1"), "SHA256SUMS".to_owned()]
-                    ),]),
-                )
-            } else {
-                json_reply(
-                    "200 OK",
-                    release_json("v0.2.0", &[archive_asset("0.2.0"), "SHA256SUMS".to_owned()]),
-                )
-            }
-        });
-        let info = fetch_latest(Channel::Beta, &base, "backrunner/hokan").expect("beta latest");
-        assert_eq!(info.tag, "v0.2.0");
-        assert_eq!(info.version, Version::parse("0.2.0").expect("version"));
-        join.join().expect("server thread");
+    fn empty_channel_is_not_an_http_error_or_a_cross_channel_fallback() {
+        for (channel, releases) in [
+            (Channel::Stable, vec![fixture("v0.2.0-beta.1")]),
+            (Channel::Beta, vec![fixture("v0.2.0")]),
+            (Channel::Stable, vec![]),
+        ] {
+            let (base, join) = spawn_server(1, move |_| {
+                json_reply("200 OK", serde_json::json!(releases))
+            });
+            assert_eq!(
+                fetch_latest(channel, &base, "backrunner/hokan").expect("lookup"),
+                None
+            );
+            join.join().expect("server thread");
+        }
+    }
+
+    #[test]
+    fn selection_checks_later_pages_instead_of_assuming_publication_order() {
+        for (channel, expected) in [
+            (Channel::Stable, "v2.0.0"),
+            (Channel::Beta, "v3.0.0-beta.1"),
+        ] {
+            let (base, join) = spawn_server(2, |path| {
+                if path.ends_with("page=1") {
+                    json_reply(
+                        "200 OK",
+                        serde_json::json!(vec![fixture("v1.0.0-beta.1"); 20]),
+                    )
+                } else {
+                    assert!(path.ends_with("page=2"));
+                    json_reply(
+                        "200 OK",
+                        serde_json::json!([fixture("v2.0.0"), fixture("v3.0.0-beta.1")]),
+                    )
+                }
+            });
+            assert_eq!(
+                fetch_latest(channel, &base, "backrunner/hokan")
+                    .expect("lookup")
+                    .expect("release")
+                    .tag,
+                expected
+            );
+            join.join().expect("server thread");
+        }
     }
 
     #[test]
     fn missing_archive_asset_is_an_error() {
-        let (base, join) = spawn_server(1, move |_| {
+        let (base, join) = spawn_server(1, |_| {
             json_reply(
                 "200 OK",
-                release_json(
-                    "v0.2.0",
-                    &["SHA256SUMS".to_owned(), "sbom.spdx.json".to_owned()],
-                ),
+                serde_json::json!([release_json("v0.2.0", &["SHA256SUMS".to_owned()])]),
             )
         });
         let error = fetch_latest(Channel::Stable, &base, "backrunner/hokan")
@@ -392,7 +410,7 @@ mod tests {
         draft["draft"] = serde_json::json!(true);
         let draft = serde_json::from_value(draft).expect("draft");
         assert_eq!(
-            select_highest(vec![released, draft])
+            select_highest(vec![released, draft], Channel::Beta)
                 .expect("published release")
                 .tag_name,
             "v1.0.0-beta.1"

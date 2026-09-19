@@ -92,12 +92,7 @@ mod tests {
         assert!(scheduler.due(&config, now + Duration::from_secs(60)));
         scheduler.tick(&config, now + Duration::from_secs(60));
         assert!(!scheduler.due(&config, now + Duration::from_secs(61)));
-        config.channel = if config.channel == "beta" {
-            "stable"
-        } else {
-            "beta"
-        }
-        .into();
+        config.interval_secs = 600;
         assert!(scheduler.due(&config, now + Duration::from_secs(61)));
         scheduler.tick(&config, now + Duration::from_secs(61));
         config.enabled = false;

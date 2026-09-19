@@ -6,7 +6,9 @@
 
 - stable：`v<version>`（如 `v0.2.0`）→ GitHub 正式 release，stable 渠道用户看到。
 - beta：`v<version>-beta.<n>`（如 `v0.2.0-beta.1`）→ workflow 自动标记 Pre-release，
-  只有 `channel = "beta"` 的用户看到；beta 渠道取 prerelease 与 stable 的较新者。
+  beta 二进制默认仅检查 beta，stable 二进制默认仅检查 stable。
+- `upgrade --channel stable|beta` 仅指定本次目标；跨渠道仅允许向上升级，成功后默认
+  跟随新二进制渠道。旧 `[update].channel` 兼容读取但忽略；无发布版本应正常提示。
 - 两种 tag 都必须与 `Cargo.toml` 的 `version` 完全一致（含 `-beta.N` 后缀），
   workflow 会拒绝版本不一致。
 - 首个 prerelease beta 用于公开真实环境验证；待认证组合必须继续明确标记，不能写成

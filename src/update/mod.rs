@@ -39,6 +39,25 @@ pub enum Channel {
 }
 
 impl Channel {
+    /// The running binary owns the default channel, including after replacement.
+    #[must_use]
+    pub const fn current() -> Self {
+        if env!("CARGO_PKG_VERSION_PRE").is_empty() {
+            Self::Stable
+        } else {
+            Self::Beta
+        }
+    }
+
+    #[must_use]
+    pub fn for_version(version: &Version) -> Self {
+        if version.pre.is_empty() {
+            Self::Stable
+        } else {
+            Self::Beta
+        }
+    }
+
     pub fn parse(value: &str) -> Result<Self, UpdateError> {
         match value {
             "stable" => Ok(Self::Stable),
@@ -130,9 +149,21 @@ pub fn read_cached_check(state_dir: &std::path::Path) -> Option<CachedCheck> {
 
 pub(crate) use install::{directory_writable, managed_install};
 
+/// Build metadata does not change semver precedence. `force` permits an
+/// equal-version reinstall, never a downgrade, including across channels.
+pub(crate) fn should_install(current: &Version, target: &Version, force: bool) -> bool {
+    match target.cmp_precedence(current) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Equal => force,
+        std::cmp::Ordering::Less => false,
+    }
+}
+
 /// What an upgrade run did or found.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UpgradeOutcome {
+    /// The repository exists but this channel has no published release yet.
+    NoRelease { channel: Channel },
     /// A background attempt is already running or its retry interval has not elapsed.
     Deferred,
     /// Nothing newer exists (or a fresh cache already said so).
@@ -216,7 +247,7 @@ pub fn run_upgrade(
             cache::CheckCache::read_fresh(&cache_path, Duration::from_secs(options.interval_secs))
         && entry.channel == options.channel.as_str()
         && let Ok(latest_known) = Version::parse(&entry.latest_known)
-        && latest_known <= current
+        && !should_install(&current, &latest_known, false)
     {
         return Ok(UpgradeOutcome::AlreadyCurrent { version: current });
     }
@@ -232,13 +263,17 @@ pub fn run_upgrade(
         None
     };
 
-    let release = check_release(options.channel, paths)?;
+    let Some(release) = check_release(options.channel, paths)? else {
+        return Ok(UpgradeOutcome::NoRelease {
+            channel: options.channel,
+        });
+    };
 
     let latest = release.version.clone();
     if options.check_only {
         return Ok(UpgradeOutcome::Checked { current, latest });
     }
-    if latest < current || (latest == current && !options.force) {
+    if !should_install(&current, &latest, options.force) {
         return Ok(UpgradeOutcome::AlreadyCurrent { version: current });
     }
     install::download_and_install(&release, paths, &current)
@@ -247,8 +282,10 @@ pub fn run_upgrade(
 pub(crate) fn check_release(
     channel: Channel,
     paths: &UpgradePaths,
-) -> Result<ReleaseInfo, UpdateError> {
-    let release = fetch_latest(channel, &paths.api_base, &paths.repo)?;
+) -> Result<Option<ReleaseInfo>, UpdateError> {
+    let Some(release) = fetch_latest(channel, &paths.api_base, &paths.repo)? else {
+        return Ok(None);
+    };
     // A cache write failure must not prevent a manual upgrade.
     let _ = cache::CheckCache {
         last_check_epoch: cache::now_epoch_secs(),
@@ -256,7 +293,7 @@ pub(crate) fn check_release(
         latest_known: release.version.to_string(),
     }
     .write(&paths.state_dir.join("update-check.json"));
-    Ok(release)
+    Ok(Some(release))
 }
 
 pub(crate) use install::download_and_install as install_checked_release;
@@ -302,13 +339,70 @@ mod tests {
     }
 
     #[test]
+    fn cross_channel_upgrades_follow_semver_and_the_installed_version_channel() {
+        for (from, to, newer, channel) in [
+            ("0.1.0-beta.9", "0.1.0-beta.13", true, Channel::Beta),
+            ("0.1.0-beta.13", "0.1.0", true, Channel::Stable),
+            ("0.1.0", "0.2.0-beta.1", true, Channel::Beta),
+            ("0.1.0", "0.1.0-beta.14", false, Channel::Beta),
+            ("0.2.0-beta.1", "0.1.0", false, Channel::Stable),
+        ] {
+            let current = Version::parse(from).expect("from");
+            let target = Version::parse(to).expect("to");
+            assert_eq!(
+                should_install(&current, &target, false),
+                newer,
+                "{from} -> {to}"
+            );
+            assert_eq!(
+                should_install(&current, &target, true),
+                newer,
+                "force {from} -> {to}"
+            );
+            assert_eq!(Channel::for_version(&target), channel);
+        }
+        let current = Version::parse("1.0.0+one").expect("current");
+        let target = Version::parse("1.0.0+two").expect("target");
+        assert!(!should_install(&current, &target, false));
+        assert!(should_install(&current, &target, true));
+        assert_eq!(
+            Channel::current(),
+            Channel::for_version(&Version::parse(env!("CARGO_PKG_VERSION")).expect("build"))
+        );
+    }
+
+    #[test]
+    fn empty_channel_is_a_successful_noop_and_background_retries_are_throttled() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let (base, join) = spawn_server(1, |_| json_reply("200 OK", serde_json::json!([])));
+        let paths = paths(root.path(), &base);
+        let mut options = options();
+        options.auto = true;
+        assert_eq!(
+            run_upgrade(&options, &paths).expect("empty channel"),
+            UpgradeOutcome::NoRelease {
+                channel: Channel::Stable
+            }
+        );
+        assert_eq!(
+            run_upgrade(&options, &paths).expect("throttled"),
+            UpgradeOutcome::Deferred
+        );
+        assert!(!paths.current_exe.exists());
+        join.join().expect("server");
+    }
+
+    #[test]
     fn check_only_reports_latest_without_installing() {
         let root = tempfile::tempdir().expect("tempdir");
         let (base, join) = spawn_server(1, move |path| {
-            assert!(path.starts_with("/repos/backrunner/hokan/releases/latest"));
+            assert!(path.starts_with("/repos/backrunner/hokan/releases?"));
             json_reply(
                 "200 OK",
-                release_json("v9.9.9", &[archive_asset("9.9.9"), "SHA256SUMS".to_owned()]),
+                serde_json::json!([release_json(
+                    "v9.9.9",
+                    &[archive_asset("9.9.9"), "SHA256SUMS".to_owned()]
+                )]),
             )
         });
         let mut opts = options();
@@ -336,7 +430,10 @@ mod tests {
         let (base, join) = spawn_server(1, move |_| {
             json_reply(
                 "200 OK",
-                release_json("v0.0.1", &[archive_asset("0.0.1"), "SHA256SUMS".to_owned()]),
+                serde_json::json!([release_json(
+                    "v0.0.1",
+                    &[archive_asset("0.0.1"), "SHA256SUMS".to_owned()]
+                )]),
             )
         });
         let outcome = run_upgrade(&options(), &paths(root.path(), &base)).expect("run");

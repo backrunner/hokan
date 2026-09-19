@@ -98,7 +98,7 @@ enum Command {
         /// Only report what is available; never download or install.
         #[arg(long, conflicts_with = "force")]
         check: bool,
-        /// Track this release channel (stable or beta); persisted to the config.
+        /// Target stable or beta for this upgrade; defaults to the installed build's channel.
         #[arg(long)]
         channel: Option<String>,
         /// Reinstall even when the latest version equals the current one.

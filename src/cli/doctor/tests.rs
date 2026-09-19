@@ -377,14 +377,17 @@ fn update_section_reports_config_cache_and_exe_writability() {
     fs::create_dir_all(&paths.state_directory).expect("state dir");
     fs::write(
         paths.state_directory.join("update-check.json"),
-        "{\"last_check_epoch\":1,\"channel\":\"stable\",\"latest_known\":\"0.2.0\"}",
+        format!(
+            "{{\"last_check_epoch\":1,\"channel\":\"{}\",\"latest_known\":\"0.2.0\"}}",
+            crate::update::Channel::current()
+        ),
     )
     .expect("seed update cache");
     let exe = directory.path().join("bin/hokan");
     fs::create_dir_all(exe.parent().expect("exe parent")).expect("bin dir");
 
     let mut stable_config = Config::default();
-    stable_config.update.channel = "stable".into();
+    stable_config.update.channel = Some("stable".into());
     let details = inspect_update(Some(&stable_config), Some(&paths), &exe);
     assert_eq!(
         details.check.level,
@@ -392,9 +395,17 @@ fn update_section_reports_config_cache_and_exe_writability() {
         "{}",
         details.check.detail
     );
-    assert!(details.check.detail.contains("channel stable"));
+    assert!(
+        details
+            .check
+            .detail
+            .contains(&format!("channel {}", crate::update::Channel::current()))
+    );
     assert!(details.check.detail.contains("every 1800s"));
-    assert_eq!(details.channel.as_deref(), Some("stable"));
+    assert_eq!(
+        details.channel.as_deref(),
+        Some(crate::update::Channel::current().as_str())
+    );
     assert_eq!(details.interval_secs, Some(1_800));
     assert_eq!(details.latest_known.as_deref(), Some("0.2.0"));
     assert_eq!(details.exe.level, CheckLevel::Ok, "{}", details.exe.detail);
@@ -402,12 +413,34 @@ fn update_section_reports_config_cache_and_exe_writability() {
     // Disabled configs say so, and still report channel/interval/cache.
     let mut config = Config::default();
     config.update.enabled = false;
-    config.update.channel = "beta".into();
+    config.update.channel = Some("beta".into());
     let details = inspect_update(Some(&config), Some(&paths), &exe);
     assert_eq!(details.check.level, CheckLevel::NotApplicable);
     assert!(details.check.detail.contains("disabled"));
-    assert_eq!(details.channel.as_deref(), Some("beta"));
+    assert_eq!(
+        details.channel.as_deref(),
+        Some(crate::update::Channel::current().as_str())
+    );
     assert_eq!(details.latest_known.as_deref(), Some("0.2.0"));
+
+    // A one-time check of another channel must not appear as our default's latest.
+    let other_channel = if crate::update::Channel::current() == crate::update::Channel::Beta {
+        "stable"
+    } else {
+        "beta"
+    };
+    fs::write(
+        paths.state_directory.join("update-check.json"),
+        format!(
+            "{{\"last_check_epoch\":1,\"channel\":\"{other_channel}\",\"latest_known\":\"0.2.0\"}}"
+        ),
+    )
+    .expect("other channel cache");
+    assert!(
+        inspect_update(Some(&config), Some(&paths), &exe)
+            .latest_known
+            .is_none()
+    );
 
     // No config at all is an error with no optional fields.
     let details = inspect_update(None, None, &exe);

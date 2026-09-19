@@ -138,11 +138,6 @@ impl Config {
                     .into(),
             ));
         }
-        if !matches!(self.update.channel.as_str(), "stable" | "beta") {
-            return Err(crate::Error::Config(
-                "update.channel must be stable or beta".into(),
-            ));
-        }
         if !(60..=86_400).contains(&self.update.interval_secs) {
             return Err(crate::Error::Config(
                 "update.interval_secs must be 60..=86400".into(),
@@ -550,7 +545,10 @@ impl Default for AiConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct UpdateConfig {
     pub enabled: bool,
-    pub channel: String,
+    /// Legacy setting, accepted but ignored. Updates follow the installed build;
+    /// `upgrade --channel` selects another channel for one invocation only.
+    #[serde(skip_serializing)]
+    pub channel: Option<String>,
     pub interval_secs: u64,
 }
 
@@ -558,12 +556,7 @@ impl Default for UpdateConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            channel: if env!("CARGO_PKG_VERSION_PRE").starts_with("beta.") {
-                "beta"
-            } else {
-                "stable"
-            }
-            .into(),
+            channel: None,
             interval_secs: 1_800,
         }
     }
@@ -821,12 +814,7 @@ mod tests {
     fn update_config_defaults_to_the_build_channel() {
         let update = UpdateConfig::default();
         assert!(update.enabled);
-        let expected = if env!("CARGO_PKG_VERSION_PRE").starts_with("beta.") {
-            "beta"
-        } else {
-            "stable"
-        };
-        assert_eq!(update.channel, expected);
+        assert_eq!(update.channel, None);
         assert_eq!(update.interval_secs, 1_800);
         assert_eq!(Config::default().update, update);
     }
@@ -834,10 +822,9 @@ mod tests {
     #[test]
     fn update_config_serde_roundtrip() {
         let parsed: UpdateConfig =
-            toml::from_str("enabled = false\nchannel = \"beta\"\ninterval_secs = 600\n")
-                .expect("parse update config");
+            toml::from_str("enabled = false\ninterval_secs = 600\n").expect("parse update config");
         assert!(!parsed.enabled);
-        assert_eq!(parsed.channel, "beta");
+        assert_eq!(parsed.channel, None);
         assert_eq!(parsed.interval_secs, 600);
 
         let rendered = toml::to_string(&parsed).expect("serialize update config");
@@ -846,18 +833,19 @@ mod tests {
     }
 
     #[test]
-    fn explicit_stable_channel_survives_beta_defaults() {
+    fn legacy_channel_is_accepted_but_not_written_back() {
         let config: Config = toml::from_str("[update]\nchannel = \"stable\"\n").expect("config");
-        assert_eq!(config.update.channel, "stable");
+        assert_eq!(config.update.channel.as_deref(), Some("stable"));
+        assert!(
+            !toml::to_string(&config)
+                .expect("serialize")
+                .contains("channel")
+        );
     }
 
     #[test]
-    fn update_config_rejects_invalid_channel_and_interval() {
+    fn update_config_rejects_invalid_interval() {
         let mut config = Config::default();
-        config.update.channel = "nightly".into();
-        assert!(config.validate().is_err());
-
-        config.update.channel = "beta".into();
         config.update.interval_secs = 59;
         assert!(config.validate().is_err());
         config.update.interval_secs = 60;
