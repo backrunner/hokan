@@ -529,6 +529,20 @@ impl TerminalSession {
         );
     }
 
+    fn wait_for_screen_absent(&mut self, needle: &str) {
+        let deadline = Instant::now() + TIMEOUT;
+        while Instant::now() < deadline {
+            if !self.screen_text().contains(needle) {
+                return;
+            }
+            self.receive_once(READ_POLL);
+        }
+        panic!(
+            "screen still contained {needle:?}; screen=\n{}",
+            self.screen_text()
+        );
+    }
+
     fn wait_for_overlay_candidate(&mut self, needle: &str) {
         let deadline = Instant::now() + TIMEOUT;
         while Instant::now() < deadline {
@@ -1069,12 +1083,15 @@ fn real_session_keeps_overlay_and_terminal_lifecycle_stable() {
     // appears while the typed text is still a proper prefix.
     terminal.write(b"sh ./alternate.s");
     terminal.wait_for_screen(TAG_FILE);
+    terminal.wait_for_clean_overlay("HK> sh ./alternate.s");
     terminal.write(b"\x1b");
-    terminal.settle(Duration::from_millis(80));
+    // Wait for the standalone Escape to be consumed, even on a busy runner.
+    // A fixed sleep can merge it with `h` into zsh's Alt-h/run-help binding.
+    terminal.wait_for_screen_absent("Esc 关闭");
     terminal.write(b"h");
-    terminal.settle(Duration::from_millis(80));
-    terminal.write(b"\r");
+    terminal.wait_for_screen("HK> sh ./alternate.sh");
     let alternate_start = terminal.transcript.len();
+    terminal.write(b"\r");
     terminal.wait_for_bytes_since(alternate_start, b"ALT_READY");
     terminal.write(b"ok\r");
     terminal.wait_for_bytes_since(alternate_start, b"ALT_KEY=ok");

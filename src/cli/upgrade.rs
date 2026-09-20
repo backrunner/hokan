@@ -429,6 +429,8 @@ mod tests {
         } else {
             "9.9.9"
         };
+        // Exercise freshly written executables repeatedly alongside the other
+        // subprocess tests; Linux can transiently reject exec with ETXTBSY.
         for auto in [false, true].repeat(16) {
             let root = tempfile::tempdir().expect("tempdir");
             let paths = test_paths(root.path());
