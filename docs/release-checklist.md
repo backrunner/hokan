@@ -66,6 +66,20 @@ overlay、跨 control sequence 写入、AI 隐式联网或 secret 泄漏都会�
 
 ## Artifact 验证
 
+发布提交或修改 `Cargo.toml` 版本号不会触发 Release。确认候选提交的 GitHub Actions
+CI 全部通过后，必须显式创建并推送对应 tag：
+
+```bash
+version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+git tag -a "v$version" -m "Release v$version"
+git push origin "v$version"
+gh run list --workflow release.yml --branch "v$version"
+```
+
+继续跟踪该 Release run 到成功，并执行下方资产及升级验证；只看到 tag 或 workflow
+已启动不代表发布完成。失败时保留原 tag，修复工作流后可用 `workflow_dispatch` 的
+`tag` 参数重建同一份源码；源码修复应在创建 tag 前完成。
+
 1. tag 必须为 `v<package-version>`，workflow 会拒绝版本不一致。
 2. 在干净机器校验 `SHA256SUMS`，解压对应 target 归档。
 3. 运行 `bin/hokan --version`、`doctor --json`、`spec validate`。

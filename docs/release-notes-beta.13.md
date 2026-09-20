@@ -24,6 +24,15 @@ list steadier while providers and shell redraws catch up.
   coverage is missing. Remote sessions keep font setup on the client terminal.
 - The TLS dependencies are updated to rustls 0.23.45 and rustls-webpki 0.103.15,
   addressing RUSTSEC-2026-0285.
+- Selecting a `cd` suggestion with Enter now changes directory immediately;
+  Tab continues to insert it. This behavior is configurable.
+- Terminal titles follow the foreground program and return to the shell title
+  when it exits, while preserving titles set by applications themselves.
+- Update checks continue during long-running sessions. Manual and automatic
+  updates follow the installed binary's channel, ignore legacy channel pins,
+  and leave the current installation unchanged when a channel has no releases.
+- Installation and upgrades validate writable directories, reject unsafe local
+  files, serialize replacement, and preserve a backup of the previous binary.
 
 In a local macOS release-mode benchmark with eight synthetic sources and 64
 candidates per source, median completion pipeline time decreased from 2.73 ms
