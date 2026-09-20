@@ -200,8 +200,18 @@ fn binary_version(path: &Path) -> Result<Version, UpdateError> {
     let program = path.to_str().ok_or(UpdateError::InvalidResponse)?;
     let output =
         crate::platform::run_bounded(program, ["--version"], SMOKE_TIMEOUT, SMOKE_MAX_OUTPUT)
-            .map_err(|_| UpdateError::SmokeTest)?;
+            .map_err(|_error| {
+                #[cfg(test)]
+                eprintln!("version probe for {program} failed: {_error}");
+                UpdateError::SmokeTest
+            })?;
     if !output.status.success() {
+        #[cfg(test)]
+        eprintln!(
+            "version probe for {program} exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
         return Err(UpdateError::SmokeTest);
     }
     let text = std::str::from_utf8(&output.stdout).map_err(|_| UpdateError::SmokeTest)?;
