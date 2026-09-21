@@ -1,8 +1,8 @@
 use std::{io::Write, time::Instant};
 
 use super::super::{
-    AnchorConfidence, CellPos, CursorRestore, FrameTicket, RenderReadiness, SurfaceGeometry,
-    SyncOutputCapability, SyncOwnership,
+    AnchorConfidence, CellPos, CursorRestore, FrameTicket, RenderReadiness, SanitizedText,
+    SurfaceGeometry, SyncOutputCapability, SyncOwnership,
 };
 use super::{OutputError, actor::OutputActor, actor::segment_may_scroll};
 
@@ -195,19 +195,23 @@ impl<W: Write> OutputActor<W> {
 
     pub(super) fn prepare_surface_geometry(
         &mut self,
+        status: Option<&SanitizedText>,
     ) -> Result<Option<SurfaceGeometry>, OutputError> {
+        let width = self.size.cols.saturating_sub(1).min(self.max_overlay_width);
+        let height = status.map_or(self.renderer.height(), |status| {
+            self.renderer.status_height(width, status)
+        });
         if self.foreground
             || self.model.alternate_screen()
             || self.model.confidence() == AnchorConfidence::Unknown
             || !self.scanner.is_safe()
             || self.size.cols < 2
-            || self.size.rows <= self.renderer.height()
+            || self.size.rows <= height
         {
             return Ok(None);
         }
 
         let cursor = self.model.cursor();
-        let height = self.renderer.height();
         let required_bottom = cursor.row.saturating_add(1).saturating_add(height);
         let scroll = required_bottom.saturating_sub(self.size.rows);
         if scroll > 0 {

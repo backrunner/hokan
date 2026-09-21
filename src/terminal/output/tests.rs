@@ -93,7 +93,7 @@ fn prepare_surface_scroll_keeps_the_actor_model_consistent() {
         .snapshot_region(ratatui::layout::Rect::new(0, 22, 80, 1));
 
     let geometry = actor
-        .prepare_surface_geometry()
+        .prepare_surface_geometry(None)
         .expect("geometry should prepare")
         .expect("overlay fits after scrolling");
     assert_eq!(geometry.rect, ratatui::layout::Rect::new(0, 21, 79, 3));
@@ -126,6 +126,37 @@ fn prepare_surface_scroll_keeps_the_actor_model_consistent() {
             .windows(b"\x1b[?2026h".len())
             .any(|window| window == b"\x1b[?2026h")
     );
+}
+
+#[test]
+fn compact_notice_reserves_only_its_own_height_before_scrolling() {
+    let size = TerminalSize::new(24, 80).expect("size");
+    let mut actor = OutputActor::new(Vec::new(), token(), size, 8);
+    actor
+        .model
+        .process(b"\x1b[21;1HHK> cd private/")
+        .expect("prompt");
+    actor.model.establish_anchor();
+    let cursor = actor.model.cursor();
+    let status = SanitizedText::new("无法读取目录：权限不足");
+    let geometry = actor
+        .prepare_surface_geometry(Some(&status))
+        .expect("geometry")
+        .expect("fits");
+    assert_eq!(geometry.rect.height, 3);
+    assert_eq!(geometry.rect.y, 21);
+    assert_eq!(
+        actor.model.cursor(),
+        cursor,
+        "a notice that fits must not scroll the prompt"
+    );
+
+    let recovered = actor
+        .prepare_surface_geometry(None)
+        .expect("geometry")
+        .expect("fits");
+    assert_eq!(recovered.rect.height, 8, "candidate page height recovers");
+    assert_eq!(actor.renderer.height(), 8);
 }
 
 #[test]
@@ -326,7 +357,7 @@ fn prepare_surface_scroll_is_wrapped_in_a_transaction_when_2026_is_available() {
     actor.capability = SyncOutputCapability::AvailableIdle;
 
     let geometry = actor
-        .prepare_surface_geometry()
+        .prepare_surface_geometry(None)
         .expect("geometry should prepare")
         .expect("overlay fits after scrolling");
     assert_eq!(geometry.rect, ratatui::layout::Rect::new(0, 21, 79, 3));

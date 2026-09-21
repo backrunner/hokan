@@ -6,6 +6,7 @@ use ratatui::{
     layout::{Position, Rect},
 };
 use thiserror::Error;
+use unicode_width::UnicodeWidthStr;
 
 use super::{FrameTicket, SurfaceKey, SyncOutputCapability, TerminalModel, model::CursorRestore};
 
@@ -342,8 +343,8 @@ impl OverlayCompositor {
 }
 
 /// Default-styled blank cells for the region the footprint rect vacated:
-/// every footprint cell outside the new rect that still holds visible
-/// content. Cells already blank need no write, and the blank target is always
+/// every footprint column outside the new rect that still holds visible
+/// content, including wide-glyph continuation columns. The blank target is always
 /// `Cell::default()` so a vacated selected-row background cannot survive as a
 /// painted block. When the terminal model is available, a cell is only
 /// blanked while the screen still shows the footprint glyph there — cells the
@@ -356,36 +357,10 @@ fn vacated_blanks(
     old_buffer: &Buffer,
     model: Option<&TerminalModel>,
 ) -> Vec<(u16, u16, Cell)> {
-    let mut blanks = Vec::new();
-    for y in old.y..old.bottom() {
-        for x in old.x..old.right() {
-            if new.contains(Position { x, y }) {
-                continue;
-            }
-            let cell = &old_buffer[(x, y)];
-            if *cell == Cell::default() {
-                continue;
-            }
-            if let Some(model) = model {
-                let on_screen = model.cell_contents(y, x).unwrap_or_default();
-                let on_screen = if on_screen.is_empty() {
-                    " "
-                } else {
-                    on_screen.as_str()
-                };
-                let symbol = if cell.symbol().is_empty() {
-                    " "
-                } else {
-                    cell.symbol()
-                };
-                if on_screen != symbol {
-                    continue;
-                }
-            }
-            blanks.push((x, y, Cell::default()));
-        }
-    }
-    blanks
+    footprint_blanks(old, old_buffer, model)
+        .into_iter()
+        .filter(|(x, y, _)| !new.contains(Position { x: *x, y: *y }))
+        .collect()
 }
 
 fn footprint_blanks(
@@ -395,8 +370,17 @@ fn footprint_blanks(
 ) -> Vec<(u16, u16, Cell)> {
     let mut blanks = Vec::new();
     for y in rect.y..rect.bottom() {
-        for x in rect.x..rect.right() {
+        let mut next_x = rect.x;
+        while next_x < rect.right() {
+            let x = next_x;
             let cell = &footprint[(x, y)];
+            let width = match cell.diff_option {
+                CellDiffOption::ForcedWidth(width) => usize::from(width.get()),
+                _ => UnicodeWidthStr::width(cell.symbol()),
+            }
+            .max(1)
+            .min(usize::from(rect.right() - x)) as u16;
+            next_x += width;
             if *cell == Cell::default() {
                 continue;
             }
@@ -416,7 +400,15 @@ fn footprint_blanks(
                     continue;
                 }
             }
-            blanks.push((x, y, Cell::default()));
+            // Ratatui resets the backing cells after a wide glyph to
+            // Cell::default(), but the terminal paints the glyph's style
+            // across its entire width. Explicitly erase all those columns:
+            // erasing only the head can leave background stripes. Ownership
+            // is checked at the head so a replacement shell glyph keeps its
+            // continuation cells too.
+            for col in x..next_x {
+                blanks.push((col, y, Cell::default()));
+            }
         }
     }
     blanks

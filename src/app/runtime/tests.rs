@@ -1302,7 +1302,7 @@ fn info_level_diagnostics_stay_out_of_the_status_line() {
     handle_provider_result(warning, &mut state, &output).expect("provider result");
     assert_eq!(
         state.status.as_deref(),
-        Some("HK-CMP-002 provider x failed internally")
+        Some("provider x failed internally (HK-CMP-002)")
     );
 }
 

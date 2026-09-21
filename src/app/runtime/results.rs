@@ -254,7 +254,7 @@ pub(super) fn handle_provider_result(
         .diagnostics
         .iter()
         .find(|diagnostic| diagnostic.level == crate::completion::DiagnosticLevel::Warning)
-        .map(|diagnostic| format!("{} {}", diagnostic.code, diagnostic.message));
+        .map(|diagnostic| format!("{} ({})", diagnostic.message, diagnostic.code));
     if result.final_batch
         && !result.output.diagnostics.is_empty()
         && let Some(log) = &state.debug_log

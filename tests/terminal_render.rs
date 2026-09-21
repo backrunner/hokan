@@ -2,7 +2,8 @@ use avt::Vt;
 use hokan::terminal::{
     BufferRevision, CellPos, CursorRestore, FrameRevision, FrameTicket, OverlayCompositor,
     OverlayRow, OverlaySurfaceRenderer, OverlayView, RiskLevel, ScreenEpoch, ScreenRevision,
-    SurfaceGeometry, SurfaceKey, SurfaceTheme, SyncOutputCapability, TerminalSize, WidthPolicy,
+    SurfaceGeometry, SurfaceKey, SurfaceTheme, SyncOutputCapability, TerminalModel, TerminalSize,
+    WidthPolicy,
 };
 
 const COLS: u16 = 80;
@@ -193,6 +194,204 @@ fn moved_overlay_blanks_vacated_cells_and_both_models_agree() {
             .contents(),
         "╭"
     );
+    assert_models_match(&vt100, &avt);
+    assert_eq!(vt100.screen().cursor_position(), (3, 4));
+    assert_eq!(avt.cursor(), (4, 3));
+}
+
+#[test]
+fn hidden_chinese_overlay_clears_every_background_cell() {
+    assert_chinese_overlay_cleanup(false, false);
+}
+
+#[test]
+fn moved_chinese_overlay_clears_every_vacated_background_cell() {
+    assert_chinese_overlay_cleanup(true, false);
+}
+
+#[test]
+fn chinese_overlay_cleanup_preserves_shell_replacements() {
+    assert_chinese_overlay_cleanup(false, true);
+}
+
+fn assert_chinese_overlay_cleanup(move_overlay: bool, shell_overwrite: bool) {
+    // Background assertions must remain effective when the test runner sets NO_COLOR.
+    crossterm::style::force_color_output(true);
+    let size = TerminalSize::new(ROWS, COLS).expect("valid size");
+    let geometry =
+        SurfaceGeometry::new_anchored(0, OVERLAY_TOP, size, 4, 60).expect("surface fits terminal");
+    let key = SurfaceKey {
+        screen_epoch: ScreenEpoch::new(1),
+        rect: geometry.rect,
+        theme_revision: 1,
+        width_policy: WidthPolicy::Auto,
+    };
+    let cursor = CursorRestore {
+        position: CellPos::new(3, 4),
+        visible: true,
+        sgr: b"\x1b[0m".to_vec(),
+    };
+    let view = OverlayView::with_rows(
+        vec![
+            OverlayRow::new(1, "HIS", "中文目录", "显示当前目录文件", RiskLevel::Low),
+            OverlayRow::new(2, "HIS", "中文路径", "显示当前目录文件", RiskLevel::Low),
+        ],
+        Some(1),
+    );
+    let renderer = OverlaySurfaceRenderer::new(4, SurfaceTheme::default(), true);
+    let buffer = renderer.render(geometry, &view);
+    let text_row = geometry.rect.y + 1;
+    let text_col = (geometry.rect.x..geometry.rect.right())
+        .find(|col| buffer[(*col, text_row)].symbol() == "中")
+        .expect("Chinese primary text");
+    let mut compositor = OverlayCompositor::default();
+    let mut model = TerminalModel::new(size);
+    let mut vt100 = vt100::Parser::new(ROWS, COLS, 0);
+    let mut background_probe = vt100::Parser::new(ROWS, COLS, 0);
+    let mut avt = Vt::new(COLS as usize, ROWS as usize);
+    let first = compositor
+        .prepare(
+            key,
+            buffer,
+            ticket(1),
+            &cursor,
+            SyncOutputCapability::UnsupportedFallback,
+            Some(&model),
+        )
+        .expect("first frame");
+    let bytes = &first.staged().bytes;
+    model.apply_hokan_frame(bytes);
+    vt100.process(bytes);
+    // vt100 and avt both clear the adjacent cell as a side effect of
+    // overwriting a wide glyph. That can mask an incomplete erase on real
+    // terminals. Replay the same colors with wide glyphs replaced by spaces
+    // to check that cleanup explicitly resets every occupied column.
+    let background_bytes: String = std::str::from_utf8(bytes)
+        .expect("UTF-8 frame")
+        .chars()
+        .map(|ch| {
+            let width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            if width > 1 {
+                " ".repeat(width)
+            } else {
+                ch.to_string()
+            }
+        })
+        .collect();
+    background_probe.process(background_bytes.as_bytes());
+    avt.feed_str(std::str::from_utf8(bytes).expect("UTF-8 frame"));
+    compositor.commit(first).expect("commit first frame");
+
+    if shell_overwrite {
+        // Replace two old CJK glyphs with a different wide glyph and ASCII.
+        // Cleanup must not blank the replacement glyph's second column.
+        let shell = format!("\x1b[{};{}H界OK", text_row + 1, text_col + 1);
+        model.process(shell.as_bytes()).expect("shell output");
+        vt100.process(shell.as_bytes());
+        background_probe.process(shell.as_bytes());
+        avt.feed_str(&shell);
+        compositor.invalidate_diff_base();
+    }
+
+    let moved = SurfaceGeometry::new_anchored(19, OVERLAY_TOP, size, 4, 60)
+        .expect("moved surface fits terminal");
+    let cleanup = if move_overlay {
+        compositor
+            .prepare(
+                SurfaceKey {
+                    rect: moved.rect,
+                    ..key
+                },
+                renderer.render(moved, &view),
+                ticket(2),
+                &cursor,
+                SyncOutputCapability::UnsupportedFallback,
+                Some(&model),
+            )
+            .expect("moved frame")
+    } else {
+        compositor
+            .prepare_hide(
+                ticket(2),
+                &cursor,
+                SyncOutputCapability::UnsupportedFallback,
+                Some(&model),
+            )
+            .expect("hide frame")
+            .expect("painted footprint")
+    };
+    assert_forbidden_sequences_absent(&cleanup.staged().bytes);
+    vt100.process(&cleanup.staged().bytes);
+    background_probe.process(&cleanup.staged().bytes);
+    avt.feed_str(std::str::from_utf8(&cleanup.staged().bytes).expect("UTF-8 frame"));
+    for row in geometry.rect.y..geometry.rect.bottom() {
+        for col in geometry.rect.x..geometry.rect.right() {
+            if move_overlay && moved.rect.contains((col, row).into()) {
+                continue;
+            }
+            if shell_overwrite && row == text_row && (text_col..text_col + 4).contains(&col) {
+                continue;
+            }
+            let cell = vt100.screen().cell(row, col).expect("cell");
+            assert!(
+                cell.contents().trim().is_empty(),
+                "vt100 text at ({row}, {col})"
+            );
+            assert_eq!(
+                cell.bgcolor(),
+                vt100::Color::Default,
+                "vt100 background at ({row}, {col})"
+            );
+            assert_eq!(
+                background_probe
+                    .screen()
+                    .cell(row, col)
+                    .expect("cell")
+                    .bgcolor(),
+                vt100::Color::Default,
+                "cleanup did not explicitly reset background at ({row}, {col})"
+            );
+            let cell = &avt.line(row as usize).cells()[col as usize];
+            assert_eq!(
+                cell.pen().background(),
+                None,
+                "avt background at ({row}, {col})"
+            );
+        }
+    }
+    if shell_overwrite {
+        assert_eq!(
+            vt100
+                .screen()
+                .cell(text_row, text_col)
+                .expect("cell")
+                .contents(),
+            "界"
+        );
+        assert!(
+            vt100
+                .screen()
+                .cell(text_row, text_col + 1)
+                .expect("cell")
+                .is_wide_continuation()
+        );
+        assert_eq!(
+            vt100
+                .screen()
+                .cell(text_row, text_col + 2)
+                .expect("cell")
+                .contents(),
+            "O"
+        );
+        assert_eq!(
+            vt100
+                .screen()
+                .cell(text_row, text_col + 3)
+                .expect("cell")
+                .contents(),
+            "K"
+        );
+    }
     assert_models_match(&vt100, &avt);
     assert_eq!(vt100.screen().cursor_position(), (3, 4));
     assert_eq!(avt.cursor(), (4, 3));

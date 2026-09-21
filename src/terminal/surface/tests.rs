@@ -15,8 +15,11 @@ fn geometry() -> SurfaceGeometry {
 fn row_text(buffer: &Buffer, y: u16) -> String {
     let area = buffer.area();
     let mut text = String::new();
-    for x in area.x..area.x + area.width {
-        text.push_str(buffer[(x, y)].symbol());
+    let mut x = area.x;
+    while x < area.right() {
+        let symbol = buffer[(x, y)].symbol();
+        text.push_str(symbol);
+        x += UnicodeWidthStr::width(symbol).max(1) as u16;
     }
     text
 }
@@ -103,6 +106,71 @@ fn status_replaces_the_hint_footer_and_pagination_marks_the_top_edge() {
     let bottom = row_text(&buffer, 13);
     assert!(bottom.contains("HK-CMP-STALE"), "{bottom}");
     assert!(!bottom.contains("Tab"), "{bottom}");
+}
+
+#[test]
+fn standalone_status_is_a_compact_notice_without_candidate_controls() {
+    for theme in [SurfaceTheme::default(), SurfaceTheme::plain()] {
+        let renderer = OverlaySurfaceRenderer::new(8, theme, true);
+        // Even stale selection/pagination must not make a notice look actionable.
+        let view = OverlayView {
+            status: Some(SanitizedText::new("无法读取目录：权限不足")),
+            selected: Some(1),
+            pagination: Some((1, 20)),
+            ..OverlayView::default()
+        };
+        let height = renderer.status_height(60, view.standalone_status().expect("notice"));
+        assert_eq!(height, 3);
+        let geometry = SurfaceGeometry::new_with_width(
+            10,
+            TerminalSize::new(24, 80).expect("size"),
+            height,
+            60,
+        )
+        .expect("geometry");
+        let buffer = renderer.render(geometry, &view);
+        assert!(row_text(&buffer, 11).contains("无法读取目录：权限不足"));
+        assert!(row_text(&buffer, 12).contains("Esc 关闭"));
+        let text = (10..13).map(|y| row_text(&buffer, y)).collect::<String>();
+        for absent in ["Tab", "Enter", "▶", "1/20"] {
+            assert!(!text.contains(absent), "{text}");
+        }
+    }
+}
+
+#[test]
+fn standalone_status_wraps_long_paths_and_marks_truncation() {
+    let renderer = OverlaySurfaceRenderer::new(8, SurfaceTheme::plain(), false);
+    let status = SanitizedText::new(&format!("权限不足 · /{}", "目录🙂/".repeat(100)));
+    for width in [12, 25, 60] {
+        let height = renderer.status_height(width, &status);
+        assert_eq!(height, 5);
+        let geometry = SurfaceGeometry::new_with_width(
+            10,
+            TerminalSize::new(24, 80).expect("size"),
+            height,
+            width,
+        )
+        .expect("geometry");
+        let view = OverlayView {
+            status: Some(status.clone()),
+            ..OverlayView::default()
+        };
+        let buffer = renderer.render(geometry, &view);
+        assert!(row_text(&buffer, 11).contains("权限不足"));
+        assert!(row_text(&buffer, 13).contains('…'));
+        for y in 11..14 {
+            assert_eq!(buffer[(0, y)].symbol(), "│");
+            assert_eq!(buffer[(width - 1, y)].symbol(), "│");
+        }
+    }
+    let lines = layout::status_lines("e\u{301}👩‍💻中文e\u{301}", 4, 2);
+    assert_eq!(lines, ["e\u{301}👩‍💻", "中…"]);
+    assert!(
+        lines
+            .iter()
+            .all(|line| UnicodeWidthStr::width(line.as_str()) <= 4)
+    );
 }
 
 #[test]

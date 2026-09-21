@@ -129,7 +129,8 @@ impl OverlayRow {
 pub struct OverlayView {
     pub rows: Vec<OverlayRow>,
     pub selected: Option<u64>,
-    /// Status text embedded in the bottom border instead of the key hints.
+    /// Status text embedded in the bottom border when candidates exist, or
+    /// shown as a compact notice in the body when there are no candidates.
     pub status: Option<SanitizedText>,
     /// `(position, total)` pagination embedded in the top border.
     pub pagination: Option<(usize, usize)>,
@@ -138,6 +139,11 @@ pub struct OverlayView {
 }
 
 impl OverlayView {
+    #[must_use]
+    pub fn standalone_status(&self) -> Option<&SanitizedText> {
+        self.status.as_ref().filter(|_| self.rows.is_empty())
+    }
+
     #[must_use]
     pub fn with_rows(rows: Vec<OverlayRow>, selected: Option<u64>) -> Self {
         Self {

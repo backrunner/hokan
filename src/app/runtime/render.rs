@@ -109,20 +109,6 @@ pub(super) fn render_current(state: &mut RuntimeState, output: &OutputHandle) ->
     {
         return Ok(());
     }
-    let Some(geometry) = output.prepare_surface().map_err(output_error)? else {
-        state.repaint_pending = true;
-        return Ok(());
-    };
-    state.frame_revision = state
-        .frame_revision
-        .checked_next()
-        .ok_or_else(|| crate::Error::Runtime("frame revision exhausted".into()))?;
-    let ticket = FrameTicket {
-        buffer_revision: state.buffer.revision,
-        frame_revision: state.frame_revision,
-        screen_revision: output_state.screen_revision,
-        screen_epoch: output_state.screen_epoch,
-    };
     let view = if let Some(confirm) = &state.pending_confirm {
         // Danger confirmation: a single synthetic EXEC row with the full final
         // command and the joined risk reasons; the bottom border carries the
@@ -178,8 +164,8 @@ pub(super) fn render_current(state: &mut RuntimeState, output: &OutputHandle) ->
                 .collect(),
             state.selected.map(|id| id.0),
         );
-        // Pagination is embedded in the top border; status replaces the key hints
-        // in the bottom border.
+        // With candidates, status replaces the footer hints. Without them,
+        // the surface shows only a compact notice and a dismissal hint.
         view.pagination = (state.candidates.len() > state.page_size)
             .then_some((selected_index.saturating_add(1), state.candidates.len()));
         view.status = state.status.as_deref().map(SanitizedText::new);
@@ -190,6 +176,20 @@ pub(super) fn render_current(state: &mut RuntimeState, output: &OutputHandle) ->
             .unwrap_or_default();
         view.highlight = (!typed.is_empty()).then(|| SanitizedText::new(typed));
         view
+    };
+    let Some(geometry) = output.prepare_surface_for(&view).map_err(output_error)? else {
+        state.repaint_pending = true;
+        return Ok(());
+    };
+    state.frame_revision = state
+        .frame_revision
+        .checked_next()
+        .ok_or_else(|| crate::Error::Runtime("frame revision exhausted".into()))?;
+    let ticket = FrameTicket {
+        buffer_revision: state.buffer.revision,
+        frame_revision: state.frame_revision,
+        screen_revision: output_state.screen_revision,
+        screen_epoch: output_state.screen_epoch,
     };
     let request = FrameRequest {
         ticket,

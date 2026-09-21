@@ -1,4 +1,5 @@
 use ratatui::layout::{Rect, Size};
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::super::TerminalSize;
@@ -83,6 +84,38 @@ pub(super) const MIN_DESC_VISIBLE: usize = 8;
 pub(super) const PAGINATION_PAD: usize = 3;
 /// Dashes kept between right-aligned edge content and the right corner.
 pub(super) const EDGE_TRAIL: usize = 2;
+
+/// Wrap notices by terminal cell width, including paths without word breaks.
+/// Keep the height bounded and mark any omitted tail explicitly.
+pub(super) fn status_lines(text: &str, width: usize, max_lines: usize) -> Vec<String> {
+    if width == 0 || max_lines == 0 {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    let mut line_width = 0;
+    for grapheme in text.graphemes(true) {
+        let grapheme_width = UnicodeWidthStr::width(grapheme);
+        if line_width + grapheme_width > width {
+            if lines.len() + 1 == max_lines || grapheme_width > width {
+                while line_width + 1 > width {
+                    let last = line.graphemes(true).next_back().expect("nonempty line");
+                    line_width -= UnicodeWidthStr::width(last);
+                    line.truncate(line.len() - last.len());
+                }
+                line.push('…');
+                lines.push(line);
+                return lines;
+            }
+            lines.push(std::mem::take(&mut line));
+            line_width = 0;
+        }
+        line.push_str(grapheme);
+        line_width += grapheme_width;
+    }
+    lines.push(line);
+    lines
+}
 
 /// Display-width truncation: keeps whole characters and appends `…` when the
 /// text does not fit.

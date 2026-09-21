@@ -282,8 +282,8 @@ impl<W: Write> OutputActor<W> {
             ControlCommand::Snapshot(sender) => {
                 let _ = sender.send(self.output_state());
             }
-            ControlCommand::PrepareSurface(sender) => {
-                let geometry = self.prepare_surface_geometry()?;
+            ControlCommand::PrepareSurface { status, sender } => {
+                let geometry = self.prepare_surface_geometry(status.as_ref())?;
                 let _ = sender.send(geometry);
             }
             ControlCommand::InvalidateAnchor => {

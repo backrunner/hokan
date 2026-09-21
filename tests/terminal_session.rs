@@ -1763,6 +1763,85 @@ finally:
 }
 
 #[test]
+fn directory_errors_replace_the_list_with_a_compact_notice_and_recover() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if !command_exists("zsh") {
+        return;
+    }
+    struct RestorePermissions(PathBuf);
+    impl Drop for RestorePermissions {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700));
+        }
+    }
+
+    for sync_status in [0, 2] {
+        let mut terminal = TerminalSession::spawn_with_sync_status(sync_status);
+        let blocked = terminal._work.path().join("blocked");
+        fs::create_dir(&blocked).expect("blocked directory");
+        fs::create_dir(terminal._work.path().join("readable")).expect("readable directory");
+        fs::write(terminal._work.path().join("file"), b"file").expect("file");
+        let _restore = RestorePermissions(blocked.clone());
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000)).expect("deny access");
+        terminal.wait_for_screen("HK> ");
+        terminal.write(b"cd ./");
+        terminal.wait_for_overlay_candidate("readable/");
+
+        let mut failures = vec![("missing", "路径不存在"), ("file", "路径不是目录")];
+        if !nix::unistd::geteuid().is_root() {
+            failures.push(("blocked", "权限不足"));
+        }
+        for (path, cause) in failures {
+            terminal.write(format!("\x15cd ./{path}/").as_bytes());
+            terminal.wait_for_overlay_candidate(cause);
+            terminal.wait_for_clean_overlay(&format!("HK> cd ./{path}/"));
+            let text = terminal.screen_text();
+            let top = terminal.screen_rows_containing("╭")[0];
+            let bottom = terminal.screen_rows_containing("╰")[0];
+            assert!(
+                (3..=5).contains(&(bottom - top + 1)),
+                "notice is too tall:\n{text}"
+            );
+            assert!(text.contains("Esc 关闭"), "{text}");
+            for row in top + 1..bottom {
+                assert!(
+                    !terminal
+                        .screen_line(row)
+                        .trim_matches([' ', '│'])
+                        .is_empty(),
+                    "empty notice row:\n{text}"
+                );
+            }
+            for absent in ["Tab", "Enter", "▶", "readable/", TAG_FILE] {
+                assert!(
+                    !text.contains(absent),
+                    "stale candidate UI {absent}:\n{text}"
+                );
+            }
+
+            // Closing a notice must preserve the command being edited.
+            terminal.write(b"\x1b");
+            terminal.wait_for_screen_absent("╭");
+            assert!(
+                terminal
+                    .screen_text()
+                    .contains(&format!("HK> cd ./{path}/"))
+            );
+            // Editing the path brings normal completion back at its full height.
+            terminal.write(b"\x15cd ./");
+            terminal.wait_for_overlay_candidate("readable/");
+            let top = terminal.screen_rows_containing("╭")[0];
+            let bottom = terminal.screen_rows_containing("╰")[0];
+            assert_eq!(bottom - top + 1, 8);
+            assert!(!terminal.screen_text().contains("无法读取目录"));
+        }
+        terminal.exit_shell();
+        terminal.wait_until_exit();
+    }
+}
+
+#[test]
 fn enter_executes_typed_command_with_one_press_while_overlay_is_open() {
     if !command_exists("zsh") {
         return;

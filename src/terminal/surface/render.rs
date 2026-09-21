@@ -11,7 +11,7 @@ use super::{
     layout::{
         EDGE_TRAIL, GAP, ICON_SECTION, MARKER_WIDTH, MAX_DESCRIPTION_WIDTH, MAX_TAG_WIDTH,
         MIN_DESC_VISIBLE, MIN_PRIMARY_WIDTH, PAGINATION_PAD, RISK_SLOT, SIDE_PAD,
-        common_prefix_len, truncate_to_width,
+        common_prefix_len, status_lines, truncate_to_width,
     },
 };
 
@@ -37,8 +37,20 @@ impl OverlaySurfaceRenderer {
         self.height
     }
 
+    /// Notices use only their wrapped text plus two borders, up to three
+    /// content rows. Candidate lists retain their configured page height.
+    #[must_use]
+    pub fn status_height(&self, width: u16, status: &SanitizedText) -> u16 {
+        let lines = status_lines(
+            status.as_str(),
+            usize::from(width.saturating_sub(4)),
+            usize::from(self.height.saturating_sub(2).min(3)),
+        );
+        (lines.len() as u16 + 2).min(self.height)
+    }
+
     pub fn render(&self, geometry: SurfaceGeometry, view: &OverlayView) -> Buffer {
-        debug_assert_eq!(geometry.rect.height, self.height);
+        debug_assert!(geometry.rect.height <= self.height);
         let mut buffer = Buffer::empty(geometry.rect);
         let width = geometry.rect.width as usize;
         if geometry.rect.height < 2 || width < 3 {
@@ -48,6 +60,11 @@ impl OverlaySurfaceRenderer {
         let top_y = geometry.rect.y;
         let bottom_y = geometry.rect.y + geometry.rect.height - 1;
         let x = geometry.rect.x;
+
+        if let Some(status) = view.standalone_status() {
+            self.render_status(&mut buffer, status);
+            return buffer;
+        }
 
         let pagination = view
             .pagination
@@ -101,6 +118,40 @@ impl OverlaySurfaceRenderer {
             buffer.set_stringn(x + width as u16 - 1, y, "│", 1, self.theme.border);
         }
         buffer
+    }
+
+    fn render_status(&self, buffer: &mut Buffer, status: &SanitizedText) {
+        let rect = *buffer.area();
+        let inner = usize::from(rect.width - 2);
+        self.render_edge(buffer, rect.y, "╭", "╮", &[], 0);
+        let lines = status_lines(
+            status.as_str(),
+            inner.saturating_sub(2),
+            usize::from(rect.height.saturating_sub(2)),
+        );
+        for (index, line) in lines.iter().enumerate() {
+            let y = rect.y + 1 + index as u16;
+            buffer.set_style(Rect::new(rect.x + 1, y, inner as u16, 1), self.theme.normal);
+            buffer.set_stringn(rect.x, y, "│", 1, self.theme.border);
+            buffer.set_stringn(rect.right() - 1, y, "│", 1, self.theme.border);
+            buffer.set_stringn(
+                rect.x + 2,
+                y,
+                line,
+                inner.saturating_sub(2),
+                self.theme.status,
+            );
+        }
+        let hint = truncate_to_width(" Esc 关闭 ", inner.saturating_sub(EDGE_TRAIL));
+        let pad = inner.saturating_sub(UnicodeWidthStr::width(hint.as_str()) + EDGE_TRAIL);
+        self.render_edge(
+            buffer,
+            rect.bottom() - 1,
+            "╰",
+            "╯",
+            &[(hint.as_str(), self.theme.hint_text)],
+            pad,
+        );
     }
 
     fn render_row(

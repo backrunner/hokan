@@ -78,7 +78,7 @@ impl CandidateProvider for FilesystemProvider {
                         provider: self.id(),
                         code: "HK-FS-001",
                         level: crate::completion::DiagnosticLevel::Warning,
-                        message: format!("cannot read {}: {error}", scan_directory.display()),
+                        message: directory_read_error(&scan_directory, &error),
                     }],
                 };
             }
@@ -209,6 +209,16 @@ impl CandidateProvider for FilesystemProvider {
                 .collect(),
         }
     }
+}
+
+fn directory_read_error(directory: &std::path::Path, error: &std::io::Error) -> String {
+    let reason = match error.kind() {
+        std::io::ErrorKind::PermissionDenied => "权限不足，请检查目录或终端的访问权限".to_owned(),
+        std::io::ErrorKind::NotFound => "路径不存在，请检查路径".to_owned(),
+        std::io::ErrorKind::NotADirectory => "路径不是目录，请检查路径".to_owned(),
+        _ => format!("{error}，请稍后重试"),
+    };
+    format!("无法读取目录：{reason} · {}", directory.display())
 }
 
 impl FilesystemProvider {
@@ -2388,6 +2398,31 @@ mod tests {
         shell::ShellKind,
         terminal::{BufferRevision, QueryId},
     };
+
+    #[test]
+    fn directory_failures_explain_the_cause_before_the_path() {
+        let path = std::path::Path::new("/private/example");
+        for (kind, cause, guidance) in [
+            (std::io::ErrorKind::PermissionDenied, "权限不足", "访问权限"),
+            (std::io::ErrorKind::NotFound, "路径不存在", "检查路径"),
+            (
+                std::io::ErrorKind::NotADirectory,
+                "路径不是目录",
+                "检查路径",
+            ),
+        ] {
+            let message = directory_read_error(path, &std::io::Error::from(kind));
+            assert!(
+                message.starts_with(&format!("无法读取目录：{cause}")),
+                "{message}"
+            );
+            assert!(message.contains(guidance), "{message}");
+            assert!(message.ends_with("/private/example"), "{message}");
+        }
+        let message = directory_read_error(path, &std::io::Error::other("device unavailable"));
+        assert!(message.contains("device unavailable"));
+        assert!(message.contains("稍后重试"));
+    }
 
     #[test]
     fn bash_prefers_scripts_and_escapes_spaces() {

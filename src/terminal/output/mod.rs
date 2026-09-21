@@ -21,8 +21,8 @@ use thiserror::Error;
 
 use super::{
     AnchorConfidence, BoundaryId, BufferRevision, ChildOutputBatch, CompositorError, FrameTicket,
-    OverlayView, RenderReadiness, ScreenEpoch, ScreenRevision, SessionToken, SurfaceGeometry,
-    SurfaceKey, SyncOutputCapability, TerminalGuard, TerminalSize,
+    OverlayView, RenderReadiness, SanitizedText, ScreenEpoch, ScreenRevision, SessionToken,
+    SurfaceGeometry, SurfaceKey, SyncOutputCapability, TerminalGuard, TerminalSize,
 };
 use crate::diagnostics::DebugLog;
 
@@ -214,9 +214,23 @@ impl OutputHandle {
     }
 
     pub fn prepare_surface(&self) -> Result<Option<SurfaceGeometry>, OutputError> {
+        self.prepare_surface_with_status(None)
+    }
+
+    pub fn prepare_surface_for(
+        &self,
+        view: &OverlayView,
+    ) -> Result<Option<SurfaceGeometry>, OutputError> {
+        self.prepare_surface_with_status(view.standalone_status().cloned())
+    }
+
+    fn prepare_surface_with_status(
+        &self,
+        status: Option<SanitizedText>,
+    ) -> Result<Option<SurfaceGeometry>, OutputError> {
         let (sender, receiver) = mpsc::sync_channel(0);
         self.mailbox
-            .push_control(ControlCommand::PrepareSurface(sender))?;
+            .push_control(ControlCommand::PrepareSurface { status, sender })?;
         receiver.recv().map_err(|_| OutputError::Closed)
     }
 
@@ -292,7 +306,10 @@ enum ControlCommand {
     Probe(Vec<u8>),
     UnlockMirrored(BufferRevision),
     Snapshot(SyncSender<OutputState>),
-    PrepareSurface(SyncSender<Option<SurfaceGeometry>>),
+    PrepareSurface {
+        status: Option<SanitizedText>,
+        sender: SyncSender<Option<SurfaceGeometry>>,
+    },
     InvalidateAnchor,
     AllowCursorProbe(BufferRevision),
 }
