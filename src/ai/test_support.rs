@@ -37,7 +37,7 @@ pub(crate) fn chat_success_body() -> serde_json::Value {
     })
 }
 
-/// Serves exactly `requests` connections, routing each raw request through
+/// Serves exactly `requests` POST requests, routing each raw request through
 /// `handler`; every request is forwarded to the returned channel.
 pub(crate) fn spawn_mock_server(
     requests: usize,
@@ -47,12 +47,17 @@ pub(crate) fn spawn_mock_server(
     let address = listener.local_addr().expect("server address");
     let (request_sender, request_receiver) = mpsc::channel();
     let join = thread::spawn(move || {
-        for _ in 0..requests {
+        let mut served = 0;
+        while served < requests {
             let (mut stream, _) = listener.accept().expect("accept request");
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .expect("read timeout");
             let request = read_http_request(&mut stream);
+            if reject_localhost_probe(&mut stream, &request) {
+                continue;
+            }
+            served += 1;
             let _ = request_sender.send(request.clone());
             let reply = handler(&request);
             let _ = write!(
@@ -66,6 +71,17 @@ pub(crate) fn spawn_mock_server(
         }
     });
     (format!("http://{address}"), request_receiver, join)
+}
+
+/// As in the OAuth fixtures, localhost service probes must not consume a
+/// scripted AI response before the actual client connects.
+pub(crate) fn reject_localhost_probe(stream: &mut TcpStream, request: &[u8]) -> bool {
+    if request.starts_with(b"POST ") {
+        return false;
+    }
+    let _ = stream
+        .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    true
 }
 
 fn read_http_request(stream: &mut TcpStream) -> Vec<u8> {

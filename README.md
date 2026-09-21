@@ -418,6 +418,20 @@ If the requested channel has no published release yet, Hokan reports that
 without changing the installation. A beta-only repository does not require
 a stable release for beta updates to work.
 
+All built-in HTTP requests (updates, AI, OAuth, model lists, and font downloads)
+use macOS HTTP/HTTPS system proxies by default. `HTTP_PROXY` / `HTTPS_PROXY`
+(or their lowercase forms) override the corresponding system setting;
+`ALL_PROXY` supplies a fallback, including `socks5h://` proxies. On Linux, use
+these environment variables. Use `NO_PROXY=localhost,127.0.0.1,::1` to keep local
+AI endpoints direct. PAC scripts and macOS proxy exception lists are not
+evaluated; use explicit proxy variables and `NO_PROXY` for those setups.
+A macOS SOCKS-only system setting also needs an explicit proxy variable.
+
+An update HTTP 403 can come from GitHub rate limiting or a proxy/gateway
+denial. Hokan identifies rate limits from response headers and reports the
+retry delay when supplied. Unauthenticated GitHub API requests share a limit
+of 60 requests per hour per public IP, including other users of the same proxy.
+
 Set `HOKAN_NO_AUTO_UPDATE=1` to disable automatic updating for one session, or
 configure `[update]` (set `enabled = false` to disable it persistently):
 

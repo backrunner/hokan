@@ -22,6 +22,13 @@ pub(crate) struct MockReply {
     body: Vec<u8>,
 }
 
+impl MockReply {
+    pub(crate) fn with_header(mut self, name: &'static str, value: impl Into<String>) -> Self {
+        self.headers.push((name, value.into()));
+        self
+    }
+}
+
 pub(crate) fn json_reply(status: &'static str, body: serde_json::Value) -> MockReply {
     MockReply {
         status,

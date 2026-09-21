@@ -252,13 +252,26 @@ OAuth 登录过程错误（`OAuthError`）的稳定错误码：
 
 ## 更新失败排查
 
+所有内置 HTTP 请求（升级、AI、OAuth、模型列表和字体下载）默认读取 macOS 的
+HTTP/HTTPS 系统代理。`HTTP_PROXY` / `HTTPS_PROXY`（也支持小写）可覆盖对应系统
+设置，`ALL_PROXY` 作为后备；Linux 使用这些环境变量。SOCKS 代理可通过
+`HTTPS_PROXY=socks5h://127.0.0.1:1080` 等方式指定，端口以实际配置为准。
+本地 AI 服务建议设置 `NO_PROXY=localhost,127.0.0.1,::1`。
+当前 HTTP 客户端不执行 PAC、不读取 macOS 代理例外列表，也不自动读取系统的
+SOCKS-only 设置；这些情况请显式设置代理变量与 `NO_PROXY`。
+
+HTTP 403 可能是 GitHub 出口 IP 限流，也可能是代理/网关拒绝访问，仅凭状态码不能
+确定原因。GitHub 未认证 API 的限额是每个公网 IP 每小时 60 次，共享代理的其他
+用户也会消耗同一配额。Hokan 根据 `X-RateLimit-Remaining` / `Retry-After` 等响应头
+区分限流，并在可用时显示等待秒数；不要连续重试。
+
 `hokan upgrade` 与后台自动更新共用同一条链路，错误码如下：
 
 | 错误码 | 含义与处理 |
 | --- | --- |
 | `HK-UPD-CHANNEL` | 渠道名无效；只支持 `stable` / `beta` |
 | `HK-UPD-NET` / `HK-UPD-TIMEOUT` | 网络失败或超时；检查网络/代理后重试 |
-| `HK-UPD-HTTP` | GitHub API 拒绝请求（附状态码）；未认证限额为每 IP 每小时 60 次，稍后重试 |
+| `HK-UPD-HTTP` | HTTP 请求被拒绝（附状态码）；提示限流时按等待时间重试，普通 403 检查网络出口与代理，407 检查代理认证 |
 | `HK-UPD-JSON` | release 响应无法解析 |
 | `HK-UPD-ASSET` | 当前平台（target）的归档或 SHA256SUMS 不在该 release 中 |
 | `HK-UPD-HASH` | 下载的归档与 SHA256SUMS 不匹配；请重试，持续出现请上报 |

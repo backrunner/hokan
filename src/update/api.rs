@@ -5,9 +5,9 @@
 //! public entry point drives its future on a private current-thread runtime,
 //! the same pattern as `ai::oauth`.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use reqwest::{Client, redirect::Policy};
+use reqwest::{Client, StatusCode, header::HeaderMap, redirect::Policy};
 use semver::Version;
 use serde::Deserialize;
 
@@ -156,7 +156,7 @@ async fn send(request: reqwest::RequestBuilder, max_bytes: usize) -> Result<Vec<
     let mut response = request.send().await.map_err(map_reqwest_error)?;
     let status = response.status();
     if !status.is_success() {
-        return Err(UpdateError::Http(status.as_u16()));
+        return Err(http_error(status, response.headers()));
     }
     if response
         .content_length()
@@ -175,6 +175,34 @@ async fn send(request: reqwest::RequestBuilder, max_bytes: usize) -> Result<Vec<
         body.extend_from_slice(&chunk);
     }
     Ok(body)
+}
+
+fn http_error(status: StatusCode, headers: &HeaderMap) -> UpdateError {
+    // Only retain numeric metadata, never response bodies or arbitrary header
+    // text: an error may come from a proxy and contain credential-bearing URLs.
+    let seconds = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<u64>().ok())
+    };
+    let retry_after = seconds("retry-after");
+    let exhausted = seconds("x-ratelimit-remaining") == Some(0);
+    if status == StatusCode::TOO_MANY_REQUESTS
+        || (status == StatusCode::FORBIDDEN && (exhausted || retry_after.is_some()))
+    {
+        let retry_after_secs = retry_after.or_else(|| {
+            let reset = seconds("x-ratelimit-reset")?;
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+            Some(reset.saturating_sub(now))
+        });
+        UpdateError::RateLimited {
+            status: status.as_u16(),
+            retry_after_secs,
+        }
+    } else {
+        UpdateError::Http(status.as_u16())
+    }
 }
 
 fn map_reqwest_error(error: reqwest::Error) -> UpdateError {
@@ -383,6 +411,91 @@ mod tests {
             fetch_latest(Channel::Stable, &base, "backrunner/hokan").expect_err("500 must fail");
         assert!(matches!(error, UpdateError::Http(500)));
         join.join().expect("server thread");
+    }
+
+    #[test]
+    fn rate_limits_are_distinguished_from_gateway_denials() {
+        let reset = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_secs()
+            + 3600;
+        let (base, join) = spawn_server(1, move |_| {
+            raw_reply("403 Forbidden", b"private response body".to_vec())
+                .with_header("X-RateLimit-Remaining", "0")
+                .with_header("X-RateLimit-Reset", reset.to_string())
+        });
+        let error = fetch_latest(Channel::Beta, &base, "backrunner/hokan")
+            .expect_err("GitHub primary rate limit");
+        assert!(matches!(
+            error,
+            UpdateError::RateLimited {
+                status: 403,
+                retry_after_secs: Some(1..=3600),
+            }
+        ));
+        assert_eq!(error.code(), "HK-UPD-HTTP");
+        assert!(!error.to_string().contains("private"));
+        join.join().expect("server");
+
+        for status in ["403 Forbidden", "429 Too Many Requests"] {
+            let (base, join) = spawn_server(1, move |_| {
+                raw_reply(status, Vec::new())
+                    .with_header("Retry-After", "120")
+                    .with_header("X-RateLimit-Reset", "0")
+            });
+            let error = fetch_latest(Channel::Beta, &base, "backrunner/hokan")
+                .expect_err("secondary rate limit");
+            assert!(matches!(
+                error,
+                UpdateError::RateLimited {
+                    retry_after_secs: Some(120),
+                    ..
+                }
+            ));
+            join.join().expect("server");
+        }
+
+        let (base, join) = spawn_server(1, |_| {
+            raw_reply(
+                "403 Forbidden",
+                b"https://user:secret@proxy.invalid".to_vec(),
+            )
+            .with_header("Retry-After", "https://user:secret@proxy.invalid")
+            .with_header("X-RateLimit-Remaining", "invalid")
+        });
+        let error = fetch_latest(Channel::Beta, &base, "backrunner/hokan")
+            .expect_err("gateway refusal without rate-limit evidence");
+        assert!(matches!(error, UpdateError::Http(403)));
+        assert!(!format!("{error:?}").contains("secret"));
+        join.join().expect("server");
+    }
+
+    #[test]
+    fn rate_limit_metadata_is_optional_and_expired_resets_do_not_underflow() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ratelimit-reset", "invalid".parse().expect("header"));
+        assert!(matches!(
+            http_error(StatusCode::TOO_MANY_REQUESTS, &headers),
+            UpdateError::RateLimited {
+                retry_after_secs: None,
+                ..
+            }
+        ));
+        headers.insert("x-ratelimit-remaining", "0".parse().expect("header"));
+        headers.insert("x-ratelimit-reset", "0".parse().expect("header"));
+        assert!(matches!(
+            http_error(StatusCode::FORBIDDEN, &headers),
+            UpdateError::RateLimited {
+                retry_after_secs: Some(0),
+                ..
+            }
+        ));
+        // Rate-limit headers on unrelated HTTP errors are not evidence of throttling.
+        assert!(matches!(
+            http_error(StatusCode::NOT_FOUND, &headers),
+            UpdateError::Http(404)
+        ));
     }
 
     #[test]

@@ -217,7 +217,22 @@ fn confirm(
 }
 
 fn update_failure(error: UpdateError) -> crate::Error {
-    crate::Error::Config(format!("升级失败（{}）：{error}", error.code()))
+    let advice = match &error {
+        UpdateError::RateLimited {
+            retry_after_secs, ..
+        } => match retry_after_secs {
+            Some(seconds) => {
+                format!("；请求被限流，请在 {seconds} 秒后重试（共享出口 IP 可能共用 GitHub 限额）")
+            }
+            None => "；请求被限流，请稍后重试（共享出口 IP 可能共用 GitHub 限额）".into(),
+        },
+        UpdateError::Http(403) => {
+            "；GitHub 或代理/网关拒绝访问，请检查当前网络出口与代理设置".into()
+        }
+        UpdateError::Http(407) => "；代理要求身份认证，请检查代理凭据".into(),
+        _ => String::new(),
+    };
+    crate::Error::Config(format!("升级失败（{}）：{error}{advice}", error.code()))
 }
 
 #[cfg(test)]
@@ -708,5 +723,37 @@ mod tests {
         let detail = error.to_string();
         assert!(detail.contains("HK-UPD-HTTP"), "{detail}");
         join.join().expect("server thread");
+    }
+
+    #[test]
+    fn rate_limited_checks_explain_retry_without_changing_installation_or_config() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let (base, join) = spawn_server(1, |_| {
+            raw_reply("403 Forbidden", Vec::new()).with_header("Retry-After", "90")
+        });
+        let paths = test_paths(root.path());
+        let upgrade_paths = make_upgrade_paths(root.path(), &base);
+        let config_before = fs::read(&paths.config_file).expect("config");
+        let exe_before = fs::read(&upgrade_paths.current_exe).expect("binary");
+        let args = UpgradeArgs {
+            check: true,
+            channel: Some("beta".into()),
+            ..UpgradeArgs::default()
+        };
+        let (result, _, _) = run_scripted("", false, &paths, &upgrade_paths, &args);
+        let detail = result.expect_err("rate limit").to_string();
+        assert!(detail.contains("HK-UPD-HTTP"), "{detail}");
+        assert!(detail.contains("HTTP 403"), "{detail}");
+        assert!(detail.contains("90 秒后重试"), "{detail}");
+        assert_eq!(fs::read(&paths.config_file).expect("config"), config_before);
+        assert_eq!(
+            fs::read(&upgrade_paths.current_exe).expect("binary"),
+            exe_before
+        );
+        join.join().expect("server");
+
+        let detail = update_failure(UpdateError::Http(403)).to_string();
+        assert!(detail.contains("代理/网关"), "{detail}");
+        assert!(!detail.contains("被限流"), "{detail}");
     }
 }

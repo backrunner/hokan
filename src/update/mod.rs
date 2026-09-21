@@ -191,6 +191,11 @@ pub enum UpdateError {
     Timeout,
     #[error("update server rejected the request (HTTP {0})")]
     Http(u16),
+    #[error("update server rate limit exceeded (HTTP {status})")]
+    RateLimited {
+        status: u16,
+        retry_after_secs: Option<u64>,
+    },
     #[error("update server response was invalid")]
     InvalidResponse,
     #[error("release does not provide an archive for this platform")]
@@ -215,7 +220,7 @@ impl UpdateError {
             Self::InvalidChannel => "HK-UPD-CHANNEL",
             Self::Network => "HK-UPD-NET",
             Self::Timeout => "HK-UPD-TIMEOUT",
-            Self::Http(_) => "HK-UPD-HTTP",
+            Self::Http(_) | Self::RateLimited { .. } => "HK-UPD-HTTP",
             Self::InvalidResponse => "HK-UPD-JSON",
             Self::MissingAsset => "HK-UPD-ASSET",
             Self::ChecksumMismatch => "HK-UPD-HASH",

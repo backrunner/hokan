@@ -83,13 +83,19 @@ where
     let address = listener.local_addr().expect("server address");
     let (request_sender, request_receiver) = mpsc::channel();
     let join = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept request");
-        stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .expect("read timeout");
-        let request = read_http_request(&mut stream);
-        let _ = request_sender.send(request);
-        handler(&mut stream);
+        loop {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("read timeout");
+            let request = read_http_request(&mut stream);
+            if test_support::reject_localhost_probe(&mut stream, &request) {
+                continue;
+            }
+            let _ = request_sender.send(request);
+            handler(&mut stream);
+            break;
+        }
     });
     (format!("http://{address}/v1"), request_receiver, join)
 }
@@ -162,6 +168,34 @@ fn anthropic_success_body() -> Vec<u8> {
         }]
     }))
     .expect("response JSON")
+}
+
+#[test]
+fn unrelated_localhost_probes_do_not_consume_ai_responses() {
+    for (endpoint, requests, join) in [
+        spawn_server(|stream| write_response(stream, "200 OK", &success_body(), "")),
+        spawn_mock_server(1, |_| {
+            test_support::json_reply("200 OK", chat_success_body())
+        }),
+    ] {
+        let mut probe_url = reqwest::Url::parse(&endpoint).expect("mock URL");
+        probe_url.set_path("/");
+        let probe = Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("probe client");
+        let response = runtime()
+            .block_on(async { probe.get(probe_url).send().await })
+            .expect("probe response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let test = test_client(&endpoint, Duration::from_secs(5));
+        runtime()
+            .block_on(test.client.request(&context(), &CancellationToken::new()))
+            .expect("AI response after unrelated probe");
+        assert!(requests.recv().expect("AI request").starts_with(b"POST "));
+        join.join().expect("server");
+    }
 }
 
 #[test]
