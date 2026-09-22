@@ -29,6 +29,7 @@ pub struct HistoryProvider {
     help: Arc<CommandHelpCache>,
     projects: Arc<ProjectCache>,
     workspaces: NodeWorkspaceCache,
+    navigation_limit: usize,
     #[cfg(test)]
     allow_unknown_cwd: bool,
 }
@@ -50,6 +51,7 @@ impl HistoryProvider {
             help,
             projects: Arc::new(ProjectCache::default()),
             workspaces: NodeWorkspaceCache::default(),
+            navigation_limit: crate::config::Config::default().completion.max_candidates,
             #[cfg(test)]
             allow_unknown_cwd: false,
         }
@@ -58,6 +60,12 @@ impl HistoryProvider {
     #[must_use]
     pub fn with_project_cache(mut self, projects: Arc<ProjectCache>) -> Self {
         self.projects = projects;
+        self
+    }
+
+    #[must_use]
+    pub fn with_navigation_limit(mut self, limit: usize) -> Self {
+        self.navigation_limit = limit.max(1);
         self
     }
 
@@ -152,22 +160,28 @@ impl CandidateProvider for HistoryProvider {
         // hide the first valid continuation entirely.
         let navigation = context.mode == CompletionMode::HistoryNavigation;
         let matches = if navigation {
-            index.search_recent_filtered(search_text, &context.cwd, now_ms, 50, |record| {
-                let command = record.command.trim().to_lowercase();
-                // Shell-style Up/Down recall must be scoped to commands that
-                // actually ran in the current directory. Imported shell
-                // history without a cwd is intentionally excluded here.
-                self.record_matches_cwd(context, record)
-                    && command.starts_with(search_text.trim_start().to_lowercase().as_str())
-                    && command_prefix.as_ref().is_none_or(|prefix| {
-                        crate::safety::effective_command_word_for_shell(
-                            &record.command,
-                            context.shell,
-                        )
-                        .is_some_and(|command| command.to_lowercase().starts_with(prefix))
-                    })
-                    && self.plausible_record_with_aliases(context, record, &aliases)
-            })
+            index.search_recent_filtered(
+                search_text,
+                &context.cwd,
+                now_ms,
+                self.navigation_limit,
+                |record| {
+                    let command = record.command.trim().to_lowercase();
+                    // Shell-style Up/Down recall must be scoped to commands that
+                    // actually ran in the current directory. Imported shell
+                    // history without a cwd is intentionally excluded here.
+                    self.record_matches_cwd(context, record)
+                        && command.starts_with(search_text.trim_start().to_lowercase().as_str())
+                        && command_prefix.as_ref().is_none_or(|prefix| {
+                            crate::safety::effective_command_word_for_shell(
+                                &record.command,
+                                context.shell,
+                            )
+                            .is_some_and(|command| command.to_lowercase().starts_with(prefix))
+                        })
+                        && self.plausible_record_with_aliases(context, record, &aliases)
+                },
+            )
         } else {
             index.search_filtered(search_text, &context.cwd, now_ms, 50, |record| {
                 // History recommendations must be grounded in executions
@@ -1725,6 +1739,30 @@ mod tests {
             &policy,
         );
         index
+    }
+
+    #[test]
+    fn arrow_navigation_keeps_more_than_fifty_rows_within_configured_limit() {
+        let policy = HistoryPolicy::new(1024, &[]).expect("history policy");
+        let directory = tempfile::tempdir().expect("directory");
+        let cwd = directory.path().canonicalize().expect("canonical cwd");
+        let mut index = HistoryIndex::default();
+        for index_number in 0..120 {
+            index.ingest(
+                &format!("echo entry{index_number:03}"),
+                1_000 + index_number,
+                ShellKind::Zsh,
+                Some(&cwd),
+                Some(0),
+                &policy,
+            );
+        }
+        let provider = provider_with_executables(index, &["echo"]).with_navigation_limit(100);
+        let context = context_in(&cwd, "", CompletionMode::HistoryNavigation);
+        let ranked = rank_and_dedupe(&context, provider.complete(&context).candidates, 100);
+        assert_eq!(ranked.len(), 100);
+        assert_eq!(ranked[0].display.primary, "echo entry119");
+        assert_eq!(ranked[99].display.primary, "echo entry020");
     }
 
     #[test]

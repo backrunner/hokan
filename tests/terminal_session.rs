@@ -529,6 +529,24 @@ impl TerminalSession {
         );
     }
 
+    fn wait_for_selected_history(&mut self, command: &str) {
+        let deadline = Instant::now() + TIMEOUT;
+        while Instant::now() < deadline {
+            if self
+                .screen_text()
+                .lines()
+                .any(|row| row.contains('▶') && row.contains(command))
+            {
+                return;
+            }
+            self.receive_once(READ_POLL);
+        }
+        panic!(
+            "history selection did not reach {command:?}:\n{}",
+            self.screen_text()
+        );
+    }
+
     fn wait_for_screen_absent(&mut self, needle: &str) {
         let deadline = Instant::now() + TIMEOUT;
         while Instant::now() < deadline {
@@ -2663,6 +2681,52 @@ fn custom_function_argument_completes_the_inferred_slot() {
 }
 
 #[test]
+fn tab_fill_clears_zsh_inline_suggestion_before_further_typing() {
+    if !command_exists("zsh") {
+        return;
+    }
+    let (home, work) = fixture_directories();
+    // Model a suggestion plugin that owns POSTDISPLAY. ZLE keeps this suffix
+    // when a custom widget changes BUFFER unless the widget clears it.
+    fs::write(
+        home.path().join(".zshrc"),
+        "PROMPT='HK> '\nRPROMPT=''\nsetopt no_beep\nbindkey -e\n\
+         function fixture_inline_suggestion() {\n\
+           BUFFER='tar '; CURSOR=${#BUFFER}\n\
+           POSTDISPLAY='HK_STALE_SUGGESTION'\n\
+           region_highlight+=(\"$CURSOR $(( CURSOR + ${#POSTDISPLAY} )) fg=8\")\n\
+         }\n\
+         zle -N fixture_inline_suggestion\n\
+         bindkey '^G' fixture_inline_suggestion\n",
+    )
+    .expect("inline suggestion fixture");
+    let mut terminal = TerminalSession::spawn_hokan(home, work, 2);
+    terminal.wait_for_screen("HK> ");
+    terminal.wait_for_sync_replies(1);
+    terminal.write(b"\x07");
+    terminal.wait_for_screen("HK> tar HK_STALE_SUGGESTION");
+    terminal.wait_for_screen(TAG_SPEC);
+    terminal.write(b"\t");
+    terminal.wait_for_screen("HK> tar -czf");
+    terminal.settle(Duration::from_millis(200));
+    assert!(
+        !terminal.screen_text().contains("HK_STALE_SUGGESTION"),
+        "old inline suggestion survived Tab:\n{}",
+        terminal.screen_text()
+    );
+    terminal.write(b"archive");
+    terminal.wait_for_screen("HK> tar -czf archive");
+    terminal.settle(Duration::from_millis(200));
+    assert!(
+        !terminal.screen_text().contains("HK_STALE_SUGGESTION"),
+        "typing pushed the old inline suggestion forward:\n{}",
+        terminal.screen_text()
+    );
+    terminal.exit_shell();
+    terminal.wait_until_exit();
+}
+
+#[test]
 fn tab_fills_back_the_selected_candidate_without_executing() {
     if !command_exists("zsh") {
         return;
@@ -3346,6 +3410,67 @@ fn ctrl_r_on_an_empty_buffer_opens_the_history_view() {
     terminal.wait_for_screen(TAG_HIS);
     assert!(terminal.screen_text().contains("echo HK_HIST_SEED"));
 
+    terminal.exit_shell();
+    terminal.wait_until_exit();
+}
+
+#[test]
+fn history_arrows_scroll_past_fifty_entries_and_fill_the_selected_command() {
+    if !command_exists("zsh") {
+        return;
+    }
+    let (home, work) = fixture_directories();
+    let store = hokan::history::HistoryStore::open(&home.path().join(".local/state/hokan"))
+        .expect("history store");
+    let cwd = work.path().canonicalize().expect("canonical cwd");
+    let events: Vec<_> = (0..80)
+        .map(|index| hokan::history::HistoryEventV1 {
+            event_id: None,
+            timestamp_ms: 1_000 + index,
+            command: format!("echo HK_HISTORY_{index:03}"),
+            cwd: Some(cwd.clone()),
+            shell: hokan::shell::ShellKind::Zsh,
+            exit_code: Some(0),
+            imported: false,
+            occurrences: 1,
+            cwd_occurrences: Some(1),
+        })
+        .collect();
+    store.append_many(&events).expect("seed history");
+    let mut terminal = TerminalSession::spawn_hokan(home, work, 2);
+    terminal.wait_for_screen("HK> ");
+    terminal.wait_for_sync_replies(1);
+
+    // A burst that arrives before the first provider result must retain every
+    // press, wrapping once before continuing upward through older pages.
+    terminal.wait_for_cpr_replies(1);
+    terminal.write(&b"\x1b[A".repeat(83));
+    terminal.wait_for_selected_history("echo HK_HISTORY_077");
+    let text = terminal.screen_text();
+    assert!(
+        text.find("HK_HISTORY_077") < text.find("HK_HISTORY_079"),
+        "{text}"
+    );
+    terminal.write(&b"\x1b[A".repeat(50));
+    terminal.wait_for_selected_history("echo HK_HISTORY_027");
+    terminal.write(b"\x1b[B");
+    terminal.wait_for_selected_history("echo HK_HISTORY_028");
+    terminal.write(b"\x1b[5~");
+    terminal.wait_for_selected_history("echo HK_HISTORY_022");
+    terminal.write(b"\x1b[6~");
+    terminal.wait_for_selected_history("echo HK_HISTORY_028");
+    terminal.write(&b"\x1b[A".repeat(28));
+    terminal.wait_for_selected_history("echo HK_HISTORY_000");
+    terminal.write(b"\x1b[A");
+    terminal.wait_for_selected_history("echo HK_HISTORY_079");
+    terminal.write(b"\x1b[B");
+    terminal.wait_for_selected_history("echo HK_HISTORY_000");
+    terminal.write(b"\x1b[5~");
+    terminal.wait_for_selected_history("echo HK_HISTORY_074");
+    terminal.write(b"\x1b[6~");
+    terminal.wait_for_selected_history("echo HK_HISTORY_000");
+    terminal.write(b"\t");
+    terminal.wait_for_bare_row("HK> echo HK_HISTORY_000");
     terminal.exit_shell();
     terminal.wait_until_exit();
 }

@@ -136,9 +136,17 @@ pub(super) fn render_current(state: &mut RuntimeState, output: &OutputHandle) ->
             .unwrap_or(0);
         let page_start = selected_index / state.page_size * state.page_size;
         let page_end = (page_start + state.page_size).min(state.candidates.len());
+        // Shell history reads upward from the newest row at the bottom.
+        // Keep the provider's newest-first order for paging and selection.
         let mut view = OverlayView::with_rows(
-            state.candidates[page_start..page_end]
-                .iter()
+            (page_start..page_end)
+                .map(|index| {
+                    if state.history_navigation {
+                        &state.candidates[page_end - 1 - (index - page_start)]
+                    } else {
+                        &state.candidates[index]
+                    }
+                })
                 .map(|candidate| {
                     let mut row = OverlayRow::new(
                         candidate.id.0,

@@ -398,6 +398,8 @@ pub(super) fn prefetch_command_help(
 /// cleared" behavior.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SelectionIntent {
+    /// Ordinary lists store a navigation delta; history stores an offset
+    /// encoded as -1 for newest, -2 for the next older row, and so on.
     pub(super) delta: isize,
     pub(super) key: Option<SelectionKey>,
 }
@@ -445,36 +447,55 @@ pub(super) fn move_selection(state: &mut RuntimeState, delta: isize) {
             .position(|candidate| candidate.id == id)
     }) {
         Some(current) if state.history_navigation => {
-            (current as isize + delta).clamp(0, length - 1) as usize
+            // Candidates are newest first. Up recalls an older command;
+            // Down returns toward the newest. Both wrap at the list edges.
+            (current as isize - delta).rem_euclid(length) as usize
         }
         Some(current) => (current as isize + delta).rem_euclid(length) as usize,
-        // No implicit selection: the first Down lands on the first row, the
-        // first Up on the last; page jumps go to the first row / the start of
-        // the last page.
         None if state.history_navigation => {
-            if delta < 0 {
-                0
-            } else if delta > 0 {
-                state.candidates.len() - 1
-            } else {
-                0
-            }
+            history_landing_row(state.candidates.len(), delta.min(-1))
         }
+        // Ordinary completion has no implicit selection: Down lands on the
+        // first row and Up on the last.
         None => landing_row(state.candidates.len(), state.page_size, delta),
     };
     state.selected = Some(state.candidates[next].id);
     state.selection_intent = Some(SelectionIntent {
-        delta,
+        delta: if state.history_navigation {
+            -(next as isize) - 1
+        } else {
+            delta
+        },
         key: Some(SelectionKey::of(&state.candidates[next])),
     });
 }
 
 /// Preserve an arrow press while a hidden overlay is waiting for its first
-/// provider batch. The result handler applies the normal no-selection landing
-/// rule once the history rows exist.
+/// provider batch. History keeps repeated presses as an offset from the newest
+/// row; ordinary completion uses its no-selection landing rule.
 pub(super) fn defer_selection(state: &mut RuntimeState, delta: isize) {
     state.selected = None;
+    let delta = if state.history_navigation {
+        // -1 denotes the newest row; subtracting steps moves toward older
+        // rows. Keep the unbounded offset until the result supplies the list
+        // length, so key repeats can wrap in either direction even here.
+        state
+            .selection_intent
+            .as_ref()
+            .map_or(delta.min(-1), |intent| intent.delta.saturating_add(delta))
+    } else {
+        delta
+    };
     state.selection_intent = Some(SelectionIntent { delta, key: None });
+}
+
+/// Decode the pending history offset once its list length is known. Offsets
+/// at or above zero represent Down presses that wrapped beyond the newest row.
+pub(super) fn history_landing_row(candidate_count: usize, delta: isize) -> usize {
+    delta
+        .saturating_neg()
+        .saturating_sub(1)
+        .rem_euclid(candidate_count.max(1) as isize) as usize
 }
 
 /// Where a navigation lands when nothing is selected yet: Down on the first

@@ -178,6 +178,7 @@ pub(super) fn build_engine(
                 Arc::clone(&specs),
                 Arc::clone(&help),
             )
+            .with_navigation_limit(config.completion.max_candidates)
             .with_project_cache(projects),
         );
     }

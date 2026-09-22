@@ -731,6 +731,73 @@ fn selection_candidate(state: &RuntimeState, primary: &str) -> Candidate {
 }
 
 #[test]
+fn repeated_history_arrows_are_retained_before_the_first_result() {
+    let directory = tempfile::tempdir().expect("directory");
+    let mut state = runtime_state(directory.path());
+    state.history_navigation = true;
+    defer_selection(&mut state, -1);
+    defer_selection(&mut state, -1);
+    defer_selection(&mut state, -1);
+    let delta = state.selection_intent.as_ref().expect("intent").delta;
+    assert_eq!(state::history_landing_row(80, delta), 2);
+    defer_selection(&mut state, 1);
+    let delta = state.selection_intent.as_ref().expect("intent").delta;
+    assert_eq!(state::history_landing_row(80, delta), 1);
+    for _ in 0..4 {
+        defer_selection(&mut state, 1);
+    }
+    defer_selection(&mut state, -1);
+    let delta = state.selection_intent.as_ref().expect("intent").delta;
+    assert_eq!(state::history_landing_row(80, delta), 78);
+
+    // A full cycle also works before any candidates have arrived.
+    for _ in 0..80 {
+        defer_selection(&mut state, -1);
+    }
+    let delta = state.selection_intent.as_ref().expect("intent").delta;
+    assert_eq!(state::history_landing_row(80, delta), 78);
+    assert_eq!(state::history_landing_row(1, delta), 0);
+    assert_eq!(state::history_landing_row(0, delta), 0);
+}
+
+#[test]
+fn history_arrows_and_pages_wrap_at_both_ends() {
+    let directory = tempfile::tempdir().expect("directory");
+    let mut state = runtime_state(directory.path());
+    state.history_navigation = true;
+    state.candidates = (0..25)
+        .map(|index| selection_candidate(&state, &format!("echo {index:02}")))
+        .collect();
+
+    for index in 0..25 {
+        move_selection(&mut state, -1);
+        assert_eq!(state.selected, Some(state.candidates[index].id));
+    }
+    move_selection(&mut state, -1);
+    assert_eq!(state.selected, Some(state.candidates[0].id));
+    move_selection(&mut state, 1);
+    assert_eq!(state.selected, Some(state.candidates[24].id));
+    let page_size = state.page_size as isize;
+    move_selection(&mut state, page_size);
+    assert_eq!(state.selected, Some(state.candidates[14].id));
+    for index in (0..14).rev() {
+        move_selection(&mut state, 1);
+        assert_eq!(state.selected, Some(state.candidates[index].id));
+    }
+    move_selection(&mut state, 1);
+    assert_eq!(state.selected, Some(state.candidates[24].id));
+    move_selection(&mut state, -page_size);
+    assert_eq!(state.selected, Some(state.candidates[9].id));
+    move_selection(&mut state, page_size);
+    assert_eq!(state.selected, Some(state.candidates[24].id));
+
+    // Either opening arrow still starts at the newest command.
+    state.selected = None;
+    move_selection(&mut state, 1);
+    assert_eq!(state.selected, Some(state.candidates[0].id));
+}
+
+#[test]
 fn move_selection_from_none_lands_on_the_edges() {
     let directory = tempfile::tempdir().expect("directory");
     let mut state = runtime_state(directory.path());

@@ -148,6 +148,20 @@ pub(super) fn handle_input_event(
         return Ok(());
     }
 
+    if !state.overlay_visible
+        && state.history_navigation
+        && state.provider_pending
+        && (config.keys.up.matches(&event.kind) || config.keys.down.matches(&event.kind))
+    {
+        let delta = if config.keys.up.matches(&event.kind) {
+            -1
+        } else {
+            1
+        };
+        defer_selection(state, delta);
+        return Ok(());
+    }
+
     // Any further keypress invalidates a pending re-selection intent; the
     // overlay navigation keys below re-establish it via `move_selection`.
     state.selection_intent = None;

@@ -7,7 +7,7 @@ use std::{
 use super::{
     output_error,
     render::render_current,
-    state::{ActiveAiRequest, RuntimeState, landing_row, selected_candidate},
+    state::{ActiveAiRequest, RuntimeState, history_landing_row, landing_row, selected_candidate},
     worker::ProviderResult,
 };
 use crate::{
@@ -227,13 +227,7 @@ pub(super) fn handle_provider_result(
                 .or_else(|| {
                     (!state.candidates.is_empty()).then(|| {
                         let index = if state.history_navigation {
-                            if intent.delta < 0 {
-                                0
-                            } else if intent.delta > 0 {
-                                state.candidates.len() - 1
-                            } else {
-                                0
-                            }
+                            history_landing_row(state.candidates.len(), intent.delta)
                         } else {
                             landing_row(state.candidates.len(), state.page_size, intent.delta)
                         };

@@ -113,6 +113,9 @@ if [[ -n ${HOKAN_ACTIVE:-} && -n ${HOKAN_CONTROL_FIFO:-} && -z ${__HOKAN_ZSH_LOA
     next_cursor=${edit_payload%%$'\t'*}
     next_buffer=${edit_payload#*$'\t'}
     [[ "$next_cursor" == <-> ]] || return 0
+    # Inline suggestions belong to the old buffer. ZLE otherwise keeps the
+    # suffix and pushes it forward as the replacement or later input grows.
+    POSTDISPLAY=''
     BUFFER="$next_buffer"
     CURSOR=$next_cursor
     zle redisplay
@@ -125,6 +128,7 @@ if [[ -n ${HOKAN_ACTIVE:-} && -n ${HOKAN_CONTROL_FIFO:-} && -z ${__HOKAN_ZSH_LOA
     next_cursor=${edit_payload%%$'\t'*}
     next_buffer=${edit_payload#*$'\t'}
     [[ "$next_cursor" == <-> ]] || return 0
+    POSTDISPLAY=''
     BUFFER="$next_buffer"
     CURSOR=$next_cursor
     zle accept-line

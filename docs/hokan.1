@@ -1,4 +1,4 @@
-.TH HOKAN 1 "2026-09-21" "hokan 0.1.0-beta.14" "User Commands"
+.TH HOKAN 1 "2026-09-22" "hokan 0.1.0-beta.15" "User Commands"
 .SH NAME
 hokan \- shell-aware terminal completion overlay
 .SH SYNOPSIS
@@ -155,10 +155,13 @@ and Ctrl-D retain their normal shell semantics and close the current session.
 .B Up, Down
 Move the current selection. When the overlay is closed at an editable prompt,
 open Hokan's history-only list without installing or replacing shell key
-bindings.
+bindings. In this history list, Up recalls older entries and Down returns to
+newer entries, wrapping at either end. The newest entry appears at the bottom.
+The list respects completion.max_candidates and the current directory and
+input prefix filters.
 .TP
 .B PageUp, PageDown
-Move the current selection by one page.
+Move the current selection by one page, wrapping at either end.
 .TP
 .B Enter
 With no selection, execute the command exactly as typed: the overlay is
