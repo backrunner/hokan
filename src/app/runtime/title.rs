@@ -138,7 +138,17 @@ fn process_name(pid: i32) -> Option<String> {
 mod tests {
     #[test]
     fn foreground_probe_reads_only_the_executable_name() {
-        let name = super::process_name(std::process::id() as i32).expect("current process");
+        // Production retries this best-effort, 150 ms probe on later ticks.
+        // A busy parallel test runner may exhaust one attempt; this test
+        // checks the discovered name, not the scheduler's latency.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let name = loop {
+            if let Some(name) = super::process_name(std::process::id() as i32) {
+                break name;
+            }
+            assert!(std::time::Instant::now() < deadline, "current process");
+            std::thread::sleep(super::REFRESH_INTERVAL);
+        };
         assert!(!name.contains('/'), "{name:?}");
         assert!(!name.contains("--"), "{name:?}");
     }
