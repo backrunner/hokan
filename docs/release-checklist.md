@@ -37,7 +37,35 @@ cargo package --locked
   Ctrl-L、alternate screen、Unicode、termios、panic 和可处理信号。
 - 普通 frame 中不得出现全屏/scrollback clear、alternate screen、DECSC/DECRC 或最后一列 write。
 - AI mock 必须覆盖成功、HTTP 错误、timeout、取消、body limit、恶意控制字符和 secret 扫描。
-- 四个 target 的归档必须附带 SHA256 和 SPDX JSON SBOM。
+- 四个 target 的归档必须附带 SHA256、Ed25519 签名的 `SHA256SUMS.sig` 和 SPDX JSON SBOM。
+- Release workflow 的 `HOKAN_RELEASE_SIGNING_KEY` secret 必须与 updater 内置的公钥配对；
+  不得把私钥写入仓库、归档或日志。
+
+### 更新签名密钥
+
+信任根是 `assets/update-signing-key.hex` 中的 Ed25519 公钥，编译进二进制，
+绝不能从 GitHub API 或镜像响应动态获取。首个签名版本发布前，把配对的 PEM 私钥
+存入仓库 Actions secret `HOKAN_RELEASE_SIGNING_KEY`：
+
+```bash
+gh secret set HOKAN_RELEASE_SIGNING_KEY --repo backrunner/hokan < /secure/path/release-signing.pem
+```
+
+私钥应另存离线备份。不得在每次发布时重新生成；随意更换公钥会导致已安装客户端
+无法验证后续版本。密钥轮换需要先用旧密钥签署包含新信任根的过渡版本。
+`scripts/sign-release.sh` 会核对私钥导出的公钥与仓库公钥完全一致，再签署
+`SHA256SUMS`，缺少密钥或不匹配时发布任务必须失败。
+
+本地验证签名（需要支持 Ed25519 的 OpenSSL 3，macOS 系统 LibreSSL 不满足）：
+
+```bash
+bash scripts/sign-release.sh dist/SHA256SUMS /secure/path/release-signing.pem
+```
+
+旧客户端仍可通过现有 GitHub 直连更新到首个签名版本，之后强制验证签名。
+新客户端不允许重装未签名的历史 release，`--force` 也不能绕过验签。
+镜像可隐藏新版本或重放旧版本列表，因此签名保证发布内容真实性，不保证镜像的新鲜度。
+现有 semver 检查始终拒绝降级。首次安装脚本维持 GitHub 直连和 SHA256 校验。
 
 ## 真实环境认证矩阵
 
@@ -81,7 +109,7 @@ gh run list --workflow release.yml --branch "v$version"
 `tag` 参数重建同一份源码；源码修复应在创建 tag 前完成。
 
 1. tag 必须为 `v<package-version>`，workflow 会拒绝版本不一致。
-2. 在干净机器校验 `SHA256SUMS`，解压对应 target 归档。
+2. 在干净机器校验 `SHA256SUMS.sig` 后再校验 `SHA256SUMS`，解压对应 target 归档。
 3. 运行 `bin/hokan --version`、`doctor --json`、`spec validate`。
 4. 用临时 rc 文件验证 `install` 幂等、备份、`setup` 兼容别名和 `uninstall`。
 5. 检查归档包含 README、BSD-3-Clause 许可证和 `share/man/man1/hokan.1`。
@@ -90,7 +118,8 @@ gh run list --workflow release.yml --branch "v$version"
    `hokan-<version>-<target>/bin/hokan`；后者可硬链接到前者。
 8. 在隔离的 macOS 安装目录实际验证上一 beta 的 `upgrade --channel beta --yes`，
    检查版本变化、备份和新版本的自动检查；不替换开发者的日常安装。
-9. 所有资产和 `SHA256SUMS` 上传完成后才将 draft 发布，避免自动更新读到半成品。
+9. 所有资产、`SHA256SUMS` 和 `SHA256SUMS.sig` 上传完成后才将 draft 发布，
+   避免自动更新读到半成品。
 
 ## Release profile
 

@@ -11,11 +11,15 @@ use reqwest::{Client, StatusCode, header::HeaderMap, redirect::Policy};
 use semver::Version;
 use serde::Deserialize;
 
-use super::{Channel, UpdateError};
+use super::{
+    Channel, DEFAULT_API_BASE, DEFAULT_API_MIRROR_TEMPLATES, DEFAULT_MIRROR_TEMPLATES, MIRRORS_ENV,
+    UpdateError,
+};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const ASSET_REDIRECT_LIMIT: usize = 5;
+const MAX_RELEASE_PAGES: usize = 100;
 /// Cap on release-metadata bodies; real replies are a few KiB of JSON.
 const RESPONSE_BODY_MAX_BYTES: usize = 1024 * 1024;
 
@@ -26,6 +30,7 @@ pub struct ReleaseInfo {
     pub tag: String,
     pub archive_url: String,
     pub checksums_url: String,
+    pub signature_url: String,
 }
 
 /// Runs `future` on a private current-thread runtime (same pattern as
@@ -64,12 +69,14 @@ pub(crate) fn download_client() -> Result<Client, UpdateError> {
         .redirect(Policy::custom(|attempt| {
             if attempt.previous().len() >= ASSET_REDIRECT_LIMIT {
                 attempt.error("too many release asset redirects")
-            } else if attempt
-                .previous()
-                .last()
-                .is_some_and(|previous| previous.scheme() != attempt.url().scheme())
+            } else if !attempt.url().username().is_empty()
+                || attempt.url().password().is_some()
+                || attempt
+                    .previous()
+                    .last()
+                    .is_some_and(|previous| previous.scheme() != attempt.url().scheme())
             {
-                attempt.error("release asset redirect changed URL scheme")
+                attempt.error("unsafe release asset redirect")
             } else {
                 attempt.follow()
             }
@@ -86,22 +93,58 @@ pub fn fetch_latest(
     base: &str,
     repo: &str,
 ) -> Result<Option<ReleaseInfo>, UpdateError> {
+    fetch_latest_with_mirrors(channel, base, repo, &mirror_templates(base))
+}
+
+fn fetch_latest_with_mirrors(
+    channel: Channel,
+    base: &str,
+    repo: &str,
+    mirrors: &[String],
+) -> Result<Option<ReleaseInfo>, UpdateError> {
     let client = api_client()?;
     let base = base.trim_end_matches('/');
     block_on(async {
-        let mut best = None;
-        for page in 1.. {
-            let url = format!("{base}/repos/{repo}/releases?per_page=20&page={page}");
-            let mut releases: Vec<Release> = get_json(&client, &url).await?;
-            let last_page = releases.len() < 20;
-            releases.extend(best.take());
-            best = select_highest(releases, channel);
-            if last_page {
-                break;
+        let mut first_error = None;
+        // Retry the complete listing on one source. Never mix pagination from
+        // GitHub and a stale mirror, which could skip releases between pages.
+        for template in std::iter::once(None).chain(mirrors.iter().map(Some)) {
+            match fetch_from_source(&client, channel, base, repo, template).await {
+                Ok(release) => return Ok(release),
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
             }
         }
-        best.map(release_info).transpose()
+        Err(first_error.unwrap_or(UpdateError::Network))
     })?
+}
+
+async fn fetch_from_source(
+    client: &Client,
+    channel: Channel,
+    base: &str,
+    repo: &str,
+    template: Option<&String>,
+) -> Result<Option<ReleaseInfo>, UpdateError> {
+    let mut best = None;
+    for page in 1..=MAX_RELEASE_PAGES {
+        let primary = format!("{base}/repos/{repo}/releases?per_page=20&page={page}");
+        let url = match template {
+            Some(template) => mirror_url(&primary, template).ok_or(UpdateError::InvalidResponse)?,
+            None => primary,
+        };
+        let mut releases: Vec<Release> = get_json(client, &url).await?;
+        let last_page = releases.len() < 20;
+        releases.extend(best.take());
+        best = select_highest(releases, channel);
+        if last_page {
+            return best
+                .map(|release| release_info(release, base, repo))
+                .transpose();
+        }
+    }
+    Err(UpdateError::InvalidResponse)
 }
 
 /// Parses a release tag (`v0.2.0` or `0.2.0-beta.1`) as semver; unparseable
@@ -138,6 +181,36 @@ pub(crate) async fn download(
     send(client.get(url), max_bytes).await
 }
 
+/// Download from GitHub first and then from configured relay templates. A
+/// relay is only a transport: the caller must still verify the signed
+/// SHA256SUMS before installing anything.
+pub(crate) async fn download_with_fallback(
+    client: &Client,
+    url: &str,
+    max_bytes: usize,
+) -> Result<Vec<u8>, UpdateError> {
+    download_from_candidates(client, url, max_bytes, &mirror_templates(url)).await
+}
+
+async fn download_from_candidates(
+    client: &Client,
+    url: &str,
+    max_bytes: usize,
+    mirrors: &[String],
+) -> Result<Vec<u8>, UpdateError> {
+    let mut first_error = None;
+    for candidate in candidate_urls(url, mirrors) {
+        match download(client, &candidate, max_bytes).await {
+            Ok(body) => return Ok(body),
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    // Keep GitHub's rate-limit and proxy diagnostics if every relay fails.
+    Err(first_error.unwrap_or(UpdateError::Network))
+}
+
 async fn get_json<T: serde::de::DeserializeOwned>(
     client: &Client,
     url: &str,
@@ -150,6 +223,73 @@ async fn get_json<T: serde::de::DeserializeOwned>(
     )
     .await?;
     serde_json::from_slice(&body).map_err(|_| UpdateError::InvalidResponse)
+}
+
+fn mirror_templates(primary: &str) -> Vec<String> {
+    let Ok(url) = reqwest::Url::parse(primary) else {
+        return Vec::new();
+    };
+    // Do not relay arbitrary/test endpoints, which may contain private data.
+    if url.scheme() != "https" || !matches!(url.host_str(), Some("api.github.com" | "github.com")) {
+        return Vec::new();
+    }
+    match std::env::var(MIRRORS_ENV) {
+        Ok(value) => value
+            .split([',', '\n'])
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .filter(|value| mirror_url(primary, value).is_some())
+            .take(4)
+            .map(str::to_owned)
+            .collect(),
+        Err(_) => (if url.host_str() == Some("api.github.com") {
+            DEFAULT_API_MIRROR_TEMPLATES
+        } else {
+            DEFAULT_MIRROR_TEMPLATES
+        })
+        .iter()
+        .map(|value| (*value).to_owned())
+        .collect(),
+    }
+}
+
+fn mirror_url(primary: &str, template: &str) -> Option<String> {
+    let source = reqwest::Url::parse(primary).ok()?;
+    let path = match source.query() {
+        Some(query) => format!("{}?{query}", source.path()),
+        None => source.path().to_owned(),
+    };
+    let candidate = if template.contains("{url}") {
+        template.replace("{url}", primary)
+    } else if template.contains("{path}") {
+        template.replace("{path}", &path)
+    } else {
+        return None;
+    };
+    let url = reqwest::Url::parse(&candidate).ok()?;
+    // A production HTTPS request can never fall back to HTTP. HTTP is only
+    // used by callers injecting an HTTP base (local test servers).
+    if url.scheme() != source.scheme()
+        || !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    Some(candidate)
+}
+
+fn candidate_urls(primary: &str, mirrors: &[String]) -> Vec<String> {
+    let mut candidates = vec![primary.to_owned()];
+    for template in mirrors.iter().take(4) {
+        if let Some(candidate) = mirror_url(primary, template)
+            && !candidates.contains(&candidate)
+        {
+            candidates.push(candidate);
+        }
+    }
+    candidates
 }
 
 async fn send(request: reqwest::RequestBuilder, max_bytes: usize) -> Result<Vec<u8>, UpdateError> {
@@ -229,22 +369,47 @@ fn select_highest(releases: Vec<Release>, channel: Channel) -> Option<Release> {
 }
 
 /// Resolves the platform archive and SHA256SUMS assets of one release.
-fn release_info(release: Release) -> Result<ReleaseInfo, UpdateError> {
+fn release_info(release: Release, base: &str, repo: &str) -> Result<ReleaseInfo, UpdateError> {
     let version = parse_tag_version(&release.tag_name).ok_or(UpdateError::InvalidResponse)?;
     let archive = archive_name(&version)?;
     let find = |name: &str| {
-        release
-            .assets
-            .iter()
-            .find(|asset| asset.name == name)
-            .map(|asset| asset.browser_download_url.clone())
-            .ok_or(UpdateError::MissingAsset)
+        let mut matches = release.assets.iter().filter(|asset| asset.name == name);
+        let asset = matches.next().ok_or(UpdateError::MissingAsset)?;
+        if matches.next().is_some() {
+            return Err(UpdateError::InvalidResponse);
+        }
+        if base == DEFAULT_API_BASE {
+            let expected = format!(
+                "https://github.com/{repo}/releases/download/{}/{name}",
+                release.tag_name
+            );
+            if asset.browser_download_url != expected {
+                return Err(UpdateError::InvalidResponse);
+            }
+        } else {
+            // Injected bases can only serve assets from the same origin.
+            let url = reqwest::Url::parse(&asset.browser_download_url)
+                .map_err(|_| UpdateError::InvalidResponse)?;
+            let origin = reqwest::Url::parse(base).map_err(|_| UpdateError::InvalidResponse)?;
+            if url.origin() != origin.origin()
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || url.fragment().is_some()
+            {
+                return Err(UpdateError::InvalidResponse);
+            }
+        }
+        Ok(asset.browser_download_url.clone())
     };
+    // SHA256 alone authenticates only the checksum response. Require the
+    // detached signature asset before a release can become installable.
+    let signature_url = find("SHA256SUMS.sig")?;
     Ok(ReleaseInfo {
         version,
-        tag: release.tag_name,
+        tag: release.tag_name.clone(),
         archive_url: find(&archive)?,
         checksums_url: find("SHA256SUMS")?,
+        signature_url,
     })
 }
 
@@ -285,6 +450,148 @@ mod tests {
             .expect("redirected download");
         assert_eq!(body, b"release asset");
         join.join().expect("server thread");
+    }
+
+    #[test]
+    fn mirror_templates_keep_direct_github_first_and_rewrite_the_full_url() {
+        let candidates = candidate_urls(
+            "https://api.github.com/repos/backrunner/hokan/releases?page=1",
+            &[
+                "https://mirror.example/{url}".to_owned(),
+                "https://api-mirror.example{path}".to_owned(),
+            ],
+        );
+        assert_eq!(
+            candidates,
+            vec![
+                "https://api.github.com/repos/backrunner/hokan/releases?page=1",
+                "https://mirror.example/https://api.github.com/repos/backrunner/hokan/releases?page=1",
+                "https://api-mirror.example/repos/backrunner/hokan/releases?page=1",
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_check_tries_mirrors_in_order_and_direct_success_stops() {
+        let (base, join) = spawn_server(3, |path| {
+            if path.starts_with("/repos/") {
+                raw_reply("503 Service Unavailable", Vec::new())
+            } else if path.starts_with("/one/repos/") {
+                raw_reply("200 OK", b"proxy login page".to_vec())
+            } else {
+                assert!(path.starts_with("/two/repos/"));
+                json_reply("200 OK", serde_json::json!([fixture("v9.9.9")]))
+            }
+        });
+        let mirrors = vec![format!("{base}/one{{path}}"), format!("{base}/two{{path}}")];
+        let info = fetch_latest_with_mirrors(Channel::Stable, &base, "backrunner/hokan", &mirrors)
+            .expect("fallback")
+            .expect("release");
+        assert_eq!(info.version, Version::new(9, 9, 9));
+        join.join().expect("server");
+
+        let (base, join) = spawn_server(1, |path| {
+            assert!(path.starts_with("/repos/"), "must not contact mirror");
+            json_reply("200 OK", serde_json::json!([]))
+        });
+        assert!(
+            fetch_latest_with_mirrors(
+                Channel::Stable,
+                &base,
+                "backrunner/hokan",
+                &[format!("{base}/unused{{path}}")]
+            )
+            .expect("direct")
+            .is_none()
+        );
+        join.join().expect("server");
+    }
+
+    #[test]
+    fn failed_asset_download_tries_next_mirror_with_body_limit() {
+        let (base, join) = spawn_server(3, |path| match path {
+            "/asset" => raw_reply("502 Bad Gateway", Vec::new()),
+            "/one/asset" => raw_reply("200 OK", vec![0; 1025]),
+            "/two/asset" => raw_reply("200 OK", b"archive bytes".to_vec()),
+            _ => panic!("unexpected request"),
+        });
+        let client = download_client().expect("client");
+        let mirrors = vec![format!("{base}/one{{path}}"), format!("{base}/two{{path}}")];
+        assert_eq!(
+            block_on(download_from_candidates(
+                &client,
+                &format!("{base}/asset"),
+                1024,
+                &mirrors
+            ))
+            .expect("runtime")
+            .expect("fallback"),
+            b"archive bytes"
+        );
+        join.join().expect("server");
+    }
+
+    #[test]
+    fn all_mirrors_failing_preserves_original_rate_limit() {
+        let (base, join) = spawn_server(2, |path| {
+            if path.starts_with("/repos/") {
+                raw_reply("429 Too Many Requests", Vec::new()).with_header("Retry-After", "123")
+            } else {
+                raw_reply("404 Not Found", Vec::new())
+            }
+        });
+        assert!(matches!(
+            fetch_latest_with_mirrors(
+                Channel::Beta,
+                &base,
+                "backrunner/hokan",
+                &[format!("{base}/mirror{{path}}")]
+            ),
+            Err(UpdateError::RateLimited {
+                retry_after_secs: Some(123),
+                ..
+            })
+        ));
+        join.join().expect("server");
+    }
+
+    #[test]
+    fn metadata_cannot_redirect_downloads_to_another_repository_or_host() {
+        for bad in [
+            "http://github.com/backrunner/hokan/releases/download/v9.9.9/SHA256SUMS",
+            "https://github.com/attacker/hokan/releases/download/v9.9.9/SHA256SUMS",
+            "https://127.0.0.1/private",
+            "https://github.com.evil.invalid/backrunner/hokan/releases/download/v9.9.9/SHA256SUMS",
+        ] {
+            let mut release = fixture("v9.9.9");
+            for asset in release["assets"].as_array_mut().expect("assets") {
+                let name = asset["name"].as_str().expect("name");
+                asset["browser_download_url"] = serde_json::json!(format!(
+                    "https://github.com/backrunner/hokan/releases/download/v9.9.9/{name}"
+                ));
+            }
+            release["assets"][1]["browser_download_url"] = serde_json::json!(bad);
+            let release: Release = serde_json::from_value(release).expect("release");
+            assert!(matches!(
+                release_info(release, DEFAULT_API_BASE, "backrunner/hokan"),
+                Err(UpdateError::InvalidResponse)
+            ));
+        }
+    }
+
+    #[test]
+    fn unsafe_mirror_templates_are_ignored_without_tls_downgrade() {
+        let primary = "https://api.github.com/repos/backrunner/hokan/releases";
+        for template in [
+            "http://127.0.0.1/{url}",
+            "http://mirror.example/{url}",
+            "https://user:secret@mirror.example/{url}",
+            "https://mirror.example/#fragment",
+            "file:///tmp/{url}",
+            "https://mirror.example",
+        ] {
+            assert!(mirror_url(primary, template).is_none());
+        }
     }
 
     fn fixture(tag: &str) -> serde_json::Value {

@@ -64,8 +64,10 @@ Terminal.app、iTerm2、Ghostty、Kitty、WezTerm 和 Alacritty 均在发布认�
   且列表关闭时，外层输入路由消费 CSI/SS3 上下键并打开 history 列表；前台程序、普通
   shell 会话，以及 history 功能关闭且列表未打开时的按键仍接收原始字节。
   箭头历史列表将最新记录放在底部；连续上键查看更早记录，下键返回较新记录，
-  上下键与翻页键均支持首尾循环。列表条数遵循 `completion.max_candidates`（默认 1000），
-  每页高度仍由 `ui.max_rows` 控制，且保留当前目录与输入前缀过滤。
+  上下键与翻页键均支持首尾循环。列表条数遵循 `completion.max_candidates`（默认 0，保留全部匹配项），
+  每页高度仍由 `ui.max_rows` 控制，且保留当前目录与输入前缀过滤。已有配置中的非零上限
+  继续生效，设为 0 可取消该上限。普通命令列表同样支持首尾循环；未选中时 PageDown
+  选中首行，PageUp 选中最后一页的首行。
 - `hokan-leave` 只在 Hokan 管理的子 shell 内注册。自动启动保留外层 shell，并用权限为
   `0700` 的临时 handoff 目录区分“返回外层 shell”和普通 `exit`；直接/按需运行返回 0。
 - 与 zsh 插件共存：oh-my-zsh 和主题在 Hokan 内层 shell 中运行并逐字节透传；补全类插件

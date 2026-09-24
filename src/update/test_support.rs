@@ -9,9 +9,10 @@ use std::{
     net::{TcpListener, TcpStream},
     path::Path,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
+use ed25519_dalek::{Signer, SigningKey};
 use sha2::{Digest, Sha256};
 
 use super::api;
@@ -63,13 +64,39 @@ pub(crate) fn spawn_server(
     let address = listener.local_addr().expect("server address");
     let base = format!("http://{address}");
     let thread_base = base.clone();
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking listener");
     let join = thread::spawn(move || {
-        for _ in 0..requests {
-            let (mut stream, _) = listener.accept().expect("accept request");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut served = 0;
+        while served < requests {
+            assert!(
+                Instant::now() < deadline,
+                "updater did not complete its requests"
+            );
+            let mut stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(error) => panic!("accept request: {error}"),
+            };
+            stream.set_nonblocking(false).expect("blocking stream");
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .expect("read timeout");
             let path = read_request_path(&mut stream);
+            // Local developer services probe newly opened ports. Such probes
+            // must not consume one of the updater's expected requests.
+            if path.is_empty() || path == "/" {
+                let _ = stream.write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                continue;
+            }
+            served += 1;
             let reply = handler(&path);
             let body = replace_base(&reply.body, &thread_base);
             let headers: Vec<_> = reply
@@ -132,7 +159,13 @@ pub(crate) fn archive_asset(version: &str) -> String {
 /// Release JSON in the GitHub API shape; asset download URLs use the
 /// `{BASE}` placeholder the mock server rewrites.
 pub(crate) fn release_json(tag: &str, assets: &[String]) -> serde_json::Value {
-    let assets: Vec<serde_json::Value> = assets
+    let mut names = assets.to_vec();
+    if names.iter().any(|name| name == "SHA256SUMS")
+        && !names.iter().any(|name| name == "SHA256SUMS.sig")
+    {
+        names.push("SHA256SUMS.sig".to_owned());
+    }
+    let assets: Vec<serde_json::Value> = names
         .iter()
         .map(|name| {
             serde_json::json!({
@@ -178,7 +211,16 @@ pub(crate) fn sha256sums_for(entries: &[(&str, &str)]) -> String {
         .collect()
 }
 
-/// Serves a full release download: the archive followed by its SHA256SUMS.
+pub(crate) fn signing_key() -> SigningKey {
+    SigningKey::from_bytes(&[0x42; 32])
+}
+
+pub(crate) fn sign_checksums(checksums: &[u8]) -> Vec<u8> {
+    signing_key().sign(checksums).to_bytes().to_vec()
+}
+
+/// Serves a full release download: the archive, SHA256SUMS, and its detached
+/// Ed25519 signature.
 pub(crate) fn serve_release(version: &str, archive: Vec<u8>) -> (String, thread::JoinHandle<()>) {
     let sums = sha256sums_for(&[(
         &format!("{:x}", Sha256::digest(&archive)),
@@ -195,11 +237,14 @@ pub(crate) fn serve_release_with(
     sums: Vec<u8>,
 ) -> (String, thread::JoinHandle<()>) {
     let archive_name = archive_asset(version);
-    spawn_server(2, move |path| {
+    let signature = sign_checksums(&sums);
+    spawn_server(3, move |path| {
         if path == format!("/download/{archive_name}") {
             raw_reply("200 OK", archive.clone())
         } else if path == "/download/SHA256SUMS" {
             raw_reply("200 OK", sums.clone())
+        } else if path == "/download/SHA256SUMS.sig" {
+            raw_reply("200 OK", signature.clone())
         } else {
             raw_reply("404 Not Found", Vec::new())
         }

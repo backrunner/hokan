@@ -3,8 +3,9 @@
 //! One implementation serves both the manual `hokan upgrade` command and the
 //! detached `--auto` background check: query GitHub Releases (with a TTL
 //! cache so background checks stay under the unauthenticated rate limit),
-//! verify the archive against the published SHA256SUMS, smoke-test the new
-//! binary, and atomically rename it over the current executable.
+//! verify the signed SHA256SUMS and archive, smoke-test the new binary, and
+//! atomically rename it over the current executable. GitHub and configured
+//! relay endpoints share the same fail-closed verification path.
 //!
 //! Every entry point returns `Result`; nothing in this module panics or
 //! exits the process, so `--auto` callers can log and drop failures quietly.
@@ -28,6 +29,18 @@ pub(crate) use api::{block_on, download, download_client};
 pub const DEFAULT_API_BASE: &str = "https://api.github.com";
 /// Repository that publishes the release archives.
 pub const DEFAULT_REPO: &str = "backrunner/hokan";
+/// Comma-separated URL templates used after the direct GitHub request fails.
+/// An explicit value replaces defaults; an empty value disables mirrors.
+pub const MIRRORS_ENV: &str = "HOKAN_UPDATE_MIRRORS";
+/// Public relay templates are only used for the production GitHub endpoint;
+/// injected test endpoints never unexpectedly contact the public internet.
+pub const DEFAULT_MIRROR_TEMPLATES: &[&str] =
+    &["https://gh-proxy.com/{url}", "https://ghproxy.net/{url}"];
+/// Relays supporting the GitHub Releases JSON API.
+pub const DEFAULT_API_MIRROR_TEMPLATES: &[&str] = &[
+    "https://gh-proxy.com/{url}",
+    "https://gh-api.p3terx.com{path}",
+];
 /// Default check interval; matches `[update].interval_secs` in the config.
 pub const DEFAULT_CHECK_INTERVAL: Duration = Duration::from_secs(1_800);
 
@@ -202,6 +215,8 @@ pub enum UpdateError {
     MissingAsset,
     #[error("downloaded archive failed the SHA256 checksum")]
     ChecksumMismatch,
+    #[error("release SHA256SUMS signature verification failed")]
+    SignatureMismatch,
     #[error("downloaded binary failed the smoke test")]
     SmokeTest,
     #[error("this platform has no release archive naming scheme")]
@@ -224,6 +239,7 @@ impl UpdateError {
             Self::InvalidResponse => "HK-UPD-JSON",
             Self::MissingAsset => "HK-UPD-ASSET",
             Self::ChecksumMismatch => "HK-UPD-HASH",
+            Self::SignatureMismatch => "HK-UPD-SIG",
             Self::SmokeTest => "HK-UPD-SMOKE",
             Self::UnsupportedPlatform => "HK-UPD-PLATFORM",
             Self::Busy => "HK-UPD-BUSY",

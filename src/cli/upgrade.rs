@@ -159,7 +159,7 @@ fn run_with_io(
         .map_err(update_failure)?;
     match outcome {
         UpgradeOutcome::Upgraded { from, to } => {
-            writeln!(output, "SHA256 校验与冒烟测试通过")?;
+            writeln!(output, "签名、SHA256 校验与冒烟测试通过")?;
             writeln!(output, "升级完成：v{from} → v{to}，下次启动生效")?;
             writeln!(output, "后续默认更新通道：{}", Channel::for_version(&to))?;
             Ok(())
@@ -244,7 +244,7 @@ mod tests {
     use super::*;
     use crate::update::test_support::{
         archive_asset, build_archive, json_reply, raw_reply, release_json, sha256sums_for,
-        spawn_server, write_stub_binary,
+        sign_checksums, spawn_server, write_stub_binary,
     };
 
     fn stable_args() -> UpgradeArgs {
@@ -284,7 +284,8 @@ mod tests {
         }
     }
 
-    /// Serves the release lookup, archive, and SHA256SUMS for a confirmed upgrade.
+    /// Serves the release lookup, archive, SHA256SUMS, and detached signature
+    /// for a confirmed upgrade.
     fn serve_full_upgrade(version: &str, requests: usize) -> (String, std::thread::JoinHandle<()>) {
         let archive = build_archive(&format!("#!/bin/sh\necho hokan {version}\n"));
         let sums = sha256sums_for(&[(
@@ -292,6 +293,7 @@ mod tests {
             &archive_asset(version),
         )])
         .into_bytes();
+        let signature = sign_checksums(&sums);
         let archive_name = archive_asset(version);
         let tag = format!("v{version}");
         spawn_server(requests, move |path| {
@@ -302,6 +304,8 @@ mod tests {
                 raw_reply("200 OK", archive.clone())
             } else if path == "/download/SHA256SUMS" {
                 raw_reply("200 OK", sums.clone())
+            } else if path == "/download/SHA256SUMS.sig" {
+                raw_reply("200 OK", signature.clone())
             } else {
                 raw_reply("404 Not Found", Vec::new())
             }
@@ -368,14 +372,17 @@ mod tests {
     #[test]
     fn interactive_confirm_yes_upgrades() {
         let root = tempfile::tempdir().expect("tempdir");
-        let (base, join) = serve_full_upgrade("9.9.9", 3);
+        let (base, join) = serve_full_upgrade("9.9.9", 4);
         let paths = test_paths(root.path());
         let upgrade_paths = make_upgrade_paths(root.path(), &base);
 
         let (result, output, _) = run_scripted("y\n", true, &paths, &upgrade_paths, &stable_args());
         result.expect("upgrade run");
         assert!(output.contains("确认升级？[Y/n]"), "{output}");
-        assert!(output.contains("SHA256 校验与冒烟测试通过"), "{output}");
+        assert!(
+            output.contains("签名、SHA256 校验与冒烟测试通过"),
+            "{output}"
+        );
         assert!(
             output.contains(&format!(
                 "升级完成：v{} → v9.9.9，下次启动生效",
@@ -460,7 +467,7 @@ mod tests {
             )
             .expect("legacy pin");
             let before = fs::read(&paths.config_file).expect("config");
-            let (base, join) = serve_full_upgrade(version, 3);
+            let (base, join) = serve_full_upgrade(version, 4);
             let upgrade_paths = make_upgrade_paths(root.path(), &base);
             if auto {
                 assert_eq!(run_auto(&paths, &upgrade_paths), 0);
@@ -489,7 +496,7 @@ mod tests {
     #[test]
     fn channel_override_never_writes_config_on_success_cancel_failure_or_no_upgrade() {
         for (version, answer, yes, force, requests) in [
-            ("9.9.9-beta.1", "", true, false, 3),
+            ("9.9.9-beta.1", "", true, false, 4),
             ("9.9.9-beta.1", "n\n", false, false, 1),
             ("0.0.1-beta.1", "", true, true, 1),
         ] {
@@ -670,8 +677,9 @@ mod tests {
         let archive = build_archive(&format!("#!/bin/sh\necho hokan {version}\n"));
         let name = archive_asset(version);
         let sums = sha256sums_for(&[(&format!("{:x}", Sha256::digest(&archive)), &name)]);
+        let signature = sign_checksums(sums.as_bytes());
         let tracks_beta = Channel::current() == Channel::Beta;
-        let (base, join) = spawn_server(if tracks_beta { 3 } else { 1 }, move |path| {
+        let (base, join) = spawn_server(if tracks_beta { 4 } else { 1 }, move |path| {
             if path.contains("releases?") {
                 json_reply(
                     "200 OK",
@@ -684,6 +692,8 @@ mod tests {
                 raw_reply("200 OK", archive.clone())
             } else if path.ends_with("/SHA256SUMS") {
                 raw_reply("200 OK", sums.as_bytes().to_vec())
+            } else if path.ends_with("/SHA256SUMS.sig") {
+                raw_reply("200 OK", signature.clone())
             } else {
                 raw_reply("404 Not Found", Vec::new())
             }

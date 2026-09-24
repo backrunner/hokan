@@ -407,25 +407,47 @@ pub(super) struct SelectionIntent {
 /// Content identity of a candidate row: two queries for different buffer
 /// revisions agree on it while per-query candidate ids never match.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct SelectionKey {
-    source: crate::completion::CandidateSource,
-    primary: String,
-    replacement: Option<String>,
+pub(super) enum SelectionKey {
+    ResultingBuffer(String),
+    Action {
+        source: crate::completion::CandidateSource,
+        primary: String,
+    },
 }
 
 impl SelectionKey {
-    fn of(candidate: &Candidate) -> Self {
-        Self {
-            source: candidate.source,
-            primary: candidate.display.primary.clone(),
-            replacement: candidate.edit.as_ref().map(|edit| edit.replacement.clone()),
+    fn of(candidate: &Candidate, buffer: &str) -> Option<Self> {
+        match &candidate.edit {
+            Some(edit) => crate::parser::apply_edit(buffer, edit.range.clone(), &edit.replacement)
+                .ok()
+                .map(Self::ResultingBuffer),
+            None => Some(Self::Action {
+                source: candidate.source,
+                primary: candidate.display.primary.clone(),
+            }),
         }
     }
 
-    pub(super) fn matches(&self, candidate: &Candidate) -> bool {
-        self.source == candidate.source
-            && self.primary == candidate.display.primary
-            && self.replacement.as_ref() == candidate.edit.as_ref().map(|edit| &edit.replacement)
+    pub(super) fn matches(&self, candidate: &Candidate, buffer: &str) -> bool {
+        match (self, &candidate.edit) {
+            (Self::ResultingBuffer(resulting), Some(edit)) => {
+                let (Some(before), Some(after)) =
+                    (buffer.get(..edit.range.start), buffer.get(edit.range.end..))
+                else {
+                    return false;
+                };
+                edit.range.start <= edit.range.end
+                    && before
+                        .bytes()
+                        .chain(edit.replacement.bytes())
+                        .chain(after.bytes())
+                        .eq(resulting.bytes())
+            }
+            (Self::Action { source, primary }, None) => {
+                *source == candidate.source && *primary == candidate.display.primary
+            }
+            _ => false,
+        }
     }
 }
 
@@ -466,7 +488,17 @@ pub(super) fn move_selection(state: &mut RuntimeState, delta: isize) {
         } else {
             delta
         },
-        key: Some(SelectionKey::of(&state.candidates[next])),
+        // Dedupe can retain a different source and edit range in a later
+        // batch. Identify the command produced by the edit, as ranking does.
+        key: SelectionKey::of(
+            &state.candidates[next],
+            state
+                .candidates_context
+                .as_ref()
+                .map_or(state.buffer.text.as_str(), |context| {
+                    context.buffer.text.as_ref()
+                }),
+        ),
     });
 }
 
@@ -506,7 +538,7 @@ pub(super) fn landing_row(candidate_count: usize, page_size: usize, delta: isize
         0
     } else if delta == -1 {
         candidate_count - 1
-    } else if delta > 1 {
+    } else if delta < -1 {
         (candidate_count - 1) / page_size * page_size
     } else {
         0

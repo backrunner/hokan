@@ -114,14 +114,17 @@ terminal; it refuses to run when they are not.
 .TP
 .BI "upgrade " [--check] [--channel stable|beta] [--force] [--yes]
 Check GitHub releases for a newer version and install it: download the
-target archive, verify it against SHA256SUMS, smoke-test the binary, back
+target archive, verify the Ed25519-signed SHA256SUMS and archive digest,
+smoke-test the binary, back
 the current one up as hokan.bak, and atomically replace it. Without flags
 the command asks for confirmation interactively and requires a terminal.
 .B --check
 only reports availability;
 .B --channel
-persists the release channel (stable releases, or beta pre-releases)
-before upgrading. Automatic background updates use the same code path and
+selects the release channel for this invocation (stable releases, or beta pre-releases).
+Missing or invalid signatures are rejected even with --force.
+HOKAN_UPDATE_MIRRORS overrides the HTTPS relay templates used after GitHub fails;
+an empty value disables mirrors. Automatic background updates use the same code path and
 are controlled by the
 .B [update]
 config section and the HOKAN_NO_AUTO_UPDATE environment variable.
@@ -153,15 +156,17 @@ and Ctrl-D retain their normal shell semantics and close the current session.
 .SH DEFAULT KEYS
 .TP
 .B Up, Down
-Move the current selection. When the overlay is closed at an editable prompt,
+Move the current selection, wrapping at either end. When the overlay is closed at an editable prompt,
 open Hokan's history-only list without installing or replacing shell key
 bindings. In this history list, Up recalls older entries and Down returns to
 newer entries, wrapping at either end. The newest entry appears at the bottom.
-The list respects completion.max_candidates and the current directory and
+The list respects completion.max_candidates (0 by default, retaining all matches) and the current directory and
 input prefix filters.
 .TP
 .B PageUp, PageDown
 Move the current selection by one page, wrapping at either end.
+With no selection, PageDown selects the first row and PageUp selects the first
+row of the last page. The visible page height is controlled by ui.max_rows.
 .TP
 .B Enter
 With no selection, execute the command exactly as typed: the overlay is

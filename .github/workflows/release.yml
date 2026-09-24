@@ -95,9 +95,18 @@ jobs:
           merge-multiple: true
       - name: Add release installer
         run: install -m 0755 scripts/install.sh dist/hokan-installer.sh
-      - name: Generate checksums
+      - name: Generate checksums and detached signature
         working-directory: dist
-        run: sha256sum *.tar.gz *.spdx.json hokan-installer.sh > SHA256SUMS
+        env:
+          HOKAN_RELEASE_SIGNING_KEY: ${{ secrets.HOKAN_RELEASE_SIGNING_KEY }}
+        run: |
+          sha256sum -- *.tar.gz *.spdx.json hokan-installer.sh > SHA256SUMS
+          test -n "$HOKAN_RELEASE_SIGNING_KEY"
+          umask 077
+          key_file=$(mktemp "$RUNNER_TEMP/hokan-release-key.XXXXXX")
+          trap 'rm -f -- "$key_file"' EXIT
+          printf '%s\n' "$HOKAN_RELEASE_SIGNING_KEY" > "$key_file"
+          bash ../scripts/sign-release.sh SHA256SUMS "$key_file"
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}

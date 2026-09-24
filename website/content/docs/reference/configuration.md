@@ -73,7 +73,7 @@ Use `disabled` to turn off a binding. Enabled bindings cannot conflict. See [you
 ```toml
 [completion]
 local_timeout_ms = 100
-max_candidates = 1000
+max_candidates = 0 # Keep all matching candidates
 cd_enter_behavior = "execute"
 
 [history]
@@ -82,7 +82,7 @@ max_command_bytes = 16384
 exclude = []
 ```
 
-Completion timeout accepts `10–5000` milliseconds; the candidate limit accepts `10–10000`. History's command size limit accepts `100–100000` bytes. History exclusions use regular expressions. Local command history can contain sensitive text, so treat it as private data.
+The incremental completion budget accepts `10–5000` milliseconds. Reaching it publishes the current batch while remaining sources continue. The candidate limit defaults to `0` (all matches); an explicit `10–10000` limit still caps the list. Existing configurations with `max_candidates = 1000` retain that cap; set it to `0` to browse all matches. `ui.max_rows` controls the visible page height, and arrow and page keys wrap through the list. History's command size limit accepts `100–100000` bytes. History exclusions use regular expressions. Local command history can contain sensitive text, so treat it as private data.
 
 `cd_enter_behavior` controls `Enter` on a selected directory candidate for `cd`:
 

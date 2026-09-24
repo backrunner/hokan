@@ -2,7 +2,7 @@
 //!
 //! The sequence is deliberately ordered so a failure at any step leaves the
 //! current executable untouched: writability probe → installation lock →
-//! download → SHA256 check against the published SHA256SUMS → extract → smoke test →
+//! download → Ed25519 signature and SHA256 checks → extract → smoke test →
 //! `{exe}.bak` backup → atomic rename.
 
 use std::{
@@ -12,6 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use ed25519_dalek::{Signature, VerifyingKey};
 use fs2::FileExt;
 use semver::Version;
 use sha2::{Digest, Sha256};
@@ -25,8 +26,12 @@ use super::{
 /// make us buffer unbounded data.
 const DOWNLOAD_MAX_BYTES: usize = 64 * 1024 * 1024;
 const CHECKSUMS_MAX_BYTES: usize = 1024 * 1024;
+const SIGNATURE_MAX_BYTES: usize = 128;
 const SMOKE_TIMEOUT: Duration = Duration::from_secs(10);
 const SMOKE_MAX_OUTPUT: usize = 4 * 1024;
+
+// One reviewed trust root, shared by the release signing script and verifier.
+const RELEASE_SIGNING_PUBLIC_KEY: &str = include_str!("../../assets/update-signing-key.hex");
 
 pub(crate) fn download_and_install(
     release: &ReleaseInfo,
@@ -90,7 +95,21 @@ pub(crate) fn download_and_install(
         .into_temp_path();
 
     let client = api::download_client()?;
-    let archive = api::block_on(api::download(
+    let checksums = api::block_on(api::download_with_fallback(
+        &client,
+        &release.checksums_url,
+        CHECKSUMS_MAX_BYTES,
+    ))??;
+    let signature = api::block_on(api::download_with_fallback(
+        &client,
+        &release.signature_url,
+        SIGNATURE_MAX_BYTES,
+    ))??;
+    verify_checksums_signature(&checksums, &signature)?;
+    let checksums = String::from_utf8(checksums).map_err(|_| UpdateError::InvalidResponse)?;
+    let expected =
+        expected_sha256(&checksums, &archive_name).ok_or(UpdateError::InvalidResponse)?;
+    let archive = api::block_on(api::download_with_fallback(
         &client,
         &release.archive_url,
         DOWNLOAD_MAX_BYTES,
@@ -98,14 +117,6 @@ pub(crate) fn download_and_install(
     archive_file.write_all(&archive)?;
     archive_file.as_file().sync_all()?;
 
-    let checksums = api::block_on(api::download(
-        &client,
-        &release.checksums_url,
-        CHECKSUMS_MAX_BYTES,
-    ))??;
-    let checksums = String::from_utf8(checksums).map_err(|_| UpdateError::InvalidResponse)?;
-    let expected =
-        expected_sha256(&checksums, &archive_name).ok_or(UpdateError::InvalidResponse)?;
     let actual = format!("{:x}", Sha256::digest(&archive));
     if !actual.eq_ignore_ascii_case(&expected) {
         return Err(UpdateError::ChecksumMismatch);
@@ -138,14 +149,73 @@ pub(crate) fn download_and_install(
     })
 }
 
-/// Finds the expected hex digest for `archive_name` in a SHA256SUMS file.
+fn release_public_key() -> Result<[u8; 32], UpdateError> {
+    let hex = RELEASE_SIGNING_PUBLIC_KEY.trim();
+    if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(UpdateError::SignatureMismatch);
+    }
+    let mut bytes = [0; 32];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16)
+            .map_err(|_| UpdateError::SignatureMismatch)?;
+    }
+    Ok(bytes)
+}
+
+fn verify_with_key(
+    checksums: &[u8],
+    signature: &[u8],
+    public_key: &[u8; 32],
+) -> Result<(), UpdateError> {
+    let key = VerifyingKey::from_bytes(public_key).map_err(|_| UpdateError::SignatureMismatch)?;
+    let signature = Signature::from_slice(signature).map_err(|_| UpdateError::SignatureMismatch)?;
+    key.verify_strict(checksums, &signature)
+        .map_err(|_| UpdateError::SignatureMismatch)
+}
+
+fn verify_checksums_signature(checksums: &[u8], signature: &[u8]) -> Result<(), UpdateError> {
+    let public_key = release_public_key()?;
+    // Unit fixtures use a separate disposable key; never accept it in a
+    // production build. The production trust root is exercised below too.
+    #[cfg(test)]
+    let public_key = {
+        assert_ne!(
+            public_key,
+            crate::update::test_support::signing_key()
+                .verifying_key()
+                .to_bytes()
+        );
+        crate::update::test_support::signing_key()
+            .verifying_key()
+            .to_bytes()
+    };
+    verify_with_key(checksums, signature, &public_key)
+}
+
+/// Exactly one valid digest must bind this version and target's archive name.
 fn expected_sha256(checksums: &str, archive_name: &str) -> Option<String> {
-    checksums.lines().find_map(|line| {
+    let mut expected = None;
+    for line in checksums.lines() {
         let mut parts = line.split_whitespace();
-        let hash = parts.next()?;
-        let name = parts.next()?;
-        (name.trim_start_matches('*') == archive_name).then(|| hash.to_owned())
-    })
+        let Some(hash) = parts.next() else {
+            continue;
+        };
+        let Some(name) = parts.next() else {
+            continue;
+        };
+        if name.strip_prefix('*').unwrap_or(name) != archive_name {
+            continue;
+        }
+        if expected.is_some()
+            || parts.next().is_some()
+            || hash.len() != 64
+            || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return None;
+        }
+        expected = Some(hash.to_owned());
+    }
+    expected
 }
 
 /// Extracts `bin/hokan` from the tar.gz archive to `staged`, mode 0755.
@@ -277,8 +347,8 @@ mod regressions;
 mod tests {
     use super::*;
     use crate::update::test_support::{
-        archive_asset, build_archive, serve_release, serve_release_with, sha256sums_for,
-        write_stub_binary,
+        archive_asset, build_archive, raw_reply, serve_release, serve_release_with, sha256sums_for,
+        sign_checksums, spawn_server, write_stub_binary,
     };
 
     pub(super) fn upgrade_paths(root: &Path, base: &str) -> (UpgradePaths, PathBuf) {
@@ -304,6 +374,7 @@ mod tests {
             tag: format!("v{version}"),
             archive_url: format!("{base}/download/{}", archive_asset(version)),
             checksums_url: format!("{base}/download/SHA256SUMS"),
+            signature_url: format!("{base}/download/SHA256SUMS.sig"),
         }
     }
 
@@ -428,11 +499,109 @@ mod tests {
 
     #[test]
     fn expected_sha256_matches_by_archive_name() {
-        let sums = sha256sums_for(&[("deadbeef", "hokan-1.0.0-aarch64-apple-darwin.tar.gz")]);
+        let sums = sha256sums_for(&[(&"ab".repeat(32), "hokan-1.0.0-aarch64-apple-darwin.tar.gz")]);
         assert_eq!(
             expected_sha256(&sums, "hokan-1.0.0-aarch64-apple-darwin.tar.gz"),
-            Some("deadbeef".to_owned())
+            Some("ab".repeat(32))
         );
         assert_eq!(expected_sha256(&sums, "hokan-9.9.9-other.tar.gz"), None);
+    }
+
+    #[test]
+    fn signed_checksums_are_required_before_hash_matching() {
+        let sums = b"deadbeef  hokan-1.0.0-aarch64-apple-darwin.tar.gz\n";
+        let signature = sign_checksums(sums);
+        assert!(verify_checksums_signature(sums, &signature).is_ok());
+        let mut changed = signature;
+        changed[0] ^= 1;
+        assert!(matches!(
+            verify_checksums_signature(sums, &changed),
+            Err(UpdateError::SignatureMismatch)
+        ));
+    }
+
+    #[test]
+    fn actual_production_public_key_verifies_only_its_own_signature() {
+        let message = b"hokan update signing key verification fixture\n";
+        let key = release_public_key().expect("production public key");
+        let signature = include_bytes!("fixtures/trust-root.sig");
+        assert!(verify_with_key(message, signature, &key).is_ok());
+        assert!(verify_with_key(b"tampered", signature, &key).is_err());
+        assert!(verify_with_key(message, &sign_checksums(message), &key).is_err());
+    }
+
+    #[test]
+    fn forged_checksums_cannot_authorize_even_a_matching_poisoned_archive() {
+        for mutation in [
+            "tampered_sums",
+            "wrong_key",
+            "short_signature",
+            "missing_signature",
+        ] {
+            let root = tempfile::tempdir().expect("root");
+            let marker = root.path().join("poison-executed");
+            let poisoned = build_archive(&format!(
+                "#!/bin/sh\ntouch '{}'\necho hokan 9.9.9\n",
+                marker.display()
+            ));
+            let sums = sha256sums_for(&[(
+                &format!("{:x}", Sha256::digest(&poisoned)),
+                &archive_asset("9.9.9"),
+            )])
+            .into_bytes();
+            let signature = match mutation {
+                "tampered_sums" => sign_checksums(b"authentic checksum list"),
+                "wrong_key" => {
+                    use ed25519_dalek::Signer;
+                    ed25519_dalek::SigningKey::from_bytes(&[0x24; 32])
+                        .sign(&sums)
+                        .to_bytes()
+                        .to_vec()
+                }
+                _ => vec![0; 63],
+            };
+            let (base, join) = spawn_server(2, move |path| match path {
+                "/download/SHA256SUMS" => raw_reply("200 OK", sums.clone()),
+                "/download/SHA256SUMS.sig" if mutation == "missing_signature" => {
+                    raw_reply("404 Not Found", Vec::new())
+                }
+                "/download/SHA256SUMS.sig" => raw_reply("200 OK", signature.clone()),
+                _ => panic!("must reject before downloading the archive"),
+            });
+            let (paths, exe) = upgrade_paths(root.path(), &base);
+            let before = fs::read(&exe).expect("original");
+            assert!(
+                download_and_install(&release(&base, "9.9.9"), &paths, &Version::new(0, 1, 0))
+                    .is_err()
+            );
+            join.join().expect("server");
+            assert_eq!(fs::read(exe).expect("unchanged"), before);
+            assert!(!marker.exists());
+            assert!(!root.path().join("bin/hokan.bak").exists());
+        }
+    }
+
+    #[test]
+    fn signed_checksum_list_binds_exact_version_and_target() {
+        for filename in [
+            "hokan-1.0.0-wrong-target.tar.gz",
+            "hokan-0.0.1-aarch64-apple-darwin.tar.gz",
+        ] {
+            let sums = sha256sums_for(&[(&"ab".repeat(32), filename)]);
+            assert!(
+                verify_checksums_signature(sums.as_bytes(), &sign_checksums(sums.as_bytes()))
+                    .is_ok()
+            );
+            assert_eq!(expected_sha256(&sums, &archive_asset("9.9.9")), None);
+        }
+        let name = archive_asset("9.9.9");
+        for sums in [
+            format!("deadbeef  {name}\n"),
+            format!("{}  {name}\n", "z".repeat(64)),
+            format!("{}  {name} extra\n", "ab".repeat(32)),
+            sha256sums_for(&[(&"ab".repeat(32), &name), (&"cd".repeat(32), &name)]),
+        ] {
+            assert_eq!(expected_sha256(&sums, &name), None);
+        }
     }
 }

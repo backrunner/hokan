@@ -267,14 +267,21 @@ HTTP 403 可能是 GitHub 出口 IP 限流，也可能是代理/网关拒绝访�
 
 `hokan upgrade` 与后台自动更新共用同一条链路，错误码如下：
 
+直连失败后，检查 API 依次尝试 gh-proxy.com、gh-api.p3terx.com；
+归档和签名下载依次尝试 gh-proxy.com、ghproxy.net。可用
+`HOKAN_UPDATE_MIRRORS='https://mirror.example/{url}'` 指定候选（最多四个，
+逗号分隔，覆盖默认），设为空字符串则仅直连。自定义镜像必须支持需要的 API
+及 release 资产路径。校验失败不会降级为未签名安装；请不要绕过签名检查。
+
 | 错误码 | 含义与处理 |
 | --- | --- |
 | `HK-UPD-CHANNEL` | 渠道名无效；只支持 `stable` / `beta` |
 | `HK-UPD-NET` / `HK-UPD-TIMEOUT` | 网络失败或超时；检查网络/代理后重试 |
 | `HK-UPD-HTTP` | HTTP 请求被拒绝（附状态码）；提示限流时按等待时间重试，普通 403 检查网络出口与代理，407 检查代理认证 |
 | `HK-UPD-JSON` | release 响应无法解析 |
-| `HK-UPD-ASSET` | 当前平台（target）的归档或 SHA256SUMS 不在该 release 中 |
+| `HK-UPD-ASSET` | 当前平台（target）的归档、SHA256SUMS 或签名不在该 release 中 |
 | `HK-UPD-HASH` | 下载的归档与 SHA256SUMS 不匹配；请重试，持续出现请上报 |
+| `HK-UPD-SIG` | SHA256SUMS 的 Ed25519 签名不匹配；候选发布或镜像被拒绝 |
 | `HK-UPD-SMOKE` | 新二进制 `--version` 冒烟测试未通过，未替换 |
 | `HK-UPD-PLATFORM` | 不支持的 OS/架构组合 |
 | `HK-UPD-BUSY` | 另一个更新持有安装锁超过 5 秒；稍后重试 |

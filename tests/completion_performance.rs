@@ -10,7 +10,7 @@ use hokan::{
     terminal::{BufferRevision, QueryId, RiskLevel},
 };
 
-struct FixtureProvider(usize);
+struct FixtureProvider(usize, usize);
 
 impl CandidateProvider for FixtureProvider {
     fn id(&self) -> &'static str {
@@ -23,7 +23,7 @@ impl CandidateProvider for FixtureProvider {
 
     fn complete(&self, context: &CompletionContext) -> ProviderOutput {
         ProviderOutput {
-            candidates: (0..64)
+            candidates: (0..self.1)
                 .map(|row| {
                     Candidate::new(
                         context.query_id,
@@ -49,9 +49,19 @@ impl CandidateProvider for FixtureProvider {
 #[test]
 #[ignore = "manual release-mode completion pipeline benchmark"]
 fn completion_pipeline_throughput() {
-    let mut engine = CompletionEngine::new(100, 8);
-    for index in 0..8 {
-        engine.register(FixtureProvider(index));
+    measure_pipeline(8, 64, 100);
+}
+
+#[test]
+#[ignore = "manual release-mode unlimited completion pipeline benchmark"]
+fn unlimited_completion_pipeline_throughput() {
+    measure_pipeline(8, 256, 0);
+}
+
+fn measure_pipeline(sources: usize, rows_per_source: usize, limit: usize) {
+    let mut engine = CompletionEngine::new(limit, 8);
+    for index in 0..sources {
+        engine.register(FixtureProvider(index, rows_per_source));
     }
     let context = CompletionContext::new(
         QueryId::new(1),
@@ -72,7 +82,12 @@ fn completion_pipeline_throughput() {
             |output, final_batch| {
                 batches += 1;
                 if final_batch {
-                    assert_eq!(output.candidates.len(), 100);
+                    let expected = if limit == 0 {
+                        sources * rows_per_source
+                    } else {
+                        limit
+                    };
+                    assert_eq!(output.candidates.len(), expected);
                 }
                 black_box(output);
             },
@@ -82,7 +97,7 @@ fn completion_pipeline_throughput() {
     }
     durations.sort_unstable();
     eprintln!(
-        "8 sources x 64 candidates, 1000 queries: p50={:?}, p95={:?}, batches/query={:.2}",
+        "{sources} sources x {rows_per_source} candidates, limit={limit}, 1000 queries: p50={:?}, p95={:?}, batches/query={:.2}",
         durations[500],
         durations[950],
         batches as f64 / 1_000.0,

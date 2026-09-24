@@ -221,7 +221,7 @@ pub(super) fn handle_provider_result(
                     state
                         .candidates
                         .iter()
-                        .find(|candidate| key.matches(candidate))
+                        .find(|candidate| key.matches(candidate, &result.context.buffer.text))
                         .map(|candidate| candidate.id)
                 })
                 .or_else(|| {

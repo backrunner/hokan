@@ -1,6 +1,6 @@
 [package]
 name = "hokan"
-version = "0.1.0-beta.15"
+version = "0.1.0-beta.16"
 edition = "2024"
 rust-version = "1.96"
 description = "A shell-aware terminal completion overlay"
@@ -23,6 +23,7 @@ include = [
     "/README.md",
     "/scripts/install.sh",
     "/scripts/package-release.sh",
+    "/scripts/sign-release.sh",
 ]
 
 [dependencies]
@@ -31,6 +32,7 @@ clap = { version = "4.6.5", features = ["derive"] }
 crossbeam-channel = "0.5.15"
 crc32fast = "1.5.0"
 crossterm = "0.29.0"
+ed25519-dalek = "3.0.0"
 flate2 = "1"
 fs2 = "0.4.3"
 getrandom = "0.3.3"

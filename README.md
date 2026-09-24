@@ -196,7 +196,7 @@ Hokan merges and ranks candidates from several independent providers:
 | --- | --- |
 | Shell history | zsh, bash, and fish history with fuzzy search and failure penalties |
 | Command specs | Built-in recipes, flags, subcommands, argument slots, and risk levels |
-| Help pages | Read-only extraction from man pages for commands without a built-in spec |
+| Help pages | Documented flags and subcommands from help and man pages, supplementing built-in recipes |
 | Filesystem | Files, directories, executable scripts, quoting, spaces, and Unicode paths |
 | Project metadata | npm, pnpm, yarn, bun, Deno, Cargo, Make, just, and workspace members |
 | Git state | Contextual `init`, `clone`, `status`, `add`, `commit`, `push`, `pull`, and more |
@@ -208,13 +208,19 @@ Hokan merges and ranks candidates from several independent providers:
 
 | Key | Action |
 | --- | --- |
-| `Up` / `Down` | Move the selection |
-| `PageUp` / `PageDown` | Move between pages |
+| `Up` / `Down` | Move the selection, wrapping at either end |
+| `PageUp` / `PageDown` | Move between pages, wrapping at either end |
 | `Tab` | Insert the selected or highest-ranked candidate; never execute it |
 | `Enter` | Run typed input, or run the explicitly selected candidate |
 | `Esc` | Close the overlay or cancel an AI request |
 | `Ctrl-R` | Toggle the history-focused view |
 | `Shift-Tab` | Show or hide the completion list |
+
+Matching candidates are kept in full by default; `ui.max_rows` controls the
+visible page height. Existing configurations with a nonzero
+`completion.max_candidates` still cap the list. Set it to `0` to keep all
+matches. With no selection, PageDown selects the first row and PageUp selects
+the first row of the last page.
 
 ## Shell and theme compatibility
 
@@ -381,8 +387,10 @@ hokan upgrade --check
 ```
 
 Writable release-installer binaries can update themselves from GitHub
-releases. Updates download the matching archive, verify `SHA256SUMS`, run a
-binary smoke test, back up the current executable, and replace it atomically.
+releases. Updates download the matching archive, verify the Ed25519 signature
+of `SHA256SUMS` and then its archive digest, run a binary smoke test, back up
+the current executable, and replace it atomically. Releases without the
+detached `SHA256SUMS.sig` asset are rejected.
 
 ```bash
 hokan upgrade
@@ -426,6 +434,27 @@ these environment variables. Use `NO_PROXY=localhost,127.0.0.1,::1` to keep loca
 AI endpoints direct. PAC scripts and macOS proxy exception lists are not
 evaluated; use explicit proxy variables and `NO_PROXY` for those setups.
 A macOS SOCKS-only system setting also needs an explicit proxy variable.
+
+Update checks try GitHub directly first, then `gh-proxy.com` and
+`gh-api.p3terx.com` if the request fails. Asset downloads fall back to
+`gh-proxy.com` and `ghproxy.net`. Set `HOKAN_UPDATE_MIRRORS` to replace
+these defaults with up to four comma- or newline-separated HTTPS templates;
+`{url}` expands to the complete GitHub URL and `{path}` to its path and
+query. An empty value disables mirrors. For example:
+
+```bash
+HOKAN_UPDATE_MIRRORS='https://mirror.example/{url}' hokan upgrade --check
+HOKAN_UPDATE_MIRRORS='' hokan upgrade --check
+```
+
+Mirrors are untrusted transports. The pinned Ed25519 key authenticates
+`SHA256SUMS` before downloading or executing an archive; the checksum entry
+binds its exact version and platform. Missing or invalid signatures always
+stop installation, including with `--force`. A mirror can still withhold
+releases or return stale version listings; checks do not prove freshness.
+The initial shell installer continues to download directly from GitHub;
+signature enforcement applies to manual and automatic self-updates after
+installing this version.
 
 An update HTTP 403 can come from GitHub rate limiting or a proxy/gateway
 denial. Hokan identifies rate limits from response headers and reports the
