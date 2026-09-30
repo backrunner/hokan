@@ -1,0 +1,17 @@
+Usage: aipass vault [OPTIONS] <COMMAND>
+
+Commands:
+  status
+  change-password
+  rotate
+  devices
+  revoke-device
+  export
+  import
+  help             Print this message or the help of the given subcommand(s)
+
+Options:
+      --json
+      --vault <VAULT>        [env: AIPASS_VAULT_DIR=]
+      --password <PASSWORD>  [env: AIPASS_MASTER_PASSWORD=]
+  -h, --help                 Print help

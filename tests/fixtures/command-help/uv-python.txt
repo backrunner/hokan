@@ -1,0 +1,12 @@
+Usage: uv python [OPTIONS] <COMMAND>
+Commands:
+  list          List the available Python installations
+  install       Download and install Python versions
+  upgrade       Upgrade installed Python versions
+  find          Search for a Python installation
+  pin           Pin to a specific Python version
+  dir           Show the uv Python installation directory
+  uninstall     Uninstall Python versions
+  update-shell  Ensure that the Python executable directory is on the `PATH`
+
+Cache options:

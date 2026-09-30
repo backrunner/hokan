@@ -1,0 +1,24 @@
+bun pm: Package manager utilities
+
+  bun pm pack               create a tarball of the current workspace
+  ├  --dry-run              do everything except for writing the tarball to disk
+  ├  --destination          the directory the tarball will be saved in
+  ├  --ignore-scripts       don't run pre/postpack and prepare scripts
+  └  --gzip-level           specify a custom compression level for gzip (0-9, default is 9)
+  bun pm bin                print the path to bin folder
+  └  -g                     print the global path to bin folder
+  bun pm ls                 list the dependency tree according to the current lockfile
+  └  --all                  list the entire dependency tree according to the current lockfile
+  bun pm whoami             print the current npm username
+  bun pm hash               generate & print the hash of the current lockfile
+  bun pm hash-string        print the string used to hash the lockfile
+  bun pm hash-print         print the hash stored in the current lockfile
+  bun pm cache              print the path to the cache folder
+  bun pm cache rm           clear the cache
+  bun pm migrate            migrate another package manager's lockfile without installing anything
+  bun pm untrusted          print current untrusted dependencies with scripts
+  bun pm trust names ...    run scripts for untrusted dependencies and add to `trustedDependencies`
+  └  --all                  trust all untrusted dependencies
+  bun pm default-trusted    print the default trusted dependencies list
+
+Learn more about these at https://bun.sh/docs/cli/pm

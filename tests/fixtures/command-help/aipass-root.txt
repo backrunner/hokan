@@ -1,0 +1,41 @@
+Local-first AI Provider credential manager
+
+Usage: aipass [OPTIONS] <COMMAND>
+
+Commands:
+  doctor
+  completions
+  vault
+  secret
+  accounts
+  native-host
+  agent
+  proxy
+  unlock       Unlock the vault with master password
+  lock
+  init
+  add          Add a provider credential to the vault [aliases: credential, credentials]
+  list
+  update
+  archive
+  restore
+  delete
+  search
+  probe
+  get
+  copy
+  env
+  inject
+  exec
+  configure
+  switch
+  rollback
+  sync
+  help         Print this message or the help of the given subcommand(s)
+
+Options:
+      --json
+      --vault <VAULT>        [env: AIPASS_VAULT_DIR=]
+      --password <PASSWORD>  [env: AIPASS_MASTER_PASSWORD=]
+  -h, --help                 Print help
+  -V, --version              Print version

@@ -1,0 +1,9 @@
+Usage: pnpm store [OPTIONS] <COMMAND>
+Commands:
+  status  Checks for modified packages in the store. Returns exit code 0 if the content of the package is the same as it was at the time of unpacking
+  add     Functionally equivalent to pnpm add, except this adds new packages to the store directly without modifying any projects or files outside of the store
+  prune   Removes unreferenced packages from the store. Unreferenced packages are packages that are not used by any projects on the system. Packages can become unreferenced after most installation operations, for instance when dependencies are made redundant
+  path    Returns the path to the active store directory
+  help    Print this message or the help of the given subcommand(s)
+
+Options:

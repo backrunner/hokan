@@ -1,0 +1,28 @@
+Usage: bun <command> [...flags] [...args]
+Commands:
+  run       ./my-script.ts       Execute a file with Bun
+            lint                 Run a package.json script
+  test                           Run unit tests with Bun
+  x         eslint               Execute a package binary (CLI), installing if needed (bunx)
+  repl                           Start a REPL session with Bun
+  exec                           Run a shell script directly with Bun
+
+  install                        Install dependencies for a package.json (bun i)
+  add       lyra                 Add a dependency to package.json (bun a)
+  remove    is-array             Remove a dependency from package.json (bun rm)
+  update    @remix-run/dev       Update outdated dependencies
+  outdated                       Display latest versions of outdated dependencies
+  link      [<package>]          Register or link a local npm package
+  unlink                         Unregister a local npm package
+  publish                        Publish a package to the npm registry
+  patch <pkg>                    Prepare a package for patching
+  pm <subcommand>                Additional package management utilities
+
+  build     ./a.ts ./b.jsx       Bundle TypeScript & JavaScript into a single file
+
+  init                           Start an empty Bun project from a blank template
+  create    vite                 Create a new project from a template (bun c)
+  upgrade                        Upgrade to latest version of Bun.
+  <command> --help               Print help text for command.
+
+Flags:

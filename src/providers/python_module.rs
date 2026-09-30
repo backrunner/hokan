@@ -36,7 +36,6 @@ const PROJECT_SCAN_BUDGET: Duration = Duration::from_millis(40);
 const ENVIRONMENT_ENTRY_LIMIT: usize = 12_000;
 const PROJECT_ENTRY_LIMIT: usize = 3_000;
 const MODULE_DEPTH_LIMIT: usize = 6;
-const MODULE_CANDIDATE_LIMIT: usize = 500;
 const PTH_FILE_LIMIT: usize = 128;
 const PTH_MAX_BYTES: u64 = 256 * 1024;
 
@@ -212,7 +211,6 @@ impl CandidateProvider for PythonModuleProvider {
         });
         let candidates = modules
             .into_iter()
-            .take(MODULE_CANDIDATE_LIMIT)
             .enumerate()
             .map(|(index, module)| {
                 let replacement = format!("{}{}", position.replacement_prefix, module.name);
@@ -1392,6 +1390,41 @@ mod tests {
         shell::ShellKind,
         terminal::{BufferRevision, QueryId},
     };
+
+    #[test]
+    fn python_module_recommendations_keep_more_than_five_hundred_discovered_entries() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let bin = directory.path().join("bin");
+        fs::create_dir(&bin).expect("bin");
+        let python = bin.join("python3");
+        fs::write(&python, b"#!/bin/sh\n").expect("python fixture");
+        fs::set_permissions(&python, fs::Permissions::from_mode(0o700)).expect("python mode");
+        let commands = Arc::new(CommandPathCache::from_path(Some(&OsString::from(&bin))));
+        let cache = Arc::new(CommandHelpCache::default());
+        cache.seed(
+            &python_module_cache_key("python3"),
+            CommandHelp {
+                subcommands: (0..620)
+                    .map(|index| HelpEntry {
+                        name: format!("entry{index:03}"),
+                        description: DESC_SITE_ENTRY.into(),
+                        takes_value: false,
+                    })
+                    .collect(),
+                ..CommandHelp::default()
+            },
+        );
+        let mut engine = CompletionEngine::new(0, 3);
+        engine.register(PythonModuleProvider::new(commands, cache));
+        let output = engine.complete(&context(directory.path(), "python3 -m entry", 1));
+        assert_eq!(output.candidates.len(), 620);
+        assert!(
+            output
+                .candidates
+                .iter()
+                .any(|candidate| candidate.display.primary == "python3 -m entry619")
+        );
+    }
 
     #[test]
     fn scanner_finds_packages_and_runnable_modules_without_data_directories() {

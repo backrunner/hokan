@@ -1,0 +1,12 @@
+Usage: uv tool [OPTIONS] <COMMAND>
+Commands:
+  run           Run a command provided by a Python package
+  install       Install commands provided by a Python package
+  upgrade       Upgrade installed tools
+  list          List installed tools
+  audit         Audit installed tools and their dependencies
+  uninstall     Uninstall a tool
+  update-shell  Ensure that the tool executable directory is on the `PATH`
+  dir           Show the path to the uv tools directory
+
+Cache options:

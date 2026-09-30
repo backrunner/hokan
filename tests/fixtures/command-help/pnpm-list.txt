@@ -1,0 +1,95 @@
+Usage: pnpm [OPTIONS] <COMMAND>
+Commands:
+  access          Manage package access and visibility on the registry
+  init            Initialize a package.json
+  recursive       Concurrently runs a command in all subdirectory projects [aliases: multi, m]
+  add             Add a package
+  install         Install packages [alias: i]
+  install-test    Runs a `pnpm install` followed immediately by a `pnpm test`. It takes exactly the same arguments as `pnpm install` [alias: it]
+  update          Update packages to their newest version based on the specified range [aliases: up, upgrade]
+  outdated        Check for outdated package and GitHub Actions dependencies
+  audit           Checks for known security issues with the installed packages
+  change          Record a change intent: which packages a change affects, the bump type for each, and a summary that becomes the changelog entry
+  version         Apply the pending change intents (`pnpm version -r`)
+  lane            Manage per-package release lanes
+  bugs            Opens the bug tracker URL of a package in the default browser [alias: issues]
+  list            List installed packages [alias: ls]
+  ll              List installed packages in long format [alias: la]
+  licenses        Check the licenses of the installed packages [alias: licences]
+  why             Shows the packages that depend on `pkg`
+  view            View registry information about a package [aliases: info, show, v]
+  sbom            Generate a Software Bill of Materials (SBOM)
+  whoami          Displays your pnpm username
+  deprecate       Deprecates a version of a package in the registry
+  undeprecate     Removes deprecation from a version of a package in the registry. Only works on already deprecated versions
+  unpublish       Removes a package from the registry
+  star            Marks a package as a favorite
+  unstar          Unmarks a package as a favorite
+  stars           Lists all packages starred by a specific user
+  dist-tag        Manage a package's distribution tags [alias: dist-tags]
+  ping            Test connectivity to the configured registry
+  doctor          Run diagnostics on the pnpm installation and environment
+  search          Search for packages in the registry [aliases: s, se, find]
+  rebuild         Rebuild a package [alias: rb]
+  pack            Create a tarball from a package
+  publish         Publish a package to the registry
+  stage           Stage packages for publishing, deferring proof-of-presence (2FA) to a later point in time
+  remove          Removes packages from `node_modules` and from the project's `package.json` [aliases: uninstall, rm, un, uni]
+  patch           Prepare a package for patching
+  patch-commit    Generate a patch out of a directory
+  patch-remove    Remove existing patch files
+  peers           Checks for unmet or missing peer dependency issues
+  set-script      Set a script in package.json [alias: ss]
+  test            Runs a package's "test" script, if one was provided
+  run             Runs a defined package script
+  exec            Run a shell command in the context of a project
+  dlx             Run a package in a temporary environment
+  create          Creates a project from a `create-*` starter kit
+  completion      Print shell completion code to stdout
+  start           Runs an arbitrary command specified in the package's start property of its scripts object
+  stop            Runs a package's "stop" script, if one was provided
+  restart         Restarts a package. Runs "stop", "restart", and "start" scripts, and associated pre- and post- scripts
+  find-hash       Lists the packages that include the file with the specified hash
+  runtime         Manage runtimes [alias: rt]
+  env             Manage Node.js versions. Deprecated in favour of `pnpm runtime`
+  shim            Manage context-aware shims for packages that are not installed globally, so a project decides which version runs
+  bin             Print the directory where pnpm will install executables
+  clean           Safely remove `node_modules` directories from the current project (or every workspace project) without following NTFS junctions into their targets. A `clean` script in `package.json` overrides the built-in command
+  purge           Alias of `clean`: same behavior, except a `purge` script (not a `clean` script) overrides it when present
+  ci              Runs clean then install with a frozen lockfile [aliases: clean-install, ic, install-clean]
+  root            Print the effective `node_modules` directory
+  prefix          Print the current package prefix
+  config          Manage the pnpm configuration files [alias: c]
+  get             Print the config value for the provided key. Shorthand for `pnpm config get`
+  set             Set the config key to the value provided. Shorthand for `pnpm config set`
+  pkg             Manages your package.json
+  pack-app        Pack a `CommonJS` entry file into a standalone executable for one or more target platforms
+  store           Managing the package store
+  cache           Inspect and manage the metadata cache
+  cat-file        Prints the contents of a file based on the hash value stored in the index file
+  cat-index       Prints the index file of a specific package from the store
+  ignored-builds  Print the list of packages with blocked build scripts
+  approve-builds  Approve dependencies for running scripts during installation
+  link            Links a local package as a dependency [alias: ln]
+  import          Generates a pnpm-lock.yaml from an external lockfile
+  dedupe          Deduplicate packages in the lockfile
+  deploy          Deploy a package from a workspace
+  prune           Remove extraneous packages
+  fetch           Fetch packages from the lockfile into the virtual store
+  unlink          Removes links to a local package and reinstalls it [alias: dislink]
+  docs            Opens the documentation of a package in the browser [alias: home]
+  repo            Opens the URL of the package's repository in a browser
+  self-update     Updates pnpm to the latest version (or the one specified)
+  setup           Sets up pnpm
+  login           Log in to an npm registry [alias: adduser]
+  team            Manage organization teams and team memberships
+  owner           Manage package owners on the registry [alias: owners]
+  logout          Log out of an npm registry
+  with            Runs pnpm at a specific version (or the currently running one) for a single invocation, ignoring the "packageManager" and "devEngines.packageManager" fields of the project's manifest
+  edit            Not implemented in pnpm. Use the npm CLI directly
+  profile         Not implemented in pnpm. Use the npm CLI directly
+  token           Not implemented in pnpm. Use the npm CLI directly
+  xmas            Not implemented in pnpm. Use the npm CLI directly
+  help            Print this message or the help of the given subcommand(s)
+
+Options:

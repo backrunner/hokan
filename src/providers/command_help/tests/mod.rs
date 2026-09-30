@@ -43,11 +43,99 @@ fn context(text: &str, query: u64) -> CompletionContext {
 }
 
 mod cache;
+mod corpus;
 mod man;
 mod modern;
 mod probe;
 mod provider;
 mod scopes;
+
+// Captured from the installed AIPass CLI. Most rows intentionally have no
+// description; keep that layout to exercise the generic help parser.
+const AIPASS_ROOT_HELP: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/command-help/aipass-root.txt"
+));
+const AIPASS_PROXY_HELP: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/command-help/aipass-proxy.txt"
+));
+const AIPASS_VAULT_HELP: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/command-help/aipass-vault.txt"
+));
+const AIPASS_ROOT_COMMANDS: &[&str] = &[
+    "doctor",
+    "completions",
+    "vault",
+    "secret",
+    "accounts",
+    "native-host",
+    "agent",
+    "proxy",
+    "unlock",
+    "lock",
+    "init",
+    "add",
+    "list",
+    "update",
+    "archive",
+    "restore",
+    "delete",
+    "search",
+    "probe",
+    "get",
+    "copy",
+    "env",
+    "inject",
+    "exec",
+    "configure",
+    "switch",
+    "rollback",
+    "sync",
+    "help",
+];
+const AIPASS_PROXY_COMMANDS: &[&str] = &[
+    "status",
+    "start",
+    "stop",
+    "config-get",
+    "config-set",
+    "route-list",
+    "route-create",
+    "route-delete",
+    "route-set-enabled",
+    "route-select",
+    "token-rotate",
+    "logs",
+    "usage",
+    "usage-clear",
+    "group-list",
+    "group-switch",
+    "group-enable",
+    "group-disable",
+    "target-list",
+    "target-add",
+    "target-remove",
+    "target-enable",
+    "target-disable",
+    "target-set-priority",
+    "target-set-weight",
+    "route-update-target",
+    "route-apply",
+    "provider-update",
+    "help",
+];
+const AIPASS_VAULT_COMMANDS: &[&str] = &[
+    "status",
+    "change-password",
+    "rotate",
+    "devices",
+    "revoke-device",
+    "export",
+    "import",
+    "help",
+];
 
 const KUBECTL_HELP: &str = "\
 kubectl controls the Kubernetes cluster manager.

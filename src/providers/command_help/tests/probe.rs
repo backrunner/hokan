@@ -1,6 +1,43 @@
 use super::*;
 
 #[test]
+fn cargo_help_merges_complete_extension_lists_with_root_flags() {
+    assert_eq!(
+        help_probe_arguments("cargo", &[]),
+        [vec!["--help".to_owned()], vec!["--list".to_owned()]]
+    );
+    let directory = tempfile::tempdir().expect("script directory");
+    let cargo = directory.path().join("cargo");
+    fs::write(&cargo, "#!/bin/sh\ncase \"$1\" in\n--help) printf 'Commands:\\n  build Build a package\\n  ... See all commands with --list\\nOptions:\\n  --offline Work offline\\n' ;;\n--list) printf 'Installed Commands:\\n  build Build a package\\n  audit\\n  b  alias: build\\n' ;;\n*) exit 3 ;;\nesac\n").expect("cargo help fixture");
+    fs::set_permissions(&cargo, fs::Permissions::from_mode(0o700)).expect("script mode");
+    let help = fetch_help_program("cargo", cargo.as_os_str());
+    assert_eq!(
+        help.subcommands
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>(),
+        ["build", "audit"]
+    );
+    assert_eq!(help.subcommand_aliases, ["b"]);
+    assert_eq!(help.flags[0].name, "--offline");
+    assert!(help.subcommands_exhaustive);
+}
+
+#[test]
+fn colored_help_on_stderr_is_recognized_even_after_a_nonzero_exit() {
+    let directory = tempfile::tempdir().expect("script directory");
+    let tool = directory.path().join("demotool");
+    fs::write(
+        &tool,
+        "#!/bin/sh\nprintf '\\033[1mCommands:\\033[0m\\n  deploy\\n' >&2\nexit 1\n",
+    )
+    .expect("help fixture");
+    fs::set_permissions(&tool, fs::Permissions::from_mode(0o700)).expect("script mode");
+    let help = fetch_help_program("demotool", tool.as_os_str());
+    assert_eq!(help.subcommands[0].name, "deploy");
+}
+
+#[test]
 fn pnpm_root_help_probes_the_complete_command_list_first() {
     assert_eq!(
         help_probe_arguments("pnpm", &[]),

@@ -1,0 +1,58 @@
+Usage: deno [OPTIONS] [COMMAND]
+Commands:
+  Execution:
+    run          Run a JavaScript or TypeScript program, or a task
+                  deno run main.ts  |  deno run --allow-net=google.com main.ts  |  deno main.ts
+    serve        Run a server
+                  deno serve main.ts
+    watch        Run a program, watching for changes and hot-replacing modules
+                  deno watch main.ts
+    task         Run a task defined in the configuration file
+                  deno task dev
+    repl         Start an interactive Read-Eval-Print Loop (REPL) for Deno
+    eval         Evaluate a script from the command line
+
+  Dependency management:
+    add          Add dependencies
+                  deno add jsr:@std/assert  |  deno add npm:express
+    bump-version Update version in the configuration file
+    install      Installs dependencies either in the local project or globally to a bin directory
+    ci           Install dependencies in a clean, reproducible way for CI environments
+                  deno ci  |  deno ci --prod
+    uninstall    Uninstalls a dependency or an executable script in the installation root's bin directory
+    outdated     Find and update outdated dependencies
+    list         List the dependencies declared in deno.json / package.json
+    approve-scripts Approve npm lifecycle scripts
+    remove       Remove dependencies from the configuration file
+    link         Link a local JSR package into the current project
+                  deno link ../my-local-pkg
+    unlink       Remove a linked local package from the current project
+    publish      Publish the current working directory's package or workspace
+    why          Show why a package is installed
+
+  Tooling:
+    bench        Run benchmarks
+                  deno bench bench.ts
+    check        Type-check the dependencies
+    clean        Remove the cache directory
+    compile      Compile the script into a self contained executable
+                  deno compile main.ts  |  deno compile --target=x86_64-unknown-linux-gnu
+    coverage     Print coverage reports
+    deploy       Manage and publish applications with Deno Deploy
+    doc          Generate and show documentation for a module or built-ins
+                  deno doc  |  deno doc --json  |  deno doc --html mod.ts
+    fmt          Format source files
+                  deno fmt  |  deno fmt main.ts
+    info         Show info about cache or info related to source file
+    jupyter      Deno kernel for Jupyter notebooks
+    lint         Lint source files
+    init         Initialize a new project
+    test         Run tests
+                  deno test  |  deno test test.ts
+    pack         Create an npm-compatible tarball from a Deno project
+                  deno pack  |  deno pack --set-version 1.2.3
+    upgrade      Upgrade deno executable to given version
+                  deno upgrade  |  deno upgrade 1.45.0  |  deno upgrade canary
+
+
+Environment variables:

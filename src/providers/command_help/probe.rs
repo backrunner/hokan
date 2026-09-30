@@ -1,7 +1,7 @@
 //! Bounded man/help probes and merging of complementary documentation.
 use super::{
     CommandHelp,
-    parsing::{parse_help_output_for_scope, parse_man_page},
+    parsing::{parse_help_output_for_scope, parse_man_page, strip_help_escapes},
 };
 use std::{collections::HashSet, path::Path, time::Duration};
 
@@ -17,9 +17,10 @@ const MAN_TIMEOUT: Duration = Duration::from_millis(1200);
 // `--help` fallback for modern CLIs without a (useful) man page: the binary
 // itself is a fixed program resolved on PATH, receives no shell, a single
 // literal `--help` argument, null stdin, and is bounded in time and output —
-// the same discipline as the `man` probe. 800 ms covers warm `kubectl
-// --help`-style runs without letting a cold binary stall the applies pass.
-const HELP_TIMEOUT: Duration = Duration::from_millis(800);
+// the same discipline as the `man` probe. A cold Deno help probe can exceed
+// 800 ms under concurrent load; allow 1200 ms on the background fetch without
+// making interactive completion wait for it.
+const HELP_TIMEOUT: Duration = Duration::from_millis(1200);
 const MAN_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 pub(super) fn command_basename(command: &str) -> &str {
     Path::new(command)
@@ -158,6 +159,7 @@ pub(super) fn fetch_help_program_for_scope(
     program: &std::ffi::OsStr,
     scope: &[String],
 ) -> CommandHelp {
+    let mut combined = CommandHelp::default();
     for arguments in help_probe_arguments(command, scope) {
         let Ok(output) =
             crate::platform::run_bounded(program, &arguments, HELP_TIMEOUT, MAN_MAX_OUTPUT_BYTES)
@@ -174,11 +176,9 @@ pub(super) fn fetch_help_program_for_scope(
                 parsed = merge_help(parsed, parse_help_output_for_scope(command, scope, &text));
             }
         }
-        if !parsed.flags.is_empty() || !parsed.subcommands.is_empty() {
-            return parsed;
-        }
+        combined = merge_help(combined, parsed);
     }
-    CommandHelp::default()
+    combined
 }
 
 pub(super) fn help_probe_arguments(command: &str, scope: &[String]) -> Vec<Vec<String>> {
@@ -206,6 +206,9 @@ pub(super) fn help_probe_arguments(command: &str, scope: &[String]) -> Vec<Vec<S
         "pnpm" if scope.is_empty() => {
             vec![vec!["help".to_owned(), "-a".to_owned()], suffixed("--help")]
         }
+        "cargo" if scope.is_empty() => {
+            vec![suffixed("--help"), vec!["--list".to_owned()]]
+        }
         "git" if !scope.is_empty() => vec![suffixed("-h")],
         "terraform" | "tofu" if !scope.is_empty() => {
             vec![suffixed("-help"), suffixed("--help")]
@@ -221,6 +224,7 @@ pub(super) fn help_probe_arguments(command: &str, scope: &[String]) -> Vec<Vec<S
 }
 
 pub(super) fn looks_like_help_output(text: &str) -> bool {
+    let text = strip_help_escapes(text);
     text.lines().any(|line| {
         let line = line.trim().to_ascii_lowercase();
         line.starts_with("usage:")

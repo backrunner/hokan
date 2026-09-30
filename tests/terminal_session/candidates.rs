@@ -220,6 +220,70 @@ fn complete_executable_shows_recommendations_without_implicit_selection() {
 }
 
 #[test]
+fn aipass_descriptionless_commands_appear_at_root_and_nested_scopes() {
+    if !command_exists("zsh") {
+        return;
+    }
+    let (home, work) = empty_fixture_directories();
+    let bin = home.path().join("rc-bin");
+    fs::create_dir(&bin).expect("rc bin");
+    let executable = bin.join("aipass");
+    fs::write(
+        &executable,
+        format!(
+            "#!/bin/sh\ncase \"$*\" in\n--help) cat <<'ROOT_HELP'\n{}ROOT_HELP\n;;\n'proxy --help') cat <<'PROXY_HELP'\n{}PROXY_HELP\n;;\n'vault --help') cat <<'VAULT_HELP'\n{}VAULT_HELP\n;;\n*) exit 1 ;;\nesac\n",
+            include_str!("../fixtures/command-help/aipass-root.txt"),
+            include_str!("../fixtures/command-help/aipass-proxy.txt"),
+            include_str!("../fixtures/command-help/aipass-vault.txt"),
+        ),
+    )
+    .expect("fixture executable");
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).expect("fixture mode");
+    fs::write(
+        home.path().join(".zshrc"),
+        format!(
+            "export PATH={}:$PATH\nPROMPT='HK> '\nRPROMPT=''\nsetopt no_beep\n",
+            bin.display()
+        ),
+    )
+    .expect("fixture zshrc");
+    // A filename sharing the command prefix must not displace help candidates.
+    fs::write(work.path().join("proxy-file.txt"), b"fixture").expect("work file");
+    let mut terminal = TerminalSession::spawn_hokan(home, work, 2);
+    terminal.wait_for_screen("HK> ");
+    for (input, expected) in [
+        ("aipass", "aipass doctor"),
+        ("aipass pro", "aipass proxy"),
+        (
+            "aipass proxy target-set-w",
+            "aipass proxy target-set-weight",
+        ),
+        ("aipass vault change-", "aipass vault change-password"),
+    ] {
+        terminal.write(input.as_bytes());
+        terminal.wait_for_screen(expected);
+        let text = terminal.screen_text();
+        assert!(
+            text.contains(TAG_HELP),
+            "help row missing for {input}:\n{text}"
+        );
+        assert!(
+            !text.contains(TAG_FILE),
+            "file rows leaked for {input}:\n{text}"
+        );
+        assert!(
+            !text.contains('▶'),
+            "implicit selection for {input}:\n{text}"
+        );
+        terminal.write(b"\x15");
+        terminal.wait_for_bare_row("HK>");
+    }
+    terminal.exit_shell();
+    terminal.wait_until_exit();
+}
+
+#[test]
 fn exact_executable_shows_dynamic_help_without_waiting_for_space() {
     if !command_exists("zsh") {
         return;

@@ -2,7 +2,7 @@
 use super::super::probe::command_basename;
 use super::{
     CommandHelp, HashSet, HelpEntry, block_description, flag_takes_separate_value, indent_of,
-    inline_description, is_entry_name, parse_flag_line, shorten,
+    inline_description, is_entry_name, parse_flag_line, shorten, strip_help_escapes,
 };
 use std::path::Path;
 
@@ -22,6 +22,7 @@ pub(crate) fn parse_help_output_for_scope(
     scope: &[String],
     text: &str,
 ) -> CommandHelp {
+    let text = strip_help_escapes(text);
     let lines: Vec<String> = text.lines().map(str::to_owned).collect();
     let mut help = CommandHelp::default();
     let mut seen_flags = HashSet::new();
@@ -33,8 +34,11 @@ pub(crate) fn parse_help_output_for_scope(
     let mut in_usage = false;
     let mut command_row_indent = None;
     let mut saw_commands = false;
+    let mut truncated_commands = false;
     for (index, line) in lines.iter().enumerate() {
-        if let Some(signature) = usage_signature(line) {
+        if !(in_commands && line.starts_with(char::is_whitespace))
+            && let Some(signature) = usage_signature(line)
+        {
             in_commands = false;
             in_command_grid = false;
             in_argument_choices = false;
@@ -142,6 +146,18 @@ pub(crate) fn parse_help_output_for_scope(
         if !in_commands {
             continue;
         }
+        if line.trim_start().starts_with("...") || line.trim_start().starts_with('…') {
+            truncated_commands = true;
+            continue;
+        }
+        // Nested category headings are not commands. Keep the surrounding
+        // Commands section and allow the next category's rows to set its indent.
+        if line.trim_end().ends_with(':') && split_help_columns(line.trim_start()).is_none() {
+            if command_row_indent.is_some_and(|indent| indent_of(line) < indent) {
+                command_row_indent = None;
+            }
+            continue;
+        }
         if in_command_grid {
             if let Some(names) = help_command_grid_row(line) {
                 for name in names {
@@ -167,6 +183,19 @@ pub(crate) fn parse_help_output_for_scope(
                 None => description,
             };
             names.extend(description_aliases(&description));
+            // Cargo-style installed command lists document aliases as their own
+            // rows. Accept them for input/history without duplicating recommendations.
+            if description
+                .strip_prefix("alias: ")
+                .is_some_and(is_entry_name)
+            {
+                for alias in names {
+                    if seen_subcommands.insert(alias.clone()) {
+                        help.subcommand_aliases.push(alias);
+                    }
+                }
+                continue;
+            }
             let mut names = names.into_iter();
             let Some(name) = names.next() else {
                 continue;
@@ -184,7 +213,8 @@ pub(crate) fn parse_help_output_for_scope(
             }
         }
     }
-    help.subcommands_exhaustive = saw_commands && !help.subcommands.is_empty();
+    help.subcommands_exhaustive =
+        saw_commands && !truncated_commands && !help.subcommands.is_empty();
     help
 }
 
@@ -270,7 +300,9 @@ pub(in crate::providers::command_help) fn is_arguments_header(line: &str) -> boo
 
 pub(in crate::providers::command_help) fn usage_signature(line: &str) -> Option<&str> {
     let trimmed = line.trim_start();
-    if trimmed.eq_ignore_ascii_case("usage") {
+    // A bare indented `usage` can be a command name in a Commands table.
+    // Colonless usage headings, like other section headings, are flush-left.
+    if !line.starts_with(char::is_whitespace) && trimmed.eq_ignore_ascii_case("usage") {
         return Some("");
     }
     let (header, signature) = trimmed.split_once(':')?;
@@ -391,7 +423,7 @@ pub(in crate::providers::command_help) fn is_help_section_header(line: &str) -> 
     line.trim_end().ends_with(':') || is_all_caps_help_heading(line.trim())
 }
 
-/// Two-column `name   description` rows inside a `--help` commands section.
+/// Command rows inside a `--help` commands section, with optional descriptions.
 /// Unlike the man-page variant, hyphenated names (`api-versions`) and
 /// clap/commander-style alias lists (`build, b`, `update|upgrade`) are
 /// accepted and retained for validation without creating duplicate rows.
@@ -402,7 +434,16 @@ pub(in crate::providers::command_help) fn help_subcommand_row(
         return None;
     }
     let trimmed = line.trim_start();
-    let (signature, description) = split_help_columns(trimmed)?;
+    let (signature, description) = split_help_columns(trimmed)
+        .or_else(|| {
+            // Some CLIs use only one space after a long name (Deno and gh).
+            // Placeholders remain usage syntax rather than description columns.
+            let (name, description) = trimmed.split_once(char::is_whitespace)?;
+            let description = description.trim_start();
+            (!description.is_empty() && !description.starts_with(['[', '<', '-', '(']))
+                .then_some((name, description))
+        })
+        .unwrap_or((trimmed.trim_end(), ""));
     let mut signature_words = signature.split_whitespace();
     let name_token = signature_words.next()?;
     let comma_aliases = name_token.ends_with(',');
@@ -416,7 +457,9 @@ pub(in crate::providers::command_help) fn help_subcommand_row(
             names.swap(0, canonical);
         }
     }
-    if description.is_empty() {
+    // A descriptionless row must consist only of command names. Do not turn
+    // prose or an unsupported usage signature into an extra recommendation.
+    if description.is_empty() && signature_words.next().is_some() {
         return None;
     }
     names.extend(description_aliases(description));

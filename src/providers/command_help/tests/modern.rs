@@ -1,6 +1,138 @@
 use super::*;
 
 #[test]
+fn generic_tables_handle_color_groups_long_names_and_single_space_columns() {
+    let help = parse_help_output(
+        "unlisted-tool",
+        "\u{1b}[1mCommands:\u{1b}[0m\n  runtime:\n    run Execute a program\n    usage: Display usage statistics\n    next\n  management:\n    experimental-audit-binary-artifact\n      Audit a binary\n    \u{1b}]8;;https://example.com\u{1b}\\install\u{1b}]8;;\u{1b}\\ Install a package\n\nOptions:\n  \u{1b}[32m--json\u{1b}[0m Emit JSON\n",
+    );
+    assert_eq!(
+        help.subcommands
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "run",
+            "usage",
+            "next",
+            "experimental-audit-binary-artifact",
+            "install"
+        ]
+    );
+    assert_eq!(help.flags[0].name, "--json");
+    assert!(
+        !help
+            .subcommands
+            .iter()
+            .any(|entry| entry.description.contains('\u{1b}'))
+    );
+    assert!(help.subcommands_exhaustive);
+}
+
+#[test]
+fn explicitly_abbreviated_command_tables_are_not_exhaustive() {
+    for ellipsis in ["...", "…"] {
+        let help = parse_help_output(
+            "demo",
+            &format!(
+                "Commands:\n  build Build a package\n  {ellipsis} See all commands with --list\n"
+            ),
+        );
+        assert_eq!(help.subcommands.len(), 1);
+        assert!(!help.subcommands_exhaustive);
+        assert!(history_arguments_are_plausible(
+            &help,
+            &["installed-extension"],
+            false,
+            false
+        ));
+    }
+}
+
+#[test]
+fn parses_all_aipass_commands_without_descriptions() {
+    for (scope, text, expected) in [
+        (Vec::new(), AIPASS_ROOT_HELP, AIPASS_ROOT_COMMANDS),
+        (
+            vec!["proxy".to_owned()],
+            AIPASS_PROXY_HELP,
+            AIPASS_PROXY_COMMANDS,
+        ),
+        (
+            vec!["vault".to_owned()],
+            AIPASS_VAULT_HELP,
+            AIPASS_VAULT_COMMANDS,
+        ),
+    ] {
+        let help = parse_help_output_for_scope("aipass", &scope, text);
+        let names: Vec<_> = help
+            .subcommands
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, expected, "scope: {scope:?}");
+        assert!(help.subcommands_exhaustive);
+        assert!(help.subcommands[0].description.is_empty());
+        for name in expected {
+            assert!(history_arguments_are_plausible(
+                &help,
+                &[name],
+                false,
+                false
+            ));
+        }
+        assert!(!history_arguments_are_plausible(
+            &help,
+            &["nonexistent"],
+            false,
+            false
+        ));
+        assert!(
+            help.flags
+                .iter()
+                .any(|flag| flag.name == "--json" && !flag.takes_value)
+        );
+        assert!(
+            help.flags
+                .iter()
+                .any(|flag| flag.name == "--vault" && flag.takes_value)
+        );
+    }
+    let root = parse_help_output("aipass", AIPASS_ROOT_HELP);
+    assert_eq!(root.subcommand_aliases, ["credential", "credentials"]);
+}
+
+#[test]
+fn descriptionless_rows_preserve_aliases_continuations_and_section_boundaries() {
+    let help = parse_help_output(
+        "demo",
+        "  orphan\nCommands:\n  bare   \n  tabbed\t\n  update|upgrade\n  install|i\n  wrapped\n      A description continued on the next line\n  build [OPTIONS]\n  described  Run a task\n      nested\n\nExamples:\n  example\nOptions:\n  --json\n",
+    );
+    let names: Vec<_> = help
+        .subcommands
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "bare",
+            "tabbed",
+            "update",
+            "install",
+            "wrapped",
+            "described"
+        ]
+    );
+    assert_eq!(help.subcommand_aliases, ["upgrade", "i"]);
+    assert_eq!(
+        help.subcommands[4].description,
+        "A description continued on the next line"
+    );
+    assert!(help.subcommands_exhaustive);
+}
+
+#[test]
 fn parses_and_merges_all_documented_entries_past_two_hundred() {
     let mut modern = String::from("Commands:\n");
     let mut man = String::from("COMMANDS\n");

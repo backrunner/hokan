@@ -5,8 +5,30 @@ use super::{CommandHelp, HelpEntry};
 pub(super) use modern::parse_help_output;
 pub(crate) use modern::parse_help_output_for_scope;
 use modern::split_subcommand_names;
+use std::borrow::Cow;
 use std::collections::HashSet;
 pub(in crate::providers::command_help) const MAX_DESCRIPTION_CHARS: usize = 72;
+
+/// Strip styling and hyperlinks while retaining the whitespace help tables use.
+pub(in crate::providers::command_help) fn strip_help_escapes(text: &str) -> Cow<'_, str> {
+    if !text.contains('\u{1b}') {
+        return Cow::Borrowed(text);
+    }
+    struct HelpText(String);
+    impl vte::Perform for HelpText {
+        fn print(&mut self, character: char) {
+            self.0.push(character);
+        }
+        fn execute(&mut self, byte: u8) {
+            if matches!(byte, b'\n' | b'\t') {
+                self.0.push(char::from(byte));
+            }
+        }
+    }
+    let mut output = HelpText(String::with_capacity(text.len()));
+    vte::Parser::new().advance(&mut output, text.as_bytes());
+    Cow::Owned(output.0)
+}
 
 /// Conservative heuristics over `man -P cat` output. Anything unrecognized is
 /// skipped rather than guessed: a partial flag list is useful, a wrong one is
@@ -359,7 +381,7 @@ pub(in crate::providers::command_help) fn man_signature_subcommand(
 
 pub(in crate::providers::command_help) fn is_entry_name(name: &str) -> bool {
     !name.is_empty()
-        && name.len() <= 32
+        && name.len() <= 128
         && name.chars().next().is_some_and(|c| c.is_ascii_lowercase())
         && !name.ends_with(':')
         && !name.contains("::")

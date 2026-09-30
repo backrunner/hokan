@@ -1,0 +1,38 @@
+Usage: aipass proxy [OPTIONS] <COMMAND>
+
+Commands:
+  status
+  start
+  stop
+  config-get
+  config-set
+  route-list
+  route-create
+  route-delete
+  route-set-enabled
+  route-select
+  token-rotate
+  logs
+  usage
+  usage-clear
+  group-list
+  group-switch
+  group-enable
+  group-disable
+  target-list
+  target-add
+  target-remove
+  target-enable
+  target-disable
+  target-set-priority
+  target-set-weight
+  route-update-target
+  route-apply
+  provider-update
+  help                 Print this message or the help of the given subcommand(s)
+
+Options:
+      --json
+      --vault <VAULT>        [env: AIPASS_VAULT_DIR=]
+      --password <PASSWORD>  [env: AIPASS_MASTER_PASSWORD=]
+  -h, --help                 Print help

@@ -1,6 +1,73 @@
 use super::*;
 
 #[test]
+fn engine_recommends_every_aipass_root_and_nested_command() {
+    let directory = tempfile::tempdir().expect("command directory");
+    let executable = directory.path().join("aipass");
+    fs::write(&executable, b"#!/bin/sh\n").expect("fake command");
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).expect("command mode");
+    let commands = Arc::new(CommandPathCache::from_path(Some(&OsString::from(
+        directory.path(),
+    ))));
+    let cache = Arc::new(CommandHelpCache::default());
+    cache.seed("aipass", parse_help_output("aipass", AIPASS_ROOT_HELP));
+    for (scope, text) in [("proxy", AIPASS_PROXY_HELP), ("vault", AIPASS_VAULT_HELP)] {
+        cache.seed_scope(
+            "aipass",
+            &[scope],
+            parse_help_output_for_scope("aipass", &[scope.to_owned()], text),
+        );
+    }
+    let mut engine = CompletionEngine::new(0, 3);
+    engine.register(CommandHelpProvider::new(
+        Arc::new(SpecRegistry::load(None)),
+        commands,
+        cache,
+    ));
+    for (text, prefix, expected) in [
+        ("aipass", "aipass", AIPASS_ROOT_COMMANDS),
+        ("aipass ", "aipass", AIPASS_ROOT_COMMANDS),
+        ("aipass proxy ", "aipass proxy", AIPASS_PROXY_COMMANDS),
+        ("aipass vault ", "aipass vault", AIPASS_VAULT_COMMANDS),
+    ] {
+        let mut rows: Vec<_> = engine
+            .complete(&context(text, 1))
+            .candidates
+            .into_iter()
+            .map(|candidate| candidate.display.primary)
+            .collect();
+        let mut expected: Vec<_> = expected
+            .iter()
+            .map(|name| format!("{prefix} {name}"))
+            .collect();
+        rows.sort();
+        expected.sort();
+        assert_eq!(rows, expected, "input: {text}");
+    }
+    for (text, expected) in [
+        ("aipass prox", "aipass proxy"),
+        (
+            "aipass proxy target-set-w",
+            "aipass proxy target-set-weight",
+        ),
+        ("aipass vault change-", "aipass vault change-password"),
+        (
+            "aipass --vault /tmp/test-vault prox",
+            "aipass --vault /tmp/test-vault proxy",
+        ),
+        ("aipass proxy --j", "aipass proxy --json"),
+    ] {
+        let rows: Vec<_> = engine
+            .complete(&context(text, 2))
+            .candidates
+            .into_iter()
+            .map(|candidate| candidate.display.primary)
+            .collect();
+        assert_eq!(rows, [expected], "input: {text}");
+    }
+}
+
+#[test]
 fn engine_descends_through_confirmed_help_subcommands() {
     let directory = tempfile::tempdir().expect("command directory");
     let path = directory.path().join("gh");

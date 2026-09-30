@@ -1,0 +1,15 @@
+USAGE: swift
+Subcommands:
+
+  swift build      Build Swift packages
+  swift package    Create and work on packages
+  swift run        Run a program from a package
+  swift test       Run package tests
+  swift repl       Experiment with Swift code interactively
+
+  Use `swift --version` for Swift version information.
+
+  Use `swift --help` for descriptions of available options and flags.
+
+  Use `swift help <subcommand>` for more information about a subcommand.
+

@@ -1,0 +1,45 @@
+USAGE: swift package <options> <subcommand>
+SUBCOMMANDS:
+  add-dependency          Add a package dependency to the manifest.
+  add-product             Add a new product to the manifest.
+  add-target              Add a new target to the manifest.
+  add-target-dependency   Add a new target dependency to the manifest.
+  add-setting             Add a new setting to the manifest.
+  experimental-audit-binary-artifact
+                          Audit a static library binary artifact for undefined
+                          symbols.
+  add-target-plugin       Add a new target plugin to the manifest
+  clean                   Delete build artifacts.
+  purge-cache             Purge the global repository cache.
+  reset                   Reset the complete cache/build directory.
+  update                  Update package dependencies.
+  describe                Describe the current package.
+  init                    Initialize a new package.
+  migrate                 Migrate a package or its individual targets to use
+                          the given set of features.
+  experimental-install    Offers the ability to install executable products of
+                          the current package.
+  experimental-uninstall  Offers the ability to uninstall executable products
+                          previously installed by `swift package
+                          experimental-install`.
+  diagnose-api-breaking-changes
+                          Diagnose API-breaking changes to Swift modules in a
+                          package.
+  dump-symbol-graph       Dump symbol graphs.
+  dump-package            Print parsed Package.swift as JSON.
+  edit                    Put a package in editable mode.
+  unedit                  Remove a package from editable mode.
+  config                  Manipulate configuration of the package
+  resolve                 Resolve package dependencies.
+  generate-sbom           Generate a Software Bill of Materials (SBOM).
+  show-dependencies       Print the resolved dependency graph.
+  show-executables        List the available executables from this package.
+  show-traits             List the available traits for a package.
+  tools-version           Manipulate tools version of the current package.
+  compute-checksum        Compute the checksum for a binary artifact.
+  archive-source          Create a source archive for the package.
+  completion-tool         Command to generate shell completions.
+  plugin                  Invoke a command plugin or perform other actions on
+                          command plugins.
+
+  See 'swift help package <subcommand>' for detailed help.

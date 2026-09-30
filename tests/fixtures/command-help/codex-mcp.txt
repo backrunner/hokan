@@ -1,0 +1,11 @@
+Usage: codex mcp [OPTIONS] <COMMAND>
+Commands:
+  list
+  get
+  add
+  remove
+  login
+  logout
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
