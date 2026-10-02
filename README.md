@@ -470,6 +470,15 @@ enabled = true
 interval_secs = 1800
 ```
 
+## Terminal input over SSH
+
+Fragments such as `29R` appearing at the prompt can be delayed cursor-position
+replies. Hokan keeps recognized partial replies within its two-second late-reply
+window, then discards completed stale replies without passing them to the shell.
+A standalone Escape still uses the 32 ms ambiguity window. Native PTY tests
+cover delayed private and standard cursor replies; remote SSH environments still
+require verification. See [troubleshooting](docs/troubleshooting.md).
+
 ## Development
 
 Follow the repository [development guidelines](AGENTS.md). Run local validation

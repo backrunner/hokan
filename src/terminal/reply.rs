@@ -4,7 +4,7 @@ use super::{CellPos, QueryId, SyncOutputCapability};
 
 const MAX_REPLY_BYTES: usize = 64;
 const LATE_REPLY_GRACE: Duration = Duration::from_secs(2);
-const LATE_REPLY_PREFIX_TIMEOUT: Duration = Duration::from_millis(32);
+const ESCAPE_PREFIX_TIMEOUT: Duration = Duration::from_millis(32);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TerminalQueryKind {
@@ -300,17 +300,20 @@ impl TerminalReplyRouter {
                 CandidateState::Potential
             )
         });
-        let prefix_expired = self.candidate_started.is_some_and(|started| {
-            now.saturating_duration_since(started) >= LATE_REPLY_PREFIX_TIMEOUT
-        });
+        let prefix_expired = self
+            .candidate_started
+            .is_some_and(|started| now.saturating_duration_since(started) >= ESCAPE_PREFIX_TIMEOUT);
         // A bare Escape/Ctrl-[ belongs to the user even if it is also a prefix
         // of Hokan's outstanding terminal reply. Bound that ambiguity to the
-        // same short window used for late replies instead of delaying the key
-        // until the full query timeout. The outstanding query remains
-        // registered, so a subsequent complete reply can still be consumed.
+        // short prefix window instead of delaying the key until the full
+        // query timeout. Once CSI has arrived, preserve partial replies for
+        // the entire late-reply grace period: SSH may split a response across
+        // the query deadline or delay the fallback's second response. Flushing
+        // that prefix after 32 ms leaks the remaining column + R into the shell.
+        // A complete late reply is discarded and cannot confirm a stale cursor.
         let escape_expired = self.candidate == b"\x1b" && prefix_expired;
         let outstanding_blocks = outstanding_potential && !escape_expired;
-        let late_blocks = late_potential && !prefix_expired;
+        let late_blocks = late_potential && !escape_expired;
         if !outstanding_blocks && !late_blocks {
             routed.input.append(&mut self.candidate);
             self.candidate_started = None;
@@ -607,7 +610,7 @@ mod tests {
                 kind: TerminalQueryKind::CursorPositionPrivate,
             }]
         );
-        let released = timed_out.expire(now + Duration::from_millis(2) + LATE_REPLY_PREFIX_TIMEOUT);
+        let released = timed_out.expire(now + Duration::from_millis(2) + LATE_REPLY_GRACE);
         assert_eq!(released.input, b"\x1b[?12");
     }
 
@@ -664,8 +667,94 @@ mod tests {
         router.expire(timed_out);
 
         assert!(router.route(b"\x1b", timed_out).input.is_empty());
-        let routed = router.expire(timed_out + LATE_REPLY_PREFIX_TIMEOUT);
+        let routed = router.expire(timed_out + ESCAPE_PREFIX_TIMEOUT);
         assert_eq!(routed.input, b"\x1b");
+    }
+
+    #[test]
+    fn delayed_reply_fragments_stay_quarantined_after_query_timeout() {
+        for (kind, reply) in [
+            (
+                TerminalQueryKind::CursorPositionPrivate,
+                b"\x1b[?12;29R".as_slice(),
+            ),
+            (
+                TerminalQueryKind::CursorPositionStandardGuarded,
+                b"\x1b[0n\x1b[12;29R".as_slice(),
+            ),
+            (
+                TerminalQueryKind::SynchronizedOutput,
+                b"\x1b[?2026;2$y".as_slice(),
+            ),
+        ] {
+            // A lone Esc remains ambiguous with a real key. Once CSI has
+            // arrived, exercise every split, including between the fallback's
+            // status report and cursor report, on either side of the timeout.
+            for split in 2..reply.len() {
+                for starts_late in [false, true] {
+                    let started = Instant::now();
+                    let timeout = Duration::from_millis(250);
+                    let mut router = TerminalReplyRouter::default();
+                    router
+                        .register(kind, started, timeout)
+                        .expect("terminal query");
+                    let first_at = if starts_late {
+                        started + timeout
+                    } else {
+                        started
+                    };
+                    let first = router.route(&reply[..split], first_at);
+                    assert!(first.input.is_empty());
+                    let second_at = first_at + Duration::from_millis(350);
+                    let expired = router.expire(second_at);
+                    assert!(
+                        expired.input.is_empty(),
+                        "{kind:?}, split={split}, starts_late={starts_late}"
+                    );
+                    let second = router.route(&reply[split..], second_at);
+                    assert!(second.input.is_empty(), "{kind:?}, split={split}");
+                    assert!(
+                        second.replies.is_empty(),
+                        "expired reply must not restore a stale cursor"
+                    );
+                    assert_eq!(router.route(b"echo 29R", second_at).input, b"echo 29R");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn late_reply_filter_preserves_delayed_keys_and_literal_input() {
+        for kind in [
+            TerminalQueryKind::CursorPositionPrivate,
+            TerminalQueryKind::CursorPositionStandardGuarded,
+            TerminalQueryKind::SynchronizedOutput,
+        ] {
+            for key in [
+                b"\x1b[A".as_slice(),
+                b"\x1b[1;5D".as_slice(),
+                b"\x1b[1;5R".as_slice(),
+                b"\x1b[13;2u".as_slice(),
+                b"\x1b[200~29R\x1b[201~".as_slice(),
+            ] {
+                let started = Instant::now();
+                let mut router = TerminalReplyRouter::default();
+                router
+                    .register(kind, started, Duration::from_millis(250))
+                    .expect("terminal query");
+                let timed_out = started + Duration::from_millis(250);
+                router.expire(timed_out);
+                // These keys share CSI with a reply but must be forwarded
+                // byte-for-byte as soon as their remaining bytes arrive.
+                assert!(router.route(&key[..2], timed_out).input.is_empty());
+                let delayed = timed_out + Duration::from_millis(350);
+                assert!(router.expire(delayed).input.is_empty());
+                let routed = router.route(&key[2..], delayed);
+                assert_eq!(routed.input, key, "{kind:?}");
+                assert!(routed.replies.is_empty());
+                assert_eq!(router.route(b"echo 29R", delayed).input, b"echo 29R");
+            }
+        }
     }
 
     #[test]
@@ -760,7 +849,7 @@ mod tests {
             .expect("cursor query");
         assert!(router.route(b"\x1b[?12", started).input.is_empty());
         assert!(router.set_foreground(true).is_empty());
-        let delayed = started + LATE_REPLY_PREFIX_TIMEOUT;
+        let delayed = started + ESCAPE_PREFIX_TIMEOUT;
         assert!(router.expire(delayed).input.is_empty());
         let routed = router.route(b";34R", delayed);
         assert_eq!(routed.input, b"");
@@ -786,11 +875,11 @@ mod tests {
             .expect("cursor query");
         assert!(router.route(b"\x1b", started).input.is_empty());
 
-        let released = router.expire(started + LATE_REPLY_PREFIX_TIMEOUT);
+        let released = router.expire(started + ESCAPE_PREFIX_TIMEOUT);
         assert_eq!(released.input, b"\x1b");
         assert!(released.replies.is_empty());
 
-        let routed = router.route(b"\x1b[?12;34R", started + LATE_REPLY_PREFIX_TIMEOUT);
+        let routed = router.route(b"\x1b[?12;34R", started + ESCAPE_PREFIX_TIMEOUT);
         assert!(routed.input.is_empty());
         assert_eq!(
             routed.replies,
@@ -821,7 +910,7 @@ mod tests {
             [TerminalReply::Timeout { .. }]
         ));
 
-        let released = router.expire(started + LATE_REPLY_PREFIX_TIMEOUT);
+        let released = router.expire(started + ESCAPE_PREFIX_TIMEOUT);
         assert_eq!(released.input, b"\x1b");
     }
 

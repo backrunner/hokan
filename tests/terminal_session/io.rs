@@ -67,7 +67,7 @@ impl TerminalSession {
             } else if self.probe_tail.ends_with(HOKAN_CPR_QUERY) && self.private_cpr_supported {
                 let (row, col) = self.terminal.screen().cursor_position();
                 let reply = format!("\x1b[?{};{}R", row + 1, col + 1);
-                self.write(reply.as_bytes());
+                self.write_cpr_reply(reply.as_bytes());
                 self.cpr_replies += 1;
                 self.probe_tail.clear();
             } else if self.probe_tail.ends_with(STATUS_QUERY) {
@@ -76,10 +76,27 @@ impl TerminalSession {
             } else if self.probe_tail.ends_with(STANDARD_CPR_QUERY) {
                 let (row, col) = self.terminal.screen().cursor_position();
                 let reply = format!("\x1b[{};{}R", row + 1, col + 1);
-                self.write(reply.as_bytes());
+                self.write_cpr_reply(reply.as_bytes());
                 self.cpr_replies += 1;
                 self.probe_tail.clear();
             }
+        }
+    }
+
+    fn write_cpr_reply(&mut self, reply: &[u8]) {
+        if let Some(pause) = self.cpr_reply_pause.take() {
+            let split = reply
+                .iter()
+                .position(|byte| *byte == b';')
+                .expect("CPR separator")
+                + 1;
+            self.write(&reply[..split]);
+            // Model an SSH response whose column/R suffix crosses Hokan's
+            // query timeout while the real shell is waiting at its prompt.
+            thread::sleep(pause);
+            self.write(&reply[split..]);
+        } else {
+            self.write(reply);
         }
     }
 

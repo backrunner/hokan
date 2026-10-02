@@ -1,6 +1,72 @@
 use super::*;
 
 #[test]
+fn delayed_cursor_reply_does_not_type_29r_at_the_prompt() {
+    if !command_exists("zsh") {
+        return;
+    }
+    for private_cpr_supported in [true, false] {
+        let (home, work) = fixture_directories();
+        let prompt = format!("{}> ", "S".repeat(26));
+        fs::write(
+            home.path().join(".zshrc"),
+            format!("PROMPT='{prompt}'\nRPROMPT=''\nsetopt no_beep\n"),
+        )
+        .expect("SSH-style prompt");
+        let mut command = CommandBuilder::new(hokan_test_bin());
+        command.arg("--shell");
+        command.arg("zsh");
+        configure_command(&mut command, &home, &work);
+        let mut terminal = TerminalSession::spawn_command_with_private_cpr(
+            home,
+            work,
+            command,
+            2,
+            private_cpr_supported,
+        );
+        terminal.cpr_reply_pause = Some(Duration::from_millis(350));
+        terminal.wait_for_screen(&prompt);
+        terminal.wait_for_bytes_since(0, HOKAN_CPR_QUERY);
+        if !private_cpr_supported {
+            // An unsupported private probe invalidates the initial anchor;
+            // wait from the actual query, not from prompt display (the sync
+            // query may still be pending under parallel load), then redraw
+            // the empty prompt to make the standard fallback eligible.
+            terminal.settle(Duration::from_millis(350));
+            terminal.write(b"\x0c");
+        }
+        let deadline = Instant::now() + TIMEOUT;
+        while terminal.cpr_reply_pause.is_some() && Instant::now() < deadline {
+            terminal.receive_once(READ_POLL);
+        }
+        assert!(
+            terminal.cpr_reply_pause.is_none(),
+            "cursor probe was not answered (private_cpr_supported={private_cpr_supported}); tail={:?}",
+            tail(&terminal.transcript, 1024)
+        );
+        terminal.settle(Duration::from_millis(200));
+        assert!(
+            !terminal.screen_text().contains("29R"),
+            "cursor reply leaked into the prompt:\n{}",
+            terminal.screen_text()
+        );
+
+        // Do not clear the buffer: the first command must run without any
+        // injected cursor-report suffix, and literal user text must survive.
+        let start = terminal.transcript.len();
+        terminal.write(b"printf '%s' '29R' > reply-input.txt; echo hk_reply_clean | tr a-z A-Z\r");
+        terminal.wait_for_bytes_since(start, b"HK_REPLY_CLEAN");
+        assert_eq!(
+            fs::read_to_string(terminal._work.path().join("reply-input.txt"))
+                .expect("first command output"),
+            "29R"
+        );
+        terminal.exit_shell();
+        terminal.wait_until_exit();
+    }
+}
+
+#[test]
 fn terminal_without_private_cpr_uses_guarded_standard_fallback() {
     if !command_exists("zsh") {
         return;

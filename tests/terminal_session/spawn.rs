@@ -337,6 +337,7 @@ impl TerminalSession {
             probe_tail: Vec::new(),
             sync_status,
             private_cpr_supported,
+            cpr_reply_pause: None,
             sync_replies: 0,
             cpr_replies: 0,
         }

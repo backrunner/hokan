@@ -65,6 +65,7 @@ struct TerminalSession {
     probe_tail: Vec<u8>,
     sync_status: u8,
     private_cpr_supported: bool,
+    cpr_reply_pause: Option<Duration>,
     sync_replies: usize,
     cpr_replies: usize,
 }
