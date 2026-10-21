@@ -39,8 +39,7 @@ v1 面向 macOS 和 Linux 上支持 UTF-8 与常见 ANSI/VT 控制序列的 POSI
 
 Terminal.app、iTerm2、Ghostty、Kitty、WezTerm 和 Alacritty 均在发布认证矩阵内，但
 本轮尚未逐一完成 120 FPS 录制、overlay rect blank-frame 检测和人工 cursor/prompt
-检查。因此首个 GitHub prerelease 用于公开 beta 验证，不表示这些组合已完成认证；
-兼容性承诺仍以本表状态为准。
+检查。发布渠道和版本号不表示这些组合已完成认证；兼容性承诺仍以本表状态为准。
 
 ## Shell 能力
 

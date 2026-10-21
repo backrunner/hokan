@@ -1,4 +1,4 @@
-.TH HOKAN 1 "2026-09-22" "hokan 0.1.0-beta.15" "User Commands"
+.TH HOKAN 1 "2026-10-22" "hokan 0.1.0" "User Commands"
 .SH NAME
 hokan \- shell-aware terminal completion overlay
 .SH SYNOPSIS
@@ -130,8 +130,8 @@ are controlled by the
 config section and the HOKAN_NO_AUTO_UPDATE environment variable.
 Checks run at session startup and are throttled, including failed retries,
 by update.interval_secs (1800 seconds by default). An installed update takes
-effect on the next launch. Beta builds default to the beta channel, while
-explicit channel settings are preserved. Concurrent updates are serialized;
+effect on the next launch. Updates follow the installed binary channel: stable builds check stable releases,
+and beta builds check beta releases. Legacy channel settings are ignored. Concurrent updates are serialized;
 the replacement is staged beside the executable to support a cache on a
 different filesystem.
 .TP

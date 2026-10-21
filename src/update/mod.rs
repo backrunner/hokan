@@ -513,21 +513,31 @@ mod tests {
     #[test]
     fn failed_background_attempts_are_throttled_but_manual_checks_can_retry() {
         let root = tempfile::tempdir().expect("tempdir");
-        let paths = paths(root.path(), "http://127.0.0.1:1");
+        let (base, join) = spawn_server(3, |_| {
+            json_reply("500 Internal Server Error", serde_json::json!({}))
+        });
+        let paths = paths(root.path(), &base);
         let mut options = options();
         options.auto = true;
-        assert!(run_upgrade(&options, &paths).is_err());
+        assert!(matches!(
+            run_upgrade(&options, &paths),
+            Err(UpdateError::Http(500))
+        ));
         assert_eq!(
             run_upgrade(&options, &paths).expect("defer retry"),
             UpgradeOutcome::Deferred
         );
         options.check_only = true;
-        assert!(run_upgrade(&options, &paths).is_err());
+        assert!(matches!(
+            run_upgrade(&options, &paths),
+            Err(UpdateError::Http(500))
+        ));
         options.check_only = false;
         options.channel = Channel::Beta;
         assert!(
-            run_upgrade(&options, &paths).is_err(),
+            matches!(run_upgrade(&options, &paths), Err(UpdateError::Http(500))),
             "a channel change can retry immediately"
         );
+        join.join().expect("three failed network attempts");
     }
 }
