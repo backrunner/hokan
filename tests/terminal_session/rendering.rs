@@ -390,6 +390,11 @@ fn directory_spelling_repairs_fill_without_executing_or_selecting_a_child() {
             .into_owned();
         terminal.wait_for_screen("HK> ");
         terminal.write(b"cd projcets/");
+        // `projects/` also appears while the shell reports an intermediate
+        // prefix such as `cd pro`. Wait for the final path-repair result,
+        // not just the candidate name or the shell's already-updated line.
+        terminal.wait_for_screen("找不到目录");
+        terminal.wait_for_screen("Tab 修正");
         terminal.wait_for_overlay_candidate("projects/");
         terminal.wait_for_clean_overlay("HK> cd projcets/");
         let before = terminal.screen_text();
