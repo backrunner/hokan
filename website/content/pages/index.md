@@ -13,7 +13,7 @@ keywords:
 
 # Completion for zsh, bash & fish
 
-Hokan adds an inline completion menu to your existing terminal. Suggestions come from your shell history, command options, files, and project scripts. Hokan is written in Rust and available for macOS and Linux as a public beta.
+Hokan adds an inline completion menu to your existing terminal. Suggestions come from your shell history, command options, files, and project scripts. Hokan is written in Rust and available for macOS and Linux as a stable release.
 
 ## Install
 
@@ -21,8 +21,8 @@ The shell installer verifies the release checksum and sets up your shell without
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/backrunner/hokan/releases/download/v0.1.0-beta.10/hokan-installer.sh \
-  | HOKAN_VERSION=0.1.0-beta.10 sh
+  https://github.com/backrunner/hokan/releases/download/v0.1.0/hokan-installer.sh \
+  | HOKAN_VERSION=0.1.0 sh
 ```
 
 Open a new terminal, then run `hokan doctor` to check the integration.
@@ -43,4 +43,4 @@ Your real shell runs underneath Hokan in a PTY. Your prompt and shell configurat
 - [CLI reference](/docs/reference/cli): commands, flags, and diagnostics.
 - [Troubleshooting](/docs/troubleshooting): fix startup, display, and completion issues.
 
-Hokan is in public beta. Check the [tested environments](/docs/reference/compatibility) for your shell and terminal. Bug reports are welcome on [GitHub](https://github.com/backrunner/hokan/issues).
+Hokan 0.1.0 is the current stable release. Check the [tested environments](/docs/reference/compatibility) for your shell and terminal. Bug reports are welcome on [GitHub](https://github.com/backrunner/hokan/issues).

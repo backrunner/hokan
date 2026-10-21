@@ -31,7 +31,7 @@ The following records come from the [repository compatibility matrix](https://gi
 | tmux 3.7+ | Awaiting certification | Capability is selected by runtime probe, never guessed from version |
 | OpenSSH loopback | Automated coverage | Isolated sshd and SSH PTY; actual remote hosts still need certification |
 
-Terminal.app, iTerm2, Ghostty, Kitty, WezTerm, and Alacritty are in the release certification matrix. That does **not** mean each combination is certified. The public beta is intended to expand real-world validation.
+Terminal.app, iTerm2, Ghostty, Kitty, WezTerm, and Alacritty are in the release certification matrix. That does **not** mean each combination is certified. Release channels do not change the certification status recorded in this matrix.
 
 ## Expected recovery behavior
 

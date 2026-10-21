@@ -17,4 +17,4 @@ Hokan is a Rust command-line tool that keeps your existing shell and adds contex
 - **Working with AI?** See [explicit AI actions](/docs/guides/ai).
 - **Something went wrong?** Use the [troubleshooting guide](/docs/troubleshooting).
 
-Hokan is currently in public beta. The [compatibility matrix](/docs/reference/compatibility) records the tested shell, terminal, SSH, and tmux combinations.
+Hokan 0.1.0 is the current stable release. The [compatibility matrix](/docs/reference/compatibility) records the tested shell, terminal, SSH, and tmux combinations.

@@ -58,7 +58,7 @@ test('landing interactions preserve review and copy the complete installation co
   await page.getByRole('button', { name: 'History', exact: true }).click();
   await expect(page.locator('.completion-box')).toContainText('cargo test --lib');
   await page.getByRole('button', { name: 'Copy install command' }).click();
-  await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toContain('HOKAN_VERSION=0.1.0-beta.10 sh');
+  await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toContain('HOKAN_VERSION=0.1.0 sh');
   await page.getByRole('button', { name: 'Switch to dark theme' }).click();
   await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark');
   await page.screenshot({ path: info.outputPath('home-dark.png'), fullPage: true });

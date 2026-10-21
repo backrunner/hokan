@@ -94,7 +94,7 @@ export default defineConfig({
           name: 'Hokan',
           applicationCategory: 'DeveloperApplication',
           operatingSystem: 'macOS, Linux',
-          softwareVersion: '0.1.0-beta.10',
+          softwareVersion: '0.1.0',
           license: 'https://opensource.org/licenses/BSD-3-Clause',
           url: siteUrl.origin,
           downloadUrl: 'https://github.com/backrunner/hokan/releases',

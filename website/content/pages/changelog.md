@@ -1,7 +1,44 @@
 ---
 title: Changelog
-description: Release notes for Hokan 0.1.0-beta.10, including completion, terminal recovery, and self-update fixes.
+description: Release notes for Hokan 0.1.0, including input isolation, explicit path completion, terminal recovery, and stable updates.
 ---
+
+## v0.1.0
+
+The first stable release includes the CLI help improvements from beta.17 and
+strengthens input ownership and filesystem completion.
+
+- Only known local-path arguments trigger filesystem completion. Package names,
+  repository and image names, expressions, and unknown command arguments no longer
+  cause directory scans merely because they contain a slash. Known file slots
+  and redirections retain completion; native shell Tab remains available when
+  no Hokan menu is open.
+- Completion tasks, AI results, pending Tab actions, and confirmations belong to
+  one prompt. Late results cannot act on a later prompt, and foreground programs
+  receive their own input.
+- Track split and late terminal color replies across program exit, with a
+  two-second grace period, while preserving replies for active programs.
+- Offer explicit spelling and parent-path repairs. Accepting a repair only fills
+  the command; it never creates directories or executes the correction.
+- Probe command help with the interactive shell PATH and invalidate cached help
+  when PATH or the executable changes.
+- Handle duplicate shell notifications without disrupting history, and keep
+  recoverable protocol diagnostics in opt-in logs.
+- Refresh dependencies within the Rust 1.96 compatibility boundary.
+
+Existing beta users can move to stable with:
+
+```sh
+hokan upgrade --channel stable --yes
+```
+
+Restart Hokan after updating. Future updates follow the installed binary's
+stable channel. Configuration and history are retained. Certification remains
+limited to the [tested environments](/docs/reference/compatibility).
+
+The [GitHub release](https://github.com/backrunner/hokan/releases/tag/v0.1.0)
+contains macOS and Linux archives for x86_64 and aarch64, SPDX SBOMs, SHA-256
+checksums, and the pinned-key Ed25519 checksum signature.
 
 ## v0.1.0-beta.10
 

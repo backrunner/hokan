@@ -1,6 +1,6 @@
 ---
 title: Install Hokan
-description: Install the Hokan beta on macOS or Linux and verify the shell integration.
+description: Install Hokan on macOS or Linux and verify the shell integration.
 order: 1
 keywords:
   - install Hokan
@@ -13,8 +13,8 @@ The release installer detects your operating system, CPU architecture, and curre
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/backrunner/hokan/releases/download/v0.1.0-beta.10/hokan-installer.sh \
-  | HOKAN_VERSION=0.1.0-beta.10 sh
+  https://github.com/backrunner/hokan/releases/download/v0.1.0/hokan-installer.sh \
+  | HOKAN_VERSION=0.1.0 sh
 ```
 
 Open a new terminal, or restart the current shell:
@@ -33,8 +33,8 @@ Use an `hk` command instead of starting Hokan for every shell:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/backrunner/hokan/releases/download/v0.1.0-beta.10/hokan-installer.sh \
-  | HOKAN_VERSION=0.1.0-beta.10 HOKAN_ON_DEMAND=1 sh
+  https://github.com/backrunner/hokan/releases/download/v0.1.0/hokan-installer.sh \
+  | HOKAN_VERSION=0.1.0 HOKAN_ON_DEMAND=1 sh
 ```
 
 ## Build from source
@@ -57,7 +57,7 @@ hokan install
 
 | Variable | Purpose |
 | --- | --- |
-| `HOKAN_VERSION` | Install an exact release such as `0.1.0-beta.10` |
+| `HOKAN_VERSION` | Install an exact release such as `0.1.0` |
 | `HOKAN_INSTALL_DIR` | Override the binary directory |
 | `HOKAN_MAN_DIR` | Override the man-page directory |
 | `HOKAN_SHELL` | Select `zsh`, `bash`, or `fish` |

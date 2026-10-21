@@ -5,7 +5,7 @@
   import TerminalDemo from './TerminalDemo.svelte';
 
   export let context: SvedocsThemeContext;
-  const install = 'curl --proto \'=https\' --tlsv1.2 -LsSf https://github.com/backrunner/hokan/releases/download/v0.1.0-beta.10/hokan-installer.sh | HOKAN_VERSION=0.1.0-beta.10 sh';
+  const install = 'curl --proto \'=https\' --tlsv1.2 -LsSf https://github.com/backrunner/hokan/releases/download/v0.1.0/hokan-installer.sh | HOKAN_VERSION=0.1.0 sh';
   const displayInstall = install.replace(' https:', ' \\\n  https:').replace(' | ', ' \\\n  | ');
   let copyStatus = 'Copy install command';
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -27,7 +27,7 @@
   <header class="home-intro">
     <div class="intro-meta">
       <span>A command-line tool, written in Rust</span>
-      <a href={href('/changelog')}>v0.1.0-beta.10 <span class="release-label">Release notes</span></a>
+      <a href={href('/changelog')}>v0.1.0 <span class="release-label">Release notes</span></a>
     </div>
     <div class="intro-body">
       <h1>Completion for<br />zsh, bash &amp; fish.</h1>
@@ -41,7 +41,7 @@
   <section class="home-section" aria-labelledby="install-title">
     <div class="section-label">
       <h2 id="install-title">Install</h2>
-      <p>macOS &amp; Linux · Public beta</p>
+      <p>macOS &amp; Linux · Stable release</p>
     </div>
     <div class="section-content">
       <div class="install-panel">
@@ -87,7 +87,7 @@
         <a href={href('/docs/reference/cli')}><span>CLI reference</span><span>Commands, flags, and diagnostics.</span><span aria-hidden="true">→</span></a>
         <a href={href('/docs/troubleshooting')}><span>Troubleshooting</span><span>Fix startup, display, and completion issues.</span><span aria-hidden="true">→</span></a>
       </nav>
-      <p class="beta-note">Hokan is in public beta. Check the <a href={href('/docs/reference/compatibility')}>tested environments</a> for your shell and terminal. Bug reports are welcome on <a href="https://github.com/backrunner/hokan/issues" target="_blank" rel="noreferrer">GitHub</a>.</p>
+      <p class="beta-note">Hokan 0.1.0 is the current stable release. Check the <a href={href('/docs/reference/compatibility')}>tested environments</a> for your shell and terminal. Bug reports are welcome on <a href="https://github.com/backrunner/hokan/issues" target="_blank" rel="noreferrer">GitHub</a>.</p>
     </div>
   </section>
 </div>
