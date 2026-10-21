@@ -106,10 +106,10 @@ fn config_reload_status_avoids_empty_success_but_preserves_restart_warnings() {
     assert_eq!(config_reload_status(&[], false), None);
     assert_eq!(
         config_reload_status(&[], true).as_deref(),
-        Some("HK-CFG-RELOAD applied provider and UI configuration")
+        Some("HK-CFG-RELOAD 补全与界面配置已更新。")
     );
     assert_eq!(
         config_reload_status(&["core", "history"], false).as_deref(),
-        Some("HK-CFG-RESTART restart required for core, history changes")
+        Some("HK-CFG-RESTART core, history 设置已保存；重新打开 Hokan 后生效。")
     );
 }

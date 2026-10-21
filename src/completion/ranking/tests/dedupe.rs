@@ -1,6 +1,37 @@
 use super::*;
 
 #[test]
+fn deduplication_preserves_path_repair_semantics_in_either_order() {
+    let context = buffer_context("cd pro");
+    let history = history_candidate(&context, "cd projects/", context.buffer.text.len());
+    let repair = Candidate::new(
+        context.query_id,
+        "projects/",
+        "修正目录名",
+        Some(TextEdit {
+            range: context.parsed.replacement.clone(),
+            replacement: "projects/".into(),
+            cursor_after: CursorPlacement::End,
+        }),
+        CandidateAction::CorrectPath,
+        CandidateSource::Filesystem,
+        CandidateKind::Directory,
+        Completeness::Runnable,
+        RiskLevel::Low,
+        "repair",
+    );
+    for candidates in [
+        vec![history.clone(), repair.clone()],
+        vec![repair.clone(), history.clone()],
+    ] {
+        let ranked = rank_and_dedupe(&context, candidates, 10);
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].action, CandidateAction::CorrectPath);
+        assert_eq!(ranked[0].display.primary, "projects/");
+    }
+}
+
+#[test]
 fn executable_argument_merges_matching_history_and_ranks_it_first() {
     let context = buffer_context("which co");
     let mut history = history_candidate(&context, "which codex", context.buffer.text.len());

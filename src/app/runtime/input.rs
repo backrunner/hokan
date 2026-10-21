@@ -42,22 +42,24 @@ pub(super) fn route_terminal_input(
     config: &Arc<Config>,
     ai_sender: &Sender<AiResult>,
 ) -> crate::Result<()> {
+    // A shell binding can launch a job without a literal Enter. Observe PTY
+    // ownership before interpreting its first input or reply as shell editing.
+    detect_foreground_process(state, pty, output, worker)?;
+    let mut pending_input = router.set_foreground(state.foreground_process());
     let routed = router.route(bytes, Instant::now());
     for reply in routed.replies {
         if handle_terminal_reply(reply, state, output)? {
             render_current(state, output)?;
         }
     }
+    // Hokan's own replies can arrive while a child's color reply is split.
+    // Remove those registered frames before continuing the color payload.
+    pending_input.extend_from_slice(&routed.input);
+    let input = output
+        .filter_color_replies(&pending_input, state.foreground_process())
+        .map_err(output_error)?;
     forward_terminal_input(
-        &routed.input,
-        decoder,
-        state,
-        pty,
-        session,
-        output,
-        worker,
-        config,
-        ai_sender,
+        &input, decoder, state, pty, session, output, worker, config, ai_sender,
     )
 }
 
@@ -73,7 +75,7 @@ pub(super) fn forward_terminal_input(
     config: &Arc<Config>,
     ai_sender: &Sender<AiResult>,
 ) -> crate::Result<()> {
-    if state.foreground_process {
+    if state.foreground_process() {
         // The decoder may contain bytes read just after the command's Enter
         // but before the foreground transition was observed. They precede the
         // current batch and must be released first, without waiting for an
@@ -106,7 +108,7 @@ pub(super) fn forward_terminal_input(
     // `feed` can return an Enter event while retaining a trailing partial
     // escape or paste sequence from the same terminal read. Once that Enter
     // hands the PTY to the command, release the retained suffix immediately.
-    if state.foreground_process {
+    if state.foreground_process() {
         let buffered = decoder.take_buffered_raw();
         state.escape_deadline = None;
         if !buffered.is_empty() {
@@ -128,20 +130,20 @@ pub(super) fn handle_input_event(
     ai_sender: &Sender<AiResult>,
 ) -> crate::Result<()> {
     let child_bytes =
-        input_bytes_for_shell(&event, session.supports_bracketed_paste(), state.editing);
+        input_bytes_for_shell(&event, session.supports_bracketed_paste(), state.editing());
     // A deferred Tab belongs only to the latest user input event. Shell
     // control messages may still catch up for bytes typed before it, but any
     // subsequent keypress cancels the one-shot activation intent.
-    state.pending_accept = false;
-    if !state.editing {
+    state.pending_accept = None;
+    if !state.editing() {
         // Input can already be queued in the outer PTY while the first prompt
         // event is still crossing the control FIFO.  Mark an Enter-triggered
         // command as foreground before forwarding it so a fast-starting TUI
         // cannot change terminal modes before the output actor snapshots the
         // shell baseline.
-        if !state.foreground_process && matches!(event.kind, InputKind::Enter) {
+        if !state.foreground_process() && matches!(event.kind, InputKind::Enter) {
             state.queued_startup_enter = true;
-            state.foreground_process = true;
+            state.begin_foreground(worker);
             output.set_foreground_and_wait(true).map_err(output_error)?;
         }
         pty.write_all(child_bytes)?;
@@ -176,7 +178,10 @@ pub(super) fn handle_input_event(
                 .pending_confirm
                 .take()
                 .ok_or_else(|| crate::Error::Runtime("pending confirmation disappeared".into()))?;
-            return execute_text(state, pty, session, output, confirm.text);
+            if state.editing_epoch() != Some(confirm.edit_epoch) {
+                return Ok(());
+            }
+            return execute_text(state, pty, session, output, worker, confirm.text);
         }
         if config.keys.dismiss.matches(&event.kind) {
             state.pending_confirm = None;
@@ -236,7 +241,7 @@ pub(super) fn handle_input_event(
                 // the final typed byte just before this Tab is routed. Keep
                 // the one-shot fill intent and apply it when that query's
                 // candidates arrive unless a later keypress cancels it.
-                state.pending_accept = true;
+                state.pending_accept = state.editing_epoch();
             }
             return Ok(());
         }
@@ -302,10 +307,7 @@ pub(super) fn handle_input_event(
 
     if matches!(event.kind, InputKind::Enter) {
         state.pending_command = Some(state.buffer.text.clone());
-        state.editing = false;
-        state.foreground_process = true;
-        state.overlay_visible = false;
-        state.cancel_ai();
+        state.begin_foreground(worker);
         output.hide_overlay().map_err(output_error)?;
         output.set_foreground_and_wait(true).map_err(output_error)?;
         pty.write_all(child_bytes)?;
@@ -408,6 +410,12 @@ fn activate_selected(
     config: &Arc<Config>,
     ai_sender: &Sender<AiResult>,
 ) -> crate::Result<ActivationAttempt> {
+    let repairing_path = selected_candidate(state).is_some_and(|candidate| {
+        matches!(
+            candidate.action,
+            crate::completion::CandidateAction::CorrectPath
+        )
+    });
     let (activation, context) = match resolve_selected_activation(state)? {
         SelectedActivation::None => return Ok(ActivationAttempt::Finished),
         SelectedActivation::Ready {
@@ -432,6 +440,12 @@ fn activate_selected(
             output.hide_overlay().map_err(output_error)?;
             replace_shell_buffer(state.shell, &text, cursor, pty, session)?;
             state.overlay_visible = false;
+            if repairing_path {
+                // The next Enter belongs to the repaired command, not the
+                // first child directory in its refreshed completion list.
+                state.selected = None;
+                state.selection_intent = None;
+            }
             if !state.shell.exact_buffer_sync() {
                 state.buffer.replace_mirrored(text, cursor)?;
                 state.pending_mirror_revision = Some(state.buffer.revision);
@@ -473,13 +487,12 @@ pub(super) fn retry_pending_accept(
     config: &Arc<Config>,
     ai_sender: &Sender<AiResult>,
 ) -> crate::Result<()> {
-    if !state.pending_accept {
+    if !state.take_pending_accept() {
         return Ok(());
     }
-    state.pending_accept = false;
     if state.candidates.is_empty() {
         if state.provider_pending {
-            state.pending_accept = true;
+            state.pending_accept = state.editing_epoch();
         }
         return Ok(());
     }
@@ -491,7 +504,7 @@ pub(super) fn retry_pending_accept(
         activate_selected(state, pty, session, output, worker, config, ai_sender)?,
         ActivationAttempt::Rejected
     ) {
-        state.pending_accept = true;
+        state.pending_accept = state.editing_epoch();
     }
     Ok(())
 }
@@ -522,13 +535,17 @@ fn enter_with_selection(
         EnterResolution::Fill => {
             activate_selected(state, pty, session, output, worker, config, ai_sender).map(|_| ())
         }
-        EnterResolution::Execute(text) => execute_text(state, pty, session, output, text),
+        EnterResolution::Execute(text) => execute_text(state, pty, session, output, worker, text),
         EnterResolution::Confirm {
             text,
             risk,
             reasons,
         } => {
+            let Some(edit_epoch) = state.editing_epoch() else {
+                return Ok(());
+            };
             state.pending_confirm = Some(PendingConfirm {
+                edit_epoch,
                 text,
                 risk,
                 reasons,
@@ -546,14 +563,11 @@ fn execute_text(
     pty: &mut PtyChild,
     session: &ShellSession,
     output: &OutputHandle,
+    worker: &ProviderWorker,
     text: String,
 ) -> crate::Result<()> {
     state.pending_command = Some(text.clone());
-    state.editing = false;
-    state.foreground_process = true;
-    state.overlay_visible = false;
-    state.pending_confirm = None;
-    state.cancel_ai();
+    state.begin_foreground(worker);
     output.hide_overlay().map_err(output_error)?;
     output.set_foreground_and_wait(true).map_err(output_error)?;
     match state.shell {
@@ -644,7 +658,7 @@ pub(super) fn handle_signal(
             state.update_terminal_size(size);
             state.overlay_visible = false;
             state.pending_confirm = None;
-            state.pending_reanchor = state.editing;
+            state.pending_reanchor = state.editing();
             pty.resize(size)?;
             output.resize(size).map_err(output_error)?;
             Ok(false)
@@ -668,7 +682,7 @@ pub(super) fn handle_signal(
             state.update_terminal_size(size);
             state.overlay_visible = false;
             state.need_cpr = false;
-            state.pending_reanchor = state.editing;
+            state.pending_reanchor = state.editing();
             state.suspended = false;
             output.resume_after_continue(size).map_err(output_error)?;
             pty.resize(size)?;
@@ -690,13 +704,10 @@ pub(super) fn detect_foreground_process(
     state: &mut RuntimeState,
     pty: &PtyChild,
     output: &OutputHandle,
+    worker: &ProviderWorker,
 ) -> crate::Result<()> {
-    if !state.foreground_process && pty.shell_is_foreground() == Some(false) {
-        state.foreground_process = true;
-        state.editing = false;
-        state.overlay_visible = false;
-        state.pending_confirm = None;
-        state.cancel_ai();
+    if !state.foreground_process() && pty.shell_is_foreground() == Some(false) {
+        state.begin_foreground(worker);
         output.hide_overlay().map_err(output_error)?;
         output.set_foreground(true).map_err(output_error)?;
     }

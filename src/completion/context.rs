@@ -58,8 +58,20 @@ impl BufferSnapshot {
     }
 }
 
+/// Identifies one shell editing session, independent of buffer and query ids.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EditEpoch(u64);
+
+impl EditEpoch {
+    pub(crate) fn checked_next(self) -> Option<Self> {
+        self.0.checked_add(1).map(Self)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct CompletionContext {
+    pub argument: super::ArgumentSemantics,
+    pub edit_epoch: EditEpoch,
     pub query_id: QueryId,
     pub shell: ShellKind,
     pub platform: &'static str,
@@ -101,7 +113,9 @@ impl CompletionContext {
         (parsed.command, parsed.command_range) = command
             .map(|(command, range)| (Some(command), Some(range)))
             .unwrap_or((None, None));
-        Ok(Self {
+        let mut context = Self {
+            argument: super::ArgumentSemantics::Unknown,
+            edit_epoch: EditEpoch::default(),
             query_id,
             shell,
             platform: std::env::consts::OS,
@@ -111,7 +125,15 @@ impl CompletionContext {
             mode: CompletionMode::Normal,
             previous_command: None,
             workspace: WorkspaceMarkers::default(),
-        })
+        };
+        context.argument = crate::providers::argument::resolve(&context);
+        Ok(context)
+    }
+
+    #[must_use]
+    pub const fn with_edit_epoch(mut self, epoch: EditEpoch) -> Self {
+        self.edit_epoch = epoch;
+        self
     }
 
     #[must_use]

@@ -36,6 +36,21 @@ pub struct ProtocolDiagnostic {
     pub message: String,
 }
 
+impl ProtocolDiagnostic {
+    /// Ordering anomalies are recoverable bookkeeping diagnostics, not failed
+    /// user commands. Keep them in the debug log without opening an overlay.
+    #[must_use]
+    pub fn user_message(&self) -> Option<&'static str> {
+        match self.code {
+            "HK-SHL-011" | "HK-SHL-013" => None,
+            "HK-SHL-012" => Some("Shell 同步连接已中断；请退出并重新打开 Hokan。"),
+            "HK-SHL-003" | "HK-SHL-006" => Some("Shell 集成版本不兼容；请退出并重新打开 Hokan。"),
+            "HK-SHL-004" => Some("输入过长，暂时无法提供补全；缩短输入后会自动恢复。"),
+            _ => Some("Shell 同步数据异常；继续输入可重试，若持续出现请重新打开 Hokan。"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DecodedShellEvents {
     pub events: Vec<ShellEvent>,
@@ -136,6 +151,14 @@ impl ShellProtocolDecoder {
         }
         let event = envelope.next().unwrap_or_default();
         let payload = envelope.next().unwrap_or_default();
+        // Plugins can invoke a preexec hook twice for the same command. Treat
+        // this as one lifecycle, including the payload-free oversized marker.
+        // A different command still goes through the pairing check below.
+        if (event == "START" && self.active_command.as_deref() == Some(payload))
+            || (event == "STARTX" && self.active_command.as_deref() == Some(""))
+        {
+            return;
+        }
         if event == "BUFFERX" {
             // The shell skipped an oversized buffer snapshot. Consume its
             // redisplay id so id ordering stays intact and mark the mirror
@@ -575,6 +598,63 @@ mod tests {
                 cwd: PathBuf::from("/tmp\twith-tab"),
                 history_control: Some("ignoreboth".into()),
             }]
+        );
+    }
+
+    #[test]
+    fn repeated_starts_are_idempotent_across_arbitrary_read_boundaries() {
+        for start in ["START\techo ok", "STARTX"] {
+            let input = format!("HKP2\t{start}\0HKP2\t{start}\0HKP2\tEND\t7\t/tmp\0");
+            for split in 0..=input.len() {
+                let mut decoder = ShellProtocolDecoder::new(ShellKind::Zsh);
+                let first = decoder.feed(&input.as_bytes()[..split]);
+                let second = decoder.feed(&input.as_bytes()[split..]);
+                assert!(first.diagnostics.is_empty());
+                assert!(second.diagnostics.is_empty());
+                let events: Vec<_> = first.events.into_iter().chain(second.events).collect();
+                let command = if start == "STARTX" { "" } else { "echo ok" };
+                assert_eq!(
+                    events,
+                    vec![
+                        ShellEvent::CommandStart {
+                            command: command.into()
+                        },
+                        ShellEvent::CommandEnd {
+                            exit_code: 7,
+                            cwd: PathBuf::from("/tmp"),
+                            command: command.into(),
+                        },
+                    ]
+                );
+                // Repeating the same command after END is a new execution.
+                assert_eq!(
+                    decoder
+                        .feed(format!("HKP2\t{start}\0").as_bytes())
+                        .events
+                        .len(),
+                    1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn conflicting_start_keeps_original_history_pair_and_recovers_at_prompt() {
+        let mut decoder = ShellProtocolDecoder::new(ShellKind::Zsh);
+        decoder.feed(b"HKP2\tSTART\toriginal\0");
+        let conflict = decoder.feed(b"HKP2\tSTART\tother\0");
+        assert!(conflict.events.is_empty());
+        assert_eq!(conflict.diagnostics[0].code, "HK-SHL-013");
+        assert!(conflict.diagnostics[0].user_message().is_none());
+        let ended = decoder.feed(b"HKP2\tEND\t1\t/tmp\0");
+        assert!(
+            matches!(&ended.events[0], ShellEvent::CommandEnd { command, exit_code: 1, .. } if command == "original")
+        );
+        decoder.feed(b"HKP2\tSTART\tunfinished\0HKP2\tPROMPT\t1\t/tmp\0");
+        let recovered = decoder.feed(b"HKP2\tSTART\tnext\0HKP2\tEND\t0\t/tmp\0");
+        assert!(recovered.diagnostics.is_empty());
+        assert!(
+            matches!(&recovered.events[1], ShellEvent::CommandEnd { command, .. } if command == "next")
         );
     }
 

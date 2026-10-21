@@ -32,7 +32,7 @@ pub(super) fn handle_control_message(
     match message {
         ControlMessage::Event(ShellEvent::PathChanged { path }) => {
             if state.commands.refresh_from_path(Some(path.as_os_str()))
-                && state.editing
+                && state.editing()
                 && state.buffer.sync != SyncQuality::Uncertain
                 && (!state.buffer.text.trim().is_empty() || state.history_only)
             {
@@ -45,7 +45,7 @@ pub(super) fn handle_control_message(
             history_control,
         }) => {
             let queued_enter = std::mem::take(&mut state.queued_startup_enter);
-            state.cancel_ai();
+            state.begin_prompt(worker, queued_enter)?;
             state.ignore_leading_space_history = history_control
                 .as_deref()
                 .is_some_and(history_control_ignores_space);
@@ -58,7 +58,6 @@ pub(super) fn handle_control_message(
                 sync_history(state, store, history, policy)?;
             }
             state.cwd = cwd;
-            state.editing = !queued_enter;
             state.history_only = false;
             state.history_navigation = false;
             state.need_cpr = !queued_enter;
@@ -69,17 +68,6 @@ pub(super) fn handle_control_message(
                 } else {
                     SyncQuality::Mirrored
                 })?;
-            state.context = None;
-            state.candidates_context = None;
-            state.candidates.clear();
-            state.selected = None;
-            state.selection_intent = None;
-            state.pending_accept = false;
-            state.provider_pending = false;
-            state.provider_batch_deadline = None;
-            state.overlay_visible = false;
-            state.pending_confirm = None;
-            state.foreground_process = queued_enter;
             state.pending_reanchor = false;
             // An Enter already sent to the PTY belongs to the command after
             // this initial prompt. Do not briefly return ownership to shell
@@ -92,6 +80,12 @@ pub(super) fn handle_control_message(
             cursor,
             text,
         }) => {
+            // Redisplay frames can lag behind Enter on the separate control
+            // FIFO. Once input belongs to a command, a late shell buffer must
+            // not update the mirror or start filesystem/help providers.
+            if !state.editing() {
+                return Ok(());
+            }
             if state.buffer.set_exact(text, cursor)? {
                 output
                     .arm_render_gate(RenderGateRequest {
@@ -105,19 +99,12 @@ pub(super) fn handle_control_message(
             }
         }
         ControlMessage::Event(ShellEvent::CommandStart { command }) => {
-            state.cancel_ai();
-            state.history_navigation = false;
+            state.begin_foreground(worker);
             // A STARTX marker decodes to an empty command: the real text
             // exceeded the control-frame budget. Leave pending_command empty
             // so history falls back to the shell's own records instead of
             // persisting a stale mirror or an empty row.
             state.pending_command = (!command.is_empty()).then_some(command);
-            state.editing = false;
-            state.overlay_visible = false;
-            state.pending_confirm = None;
-            state.selection_intent = None;
-            state.pending_accept = false;
-            state.foreground_process = true;
             output.hide_overlay().map_err(output_error)?;
             output.set_foreground(true).map_err(output_error)?;
         }
@@ -132,15 +119,21 @@ pub(super) fn handle_control_message(
             record_history(command, Some(exit_code), state, store, history, policy)?;
         }
         ControlMessage::Diagnostic(diagnostic) => {
-            state.status = Some(format!("{} {}", diagnostic.code, diagnostic.message));
+            if let Some(log) = &state.debug_log {
+                log.shell_diagnostic(diagnostic.code);
+            }
+            if let Some(message) = diagnostic.user_message() {
+                state.status = Some(format!("{} {message}", diagnostic.code));
+            }
         }
         ControlMessage::BufferUncertain => {
+            worker.cancel();
             state.cancel_ai();
             state.buffer.mark_uncertain();
             state.overlay_visible = false;
             state.pending_confirm = None;
             state.selection_intent = None;
-            state.pending_accept = false;
+            state.pending_accept = None;
             output.hide_overlay().map_err(output_error)?;
         }
     }
@@ -165,7 +158,7 @@ pub(super) fn handle_config_reload(
                 log.config_reload("invalid", None);
             }
             state.status = Some(format!(
-                "HK-CFG-RELOAD invalid config; keeping last known good: {error}"
+                "HK-CFG-RELOAD 配置有误，已保留上次可用配置；修正后会自动重载。{error}"
             ));
             return render_current(state, output);
         }
@@ -198,7 +191,7 @@ pub(super) fn handle_config_reload(
                 .configure_title(live.ui.sync_title.then(|| state.shell.name().to_owned()))
                 .map_err(output_error)?;
             *config = live;
-            if state.editing
+            if state.editing()
                 && state.buffer.sync != SyncQuality::Uncertain
                 && (!state.buffer.text.trim().is_empty() || state.history_only)
             {
@@ -220,11 +213,11 @@ pub(super) fn config_reload_status(
 ) -> Option<String> {
     if !restart_required.is_empty() {
         return Some(format!(
-            "HK-CFG-RESTART restart required for {} changes",
+            "HK-CFG-RESTART {} 设置已保存；重新打开 Hokan 后生效。",
             restart_required.join(", ")
         ));
     }
-    has_candidates.then(|| "HK-CFG-RELOAD applied provider and UI configuration".into())
+    has_candidates.then(|| "HK-CFG-RELOAD 补全与界面配置已更新。".into())
 }
 
 pub(super) fn merge_live_config(

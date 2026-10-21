@@ -153,7 +153,7 @@ fn partial_refresh_waits_one_frame_but_final_results_and_navigation_are_immediat
         let directory = tempfile::tempdir().expect("directory");
         let mut state = runtime_state(directory.path());
         let (output, join) = test_output();
-        state.editing = true;
+        state.input_owner = super::super::state::InputOwner::Editing;
         state.buffer.set_exact("ec".into(), 2).expect("buffer");
         refresh_context(&mut state, QueryId::new(1));
         output
@@ -348,7 +348,7 @@ fn tab_intent_waits_for_candidates_after_a_queued_buffer_event() {
         .expect("newer buffer");
     refresh_context(&mut state, QueryId::new(2));
     state.selected = None;
-    state.pending_accept = true;
+    state.pending_accept = state.editing_epoch();
     let result = provider_result(
         &state,
         vec![Candidate::new(
@@ -372,7 +372,10 @@ fn tab_intent_waits_for_candidates_after_a_queued_buffer_event() {
     );
     handle_provider_result(result, &mut state, &output).expect("provider result");
 
-    assert!(state.pending_accept, "fresh results must not drop the Tab");
+    assert!(
+        state.pending_accept.is_some(),
+        "fresh results must not drop the Tab"
+    );
     assert!(
         state.selected.is_some(),
         "fresh top row should be reselected"

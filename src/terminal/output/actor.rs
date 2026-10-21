@@ -245,6 +245,13 @@ impl<W: Write> OutputActor<W> {
                 self.latest_frame = None;
             }
             ControlCommand::SetForeground(foreground) => {
+                if foreground {
+                    self.mailbox
+                        .colors
+                        .lock()
+                        .map_err(|_| OutputError::Poisoned)?
+                        .begin_foreground();
+                }
                 if foreground && !self.foreground {
                     self.title.next_command();
                 }
@@ -282,8 +289,12 @@ impl<W: Write> OutputActor<W> {
             ControlCommand::Snapshot(sender) => {
                 let _ = sender.send(self.output_state());
             }
-            ControlCommand::PrepareSurface { status, sender } => {
-                let geometry = self.prepare_surface_geometry(status.as_ref())?;
+            ControlCommand::PrepareSurface {
+                status,
+                compact_rows,
+                sender,
+            } => {
+                let geometry = self.prepare_surface_geometry(status.as_ref(), compact_rows)?;
                 let _ = sender.send(geometry);
             }
             ControlCommand::InvalidateAnchor => {
@@ -349,6 +360,13 @@ impl<W: Write> OutputActor<W> {
             self.guard.write_child(segment)?;
             written_bytes = written_bytes.saturating_add(segment.len());
             start = boundary.passthrough_offset;
+            if matches!(boundary.event, RenderBoundaryEvent::PromptRendered { .. }) {
+                self.mailbox
+                    .colors
+                    .lock()
+                    .map_err(|_| OutputError::Poisoned)?
+                    .prompt(Instant::now());
+            }
             self.observe_boundary(
                 boundary.event,
                 batch.read_cycle,
@@ -402,6 +420,11 @@ impl<W: Write> OutputActor<W> {
         if bytes.is_empty() {
             return Ok(());
         }
+        self.mailbox
+            .colors
+            .lock()
+            .map_err(|_| OutputError::Poisoned)?
+            .observe_output(bytes, Instant::now());
         let scan = self.scanner.feed(bytes);
         let update = self.model.process(bytes)?;
         if self.model.take_title_changed() {

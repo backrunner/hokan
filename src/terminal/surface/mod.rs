@@ -136,6 +136,9 @@ pub struct OverlayView {
     pub pagination: Option<(usize, usize)>,
     /// Typed text used to highlight the matching prefix of each primary.
     pub highlight: Option<SanitizedText>,
+    /// Path recovery has a short heading, compact rows and explicit fill hints.
+    pub recovery: bool,
+    pub fill_only: bool,
 }
 
 impl OverlayView {
@@ -152,6 +155,8 @@ impl OverlayView {
             status: None,
             pagination: None,
             highlight: None,
+            recovery: false,
+            fill_only: false,
         }
     }
 }

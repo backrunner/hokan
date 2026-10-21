@@ -295,6 +295,12 @@ cd_enter_behavior = "execute" # default; or "continue"
 
 `Tab` always fills the path and continues completion without executing.
 
+Misspelled paths can offer explicit repairs, including adjacent-letter swaps
+and a missing intermediate directory name. Recovery rows show the corrected
+path or a readable parent; they never create directories. `Enter` on a repair
+only fills the command, even with `cd_enter_behavior = "execute"`, and leaves
+the refreshed list unselected. `mkdir -p` may name directories that do not exist.
+
 Diagnostic logging is opt-in and bounded:
 
 ```toml
@@ -478,6 +484,14 @@ window, then discards completed stale replies without passing them to the shell.
 A standalone Escape still uses the 32 ms ambiguity window. Native PTY tests
 cover delayed private and standard cursor replies; remote SSH environments still
 require verification. See [troubleshooting](docs/troubleshooting.md).
+
+Color replies such as `#ffffff` or `rgb:ffff/ffff/ffff` can also arrive after
+the querying program exits. Hokan tracks emitted OSC 4, 10–19 and 21 queries
+before forwarding output, preserves split-response ownership across the prompt,
+and consumes recognized late replies within a two-second grace period. Active
+programs and shell widgets still receive their replies; ordinary color text and
+bracketed paste remain input. Native PTY tests cover complete and partial late
+color replies as well as live foreground queries.
 
 ## Development
 

@@ -1,3 +1,4 @@
+mod color_reply;
 pub mod compositor;
 pub mod guard;
 pub mod icons;

@@ -402,6 +402,7 @@ fn head(bytes: &[u8], max: usize) -> String {
 
 mod activation;
 mod candidates;
+mod color_replies;
 mod foreground;
 mod input;
 

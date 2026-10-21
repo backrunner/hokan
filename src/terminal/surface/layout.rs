@@ -85,6 +85,22 @@ pub(super) const PAGINATION_PAD: usize = 3;
 /// Dashes kept between right-aligned edge content and the right corner.
 pub(super) const EDGE_TRAIL: usize = 2;
 
+/// Keep the support code in the notice heading so the body starts with the
+/// explanation. Provider messages without a code remain untouched.
+pub(super) fn status_parts(text: &str) -> (Option<&str>, &str) {
+    if let Some((code, message)) = text.split_once(' ')
+        && code.starts_with("HK-")
+        && code.len() <= 40
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        (Some(code), message)
+    } else {
+        (None, text)
+    }
+}
+
 /// Wrap notices by terminal cell width, including paths without word breaks.
 /// Keep the height bounded and mark any omitted tail explicitly.
 pub(super) fn status_lines(text: &str, width: usize, max_lines: usize) -> Vec<String> {

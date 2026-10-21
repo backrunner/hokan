@@ -1,11 +1,34 @@
 use super::*;
 
 #[test]
+fn foreground_commands_ignore_late_provider_results() {
+    let directory = tempfile::tempdir().expect("directory");
+    let mut state = runtime_state(directory.path());
+    let (output, join) = test_output();
+    state
+        .buffer
+        .set_exact("brew uninstall xxx".into(), 18)
+        .expect("buffer");
+    refresh_context(&mut state, QueryId::new(1));
+    let late = provider_result(
+        &state,
+        vec![history_candidate(QueryId::new(1), "brew uninstall other")],
+    );
+    state.input_owner = super::super::state::InputOwner::Foreground;
+    handle_provider_result(late, &mut state, &output).expect("late result");
+    assert!(state.candidates.is_empty());
+    assert!(state.status.is_none());
+    assert!(!state.overlay_visible);
+    output.restore_and_exit().expect("shutdown");
+    join.join().expect("actor joins").expect("actor exits");
+}
+
+#[test]
 fn dismissed_overlay_drops_pending_frames_and_late_results_until_reopened_or_edited() {
     let directory = tempfile::tempdir().expect("directory");
     let mut state = runtime_state(directory.path());
     let (output, join) = test_output();
-    state.editing = true;
+    state.input_owner = super::super::state::InputOwner::Editing;
     state.buffer.set_exact("echo ".into(), 5).expect("buffer");
     refresh_context(&mut state, QueryId::new(1));
     let late = provider_result(
@@ -58,7 +81,7 @@ fn a_final_frame_invalidated_by_child_output_is_retried_without_another_result()
     let directory = tempfile::tempdir().expect("directory");
     let mut state = runtime_state(directory.path());
     let (output, join) = test_output();
-    state.editing = true;
+    state.input_owner = super::super::state::InputOwner::Editing;
     state.buffer.set_exact("ec".into(), 2).expect("buffer");
     refresh_context(&mut state, QueryId::new(1));
     output
@@ -123,7 +146,7 @@ fn final_empty_result_discards_queued_frames_so_the_list_cannot_reappear() {
     let directory = tempfile::tempdir().expect("directory");
     let mut state = runtime_state(directory.path());
     let (output, join) = test_output();
-    state.editing = true;
+    state.input_owner = super::super::state::InputOwner::Editing;
     state.buffer.set_exact("ec".into(), 2).expect("buffer");
     refresh_context(&mut state, QueryId::new(1));
     output
@@ -190,7 +213,7 @@ fn info_level_diagnostics_stay_out_of_the_status_line() {
     handle_provider_result(warning, &mut state, &output).expect("provider result");
     assert_eq!(
         state.status.as_deref(),
-        Some("provider x failed internally (HK-CMP-002)")
+        Some("provider x failed internally")
     );
 }
 
@@ -220,4 +243,106 @@ fn provider_result_is_dropped_when_buffer_sync_is_uncertain() {
     );
     output.restore_and_exit().expect("shutdown");
     join.join().expect("actor joins").expect("actor exits");
+}
+
+#[test]
+fn late_work_cannot_cross_prompt_epochs_even_with_identical_buffer_and_query() {
+    let directory = tempfile::tempdir().expect("directory");
+    let mut state = runtime_state(directory.path());
+    let worker = ProviderWorker::start(
+        Arc::new(crate::completion::CompletionEngine::new(8, 12)),
+        None,
+    )
+    .expect("worker");
+    let (output, join) = test_output();
+    state.buffer.set_exact("git ".into(), 4).expect("buffer");
+    // Reuse ids and buffer deliberately: epoch admission must stand on its own.
+    for round in 0..64 {
+        refresh_context(&mut state, QueryId::new(1));
+        let old_context = Arc::clone(state.context.as_ref().expect("context"));
+        let old_epoch = old_context.edit_epoch;
+        state.pending_accept = Some(old_epoch);
+        state.begin_foreground(&worker);
+        assert!(!state.take_pending_accept());
+        let batch = || ProviderResult {
+            context: Arc::clone(&old_context),
+            output: ProviderOutput {
+                candidates: vec![history_candidate(QueryId::new(1), "git stale")],
+                diagnostics: Vec::new(),
+            },
+            final_batch: round % 2 == 0,
+        };
+        handle_provider_result(batch(), &mut state, &output).expect("foreground batch");
+        assert!(state.candidates.is_empty());
+        state.begin_prompt(&worker, false).expect("new prompt");
+        refresh_context(&mut state, QueryId::new(1));
+        assert_ne!(state.editing_epoch(), Some(old_epoch));
+        handle_provider_result(batch(), &mut state, &output).expect("late batch");
+        assert!(state.candidates.is_empty());
+        // A delayed Tab cannot acquire the next prompt's candidates.
+        state.pending_accept = Some(old_epoch);
+        assert!(!state.take_pending_accept());
+        state.pending_accept = state.editing_epoch();
+        assert!(state.take_pending_accept());
+        assert!(!state.take_pending_accept());
+        // Candidate activation independently checks the producing session.
+        state.candidates = vec![history_candidate(QueryId::new(1), "git stale")];
+        state.selected = Some(state.candidates[0].id);
+        state.candidates_context = Some(old_context);
+        assert!(matches!(
+            resolve_selected_activation(&state).expect("activation"),
+            SelectedActivation::Rejected
+        ));
+        state.candidates.clear();
+        state.selected = None;
+        // Even an identical AI generation/id cannot consume a fresh request.
+        let current_epoch = state.editing_epoch().expect("editing");
+        state.ai_query = Some(ActiveAiRequest {
+            edit_epoch: current_epoch,
+            query_id: QueryId::new(1),
+            generation: 1,
+            cancel: tokio_util::sync::CancellationToken::new(),
+        });
+        handle_ai_result(
+            AiResult {
+                edit_epoch: old_epoch,
+                query_id: QueryId::new(1),
+                generation: 1,
+                result: Ok(vec![ai_command("git stale")]),
+            },
+            &mut state,
+            &output,
+        )
+        .expect("late ai");
+        assert!(state.ai_query.is_some());
+        assert!(state.candidates.is_empty());
+        state.cancel_ai();
+        let fresh = provider_result(
+            &state,
+            vec![history_candidate(QueryId::new(1), "git status")],
+        );
+        handle_provider_result(fresh, &mut state, &output).expect("fresh result");
+        assert_eq!(state.candidates[0].display.primary, "git status");
+    }
+    output.restore_and_exit().expect("shutdown");
+    join.join().expect("actor joins").expect("actor exits");
+}
+
+#[test]
+fn startup_does_not_own_completion_work() {
+    let directory = tempfile::tempdir().expect("directory");
+    let mut state = runtime_state(directory.path());
+    state.input_owner = super::super::state::InputOwner::Starting;
+    state
+        .buffer
+        .set_exact("cat missing/file".into(), 16)
+        .expect("buffer");
+    let worker = ProviderWorker::start(
+        Arc::new(crate::completion::CompletionEngine::new(8, 12)),
+        None,
+    )
+    .expect("worker");
+    state.schedule_query(&worker).expect("query suppressed");
+    assert!(state.context.is_none());
+    assert!(!state.provider_pending);
 }

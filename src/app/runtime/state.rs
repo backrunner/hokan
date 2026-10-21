@@ -11,7 +11,9 @@ use super::{
     worker::ProviderWorker,
 };
 use crate::{
-    completion::{BufferSnapshot, Candidate, CompletionContext, CompletionMode, SyncQuality},
+    completion::{
+        BufferSnapshot, Candidate, CompletionContext, CompletionMode, EditEpoch, SyncQuality,
+    },
     diagnostics::DebugLog,
     history::{HistoryCursor, HistoryEventV1},
     platform::CommandPathCache,
@@ -24,6 +26,13 @@ use crate::{
     },
 };
 use tokio_util::sync::CancellationToken;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum InputOwner {
+    Starting,
+    Editing,
+    Foreground,
+}
 
 pub(super) struct RuntimeState {
     pub(super) shell: ShellKind,
@@ -42,7 +51,7 @@ pub(super) struct RuntimeState {
     /// One-shot Tab fill deferred until candidates for the latest
     /// authoritative shell buffer arrive. Every subsequent input event clears
     /// it; shell buffer events for bytes typed before Tab do not.
-    pub(super) pending_accept: bool,
+    pub(super) pending_accept: Option<EditEpoch>,
     pub(super) history_only: bool,
     pub(super) history_navigation: bool,
     pub(super) provider_pending: bool,
@@ -61,7 +70,8 @@ pub(super) struct RuntimeState {
     /// invalidate its ticket before the actor gets to it.
     pub(super) in_flight_frame: Option<FrameTicket>,
     pub(super) frame_revision: FrameRevision,
-    pub(super) editing: bool,
+    pub(super) input_owner: InputOwner,
+    edit_epoch: EditEpoch,
     /// Enter was forwarded before the shell's first PROMPT control event.
     pub(super) queued_startup_enter: bool,
     pub(super) pending_mirror_revision: Option<BufferRevision>,
@@ -91,7 +101,6 @@ pub(super) struct RuntimeState {
     /// AI wait screen or its results own the overlay, provider batches for the
     /// same query must not replace them.
     pub(super) ai_owns_candidates: bool,
-    pub(super) foreground_process: bool,
     pub(super) suspended: bool,
     pub(super) pending_reanchor: bool,
     pub(super) history_cursor: HistoryCursor,
@@ -142,7 +151,7 @@ impl RuntimeState {
             candidates: Vec::new(),
             selected: None,
             selection_intent: None,
-            pending_accept: false,
+            pending_accept: None,
             history_only: false,
             history_navigation: false,
             provider_pending: false,
@@ -152,7 +161,8 @@ impl RuntimeState {
             repaint_pending: false,
             in_flight_frame: None,
             frame_revision: FrameRevision::ZERO,
-            editing: false,
+            input_owner: InputOwner::Starting,
+            edit_epoch: EditEpoch::default(),
             queued_startup_enter: false,
             pending_mirror_revision: None,
             status: None,
@@ -174,7 +184,6 @@ impl RuntimeState {
             ai_query: None,
             ai_generation: 0,
             ai_owns_candidates: false,
-            foreground_process: false,
             suspended: false,
             pending_reanchor: false,
             history_cursor,
@@ -192,6 +201,43 @@ impl RuntimeState {
             theme_revision: 1,
             debug_log,
         }
+    }
+
+    pub(super) fn editing(&self) -> bool {
+        self.input_owner == InputOwner::Editing
+    }
+    pub(super) fn foreground_process(&self) -> bool {
+        self.input_owner == InputOwner::Foreground
+    }
+    pub(super) fn editing_epoch(&self) -> Option<EditEpoch> {
+        self.editing().then_some(self.edit_epoch)
+    }
+    pub(super) fn take_pending_accept(&mut self) -> bool {
+        self.pending_accept
+            .take()
+            .is_some_and(|epoch| self.editing_epoch() == Some(epoch))
+    }
+
+    pub(super) fn owns_context(&self, context: &CompletionContext) -> bool {
+        self.editing_epoch() == Some(context.edit_epoch)
+    }
+    pub(super) fn begin_prompt(
+        &mut self,
+        worker: &ProviderWorker,
+        queued_enter: bool,
+    ) -> crate::Result<()> {
+        worker.cancel();
+        self.clear_completion();
+        self.edit_epoch = self
+            .edit_epoch
+            .checked_next()
+            .ok_or_else(|| crate::Error::Runtime("editing epoch exhausted".into()))?;
+        self.input_owner = if queued_enter {
+            InputOwner::Foreground
+        } else {
+            InputOwner::Editing
+        };
+        Ok(())
     }
 
     pub(super) fn update_terminal_size(&mut self, size: TerminalSize) {
@@ -223,7 +269,8 @@ impl RuntimeState {
         self.scheduler.discard_pending();
         self.status = None;
         self.pending_confirm = None;
-        if self.dismissed_revision == Some(self.buffer.revision)
+        if !self.editing()
+            || self.dismissed_revision == Some(self.buffer.revision)
             || self.buffer.sync == SyncQuality::Uncertain
             || (self.buffer.text.trim().is_empty() && !self.history_only)
         {
@@ -232,7 +279,7 @@ impl RuntimeState {
             self.candidates_context = None;
             self.candidates.clear();
             self.selected = None;
-            self.pending_accept = false;
+            self.pending_accept = None;
             self.overlay_visible = false;
             self.provider_pending = false;
             return Ok(());
@@ -255,6 +302,7 @@ impl RuntimeState {
                 self.cwd.clone(),
                 self.snapshot()?,
             )?
+            .with_edit_epoch(self.edit_epoch)
             .with_mode(if self.history_navigation {
                 CompletionMode::HistoryNavigation
             } else if self.history_only {
@@ -275,13 +323,25 @@ impl RuntimeState {
 
     pub(super) fn dismiss_overlay(&mut self) {
         self.dismissed_revision = Some(self.buffer.revision);
+        self.clear_completion();
+    }
+
+    pub(super) fn begin_foreground(&mut self, worker: &ProviderWorker) {
+        worker.cancel();
+        self.clear_completion();
+        self.input_owner = InputOwner::Foreground;
+        self.history_only = false;
+        self.history_navigation = false;
+    }
+
+    fn clear_completion(&mut self) {
         self.cancel_ai();
         self.context = None;
         self.candidates_context = None;
         self.candidates.clear();
         self.selected = None;
         self.selection_intent = None;
-        self.pending_accept = false;
+        self.pending_accept = None;
         self.pending_confirm = None;
         self.provider_pending = false;
         self.provider_batch_deadline = None;
@@ -305,7 +365,7 @@ impl RuntimeState {
         if self.pending_confirm.is_some() || self.ai_query.is_some() || self.ai_owns_candidates {
             return Ok(());
         }
-        if self.editing
+        if self.editing()
             && self.buffer.sync != SyncQuality::Uncertain
             && (!self.buffer.text.trim().is_empty() || self.history_only)
         {
@@ -340,6 +400,7 @@ impl RuntimeState {
 }
 
 pub(super) struct ActiveAiRequest {
+    pub(super) edit_epoch: EditEpoch,
     pub(super) query_id: QueryId,
     pub(super) generation: u64,
     pub(super) cancel: CancellationToken,
@@ -348,6 +409,7 @@ pub(super) struct ActiveAiRequest {
 /// A dangerous candidate execution awaiting explicit confirmation: the full
 /// final command text plus the effective risk that triggered the prompt.
 pub(super) struct PendingConfirm {
+    pub(super) edit_epoch: EditEpoch,
     pub(super) text: String,
     pub(super) risk: crate::terminal::RiskLevel,
     pub(super) reasons: Vec<String>,

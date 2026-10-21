@@ -129,12 +129,48 @@ fn standalone_status_is_a_compact_notice_without_candidate_controls() {
         )
         .expect("geometry");
         let buffer = renderer.render(geometry, &view);
+        assert!(row_text(&buffer, 10).contains("提示"));
         assert!(row_text(&buffer, 11).contains("无法读取目录：权限不足"));
         assert!(row_text(&buffer, 12).contains("Esc 关闭"));
         let text = (10..13).map(|y| row_text(&buffer, y)).collect::<String>();
         for absent in ["Tab", "Enter", "▶", "1/20"] {
             assert!(!text.contains(absent), "{text}");
         }
+    }
+}
+
+#[test]
+fn notice_separates_diagnostic_code_from_the_explanation() {
+    let status = SanitizedText::new("HK-SHL-012 Shell 同步连接已中断；请重新打开 Hokan。");
+    let renderer = OverlaySurfaceRenderer::new(12, SurfaceTheme::plain(), false);
+    for width in [12, 32, 60] {
+        let height = renderer.status_height(width, &status);
+        assert!(height <= 5);
+        let geometry = SurfaceGeometry::new_with_width(
+            10,
+            TerminalSize::new(24, 80).expect("size"),
+            height,
+            width,
+        )
+        .expect("geometry");
+        let buffer = renderer.render(
+            geometry,
+            &OverlayView {
+                status: Some(status.clone()),
+                ..OverlayView::default()
+            },
+        );
+        let heading = row_text(&buffer, 10);
+        assert!(heading.contains("提示"));
+        if width >= 32 {
+            assert!(heading.contains("HK-SHL-012"));
+        }
+        let body = (11..10 + height - 1)
+            .map(|y| row_text(&buffer, y))
+            .collect::<String>();
+        assert!(!body.contains("HK-SHL"));
+        assert!(body.contains("Shell"));
+        assert!(!body.contains("▶"));
     }
 }
 

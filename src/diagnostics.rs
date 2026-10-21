@@ -115,6 +115,11 @@ impl DebugLog {
         self.record("ai-request", [("outcome", Value::String(outcome.into()))]);
     }
 
+    /// Protocol codes are sufficient for support; never log shell payloads.
+    pub fn shell_diagnostic(&self, code: &'static str) {
+        self.record("shell-diagnostic", [("code", Value::String(code.into()))]);
+    }
+
     /// Records that `hide_overlay` refused to erase the overlay because a
     /// safety guard rejected the write. Carries only the guard name — never
     /// buffer or screen content.

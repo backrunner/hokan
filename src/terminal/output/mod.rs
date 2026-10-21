@@ -101,6 +101,21 @@ pub struct OutputHandle {
 }
 
 impl OutputHandle {
+    /// The output actor registers color queries before writing them. Sharing
+    /// this small protocol state closes the output/input channel race.
+    pub(crate) fn filter_color_replies(
+        &self,
+        bytes: &[u8],
+        foreground: bool,
+    ) -> Result<Vec<u8>, OutputError> {
+        Ok(self
+            .mailbox
+            .colors
+            .lock()
+            .map_err(|_| OutputError::Poisoned)?
+            .route(bytes, foreground, Instant::now()))
+    }
+
     pub fn configure_title(&self, shell: Option<String>) -> Result<(), OutputError> {
         self.mailbox
             .push_control(ControlCommand::ConfigureTitle(shell))
@@ -214,23 +229,30 @@ impl OutputHandle {
     }
 
     pub fn prepare_surface(&self) -> Result<Option<SurfaceGeometry>, OutputError> {
-        self.prepare_surface_with_status(None)
+        self.prepare_surface_with_status(None, None)
     }
 
     pub fn prepare_surface_for(
         &self,
         view: &OverlayView,
     ) -> Result<Option<SurfaceGeometry>, OutputError> {
-        self.prepare_surface_with_status(view.standalone_status().cloned())
+        self.prepare_surface_with_status(
+            view.standalone_status().cloned(),
+            view.recovery.then_some(view.rows.len()),
+        )
     }
 
     fn prepare_surface_with_status(
         &self,
         status: Option<SanitizedText>,
+        compact_rows: Option<usize>,
     ) -> Result<Option<SurfaceGeometry>, OutputError> {
         let (sender, receiver) = mpsc::sync_channel(0);
-        self.mailbox
-            .push_control(ControlCommand::PrepareSurface { status, sender })?;
+        self.mailbox.push_control(ControlCommand::PrepareSurface {
+            status,
+            compact_rows,
+            sender,
+        })?;
         receiver.recv().map_err(|_| OutputError::Closed)
     }
 
@@ -308,6 +330,7 @@ enum ControlCommand {
     Snapshot(SyncSender<OutputState>),
     PrepareSurface {
         status: Option<SanitizedText>,
+        compact_rows: Option<usize>,
         sender: SyncSender<Option<SurfaceGeometry>>,
     },
     InvalidateAnchor,
@@ -345,6 +368,7 @@ struct MailboxQueues {
 struct OutputMailbox {
     queues: Mutex<MailboxQueues>,
     wake: Condvar,
+    colors: Mutex<super::color_reply::ColorReplyFilter>,
 }
 
 impl OutputMailbox {

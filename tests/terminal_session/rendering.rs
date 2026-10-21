@@ -1,6 +1,158 @@
 use super::*;
 
 #[test]
+fn literal_slash_arguments_clear_stale_directory_errors() {
+    if !command_exists("zsh") {
+        return;
+    }
+    let mut terminal = TerminalSession::spawn();
+    terminal.wait_for_bare_row("HK>");
+    fs::create_dir_all(terminal._work.path().join("anomalyco/tap")).expect("collision directory");
+    fs::write(
+        terminal._work.path().join("anomalyco/tap/private-file"),
+        b"fixture",
+    )
+    .expect("file");
+    terminal.write(b"grep pattern hokan-missing-parent/file");
+    terminal.wait_for_screen("找不到目录");
+    for text in [
+        "unmodelled-command anomalyco/tap/",
+        "unmodelled-command ./anomalyco/tap/",
+        "brew uninstall anomalyco/tap/",
+        "npm exec @scope/pkg",
+        "grep src/part",
+        "sed s/old/new/",
+        "awk /pattern/",
+        "jq .items/2",
+        "cat $HOKAN_UNKNOWN_DIRECTORY/file",
+        "cat src/*/file",
+        "open https://example.com/path",
+    ] {
+        terminal.write(b"\x15");
+        terminal.write(text.as_bytes());
+        terminal.settle(Duration::from_millis(350));
+        let screen = terminal.screen_text();
+        assert!(
+            !screen.contains("找不到目录")
+                && !screen.contains("修正目录")
+                && !screen.contains("HK-FS-001")
+                && !screen.contains("private-file"),
+            "stale or speculative directory error for {text}:\n{screen}"
+        );
+    }
+    terminal.exit_shell();
+    terminal.wait_until_exit();
+}
+
+#[test]
+fn intermittent_repeated_preexec_does_not_leave_a_protocol_error_at_the_next_prompt() {
+    if !command_exists("zsh") {
+        return;
+    }
+    let (home, work) = fixture_directories();
+    fs::OpenOptions::new()
+        .append(true)
+        .open(home.path().join(".zshrc"))
+        .expect("zshrc")
+        .write_all(
+            b"\nautoload -Uz add-zsh-hook\n\
+              typeset -gi fixture_preexec_count=0\n\
+              function fixture_duplicate_preexec() {\n\
+                (( fixture_preexec_count += 1 ))\n\
+                if (( fixture_preexec_count % 3 == 1 )); then\n\
+                  __hokan_preexec \"$@\"\n\
+                fi\n\
+                return 0\n\
+              }\n\
+              add-zsh-hook preexec fixture_duplicate_preexec\n",
+        )
+        .expect("duplicate hook fixture");
+    let mut terminal = TerminalSession::spawn_hokan(home, work, 2);
+    terminal.wait_for_sync_replies(1);
+    terminal.wait_for_bare_row("HK>");
+    // Ordinary commands alternate success and failure. Only some executions
+    // repeat the hook, matching an intermittent prompt/plugin interaction.
+    for command in [
+        "false",
+        "printf 'HOOK_1\\n'",
+        "true",
+        "printf 'HOOK_2\\n'",
+        "false",
+        "printf 'HOOK_OK\\n'",
+    ] {
+        let start = terminal.transcript.len();
+        terminal.write(format!("{command}\r").as_bytes());
+        terminal.wait_for_bytes_since(start, b"HK> ");
+        terminal.wait_for_bare_row("HK>");
+        terminal.settle(Duration::from_millis(150));
+        let screen = terminal.screen_text();
+        assert!(!screen.contains("HK-SHL-013"), "{screen}");
+        assert!(
+            !screen.contains('╭'),
+            "unexpected notice at empty prompt:\n{screen}"
+        );
+    }
+    terminal.wait_for_bare_row("HOOK_OK");
+    terminal.write(b"ls ");
+    terminal.wait_for_screen(TAG_SPEC);
+    terminal.exit_shell();
+    terminal.wait_until_exit();
+}
+
+#[test]
+fn config_error_is_a_compact_notice_that_can_be_dismissed_and_recovers() {
+    if !command_exists("zsh") {
+        return;
+    }
+    for sync_status in [0, 2] {
+        let mut terminal = TerminalSession::spawn_with_sync_status(sync_status);
+        terminal.wait_for_bare_row("HK>");
+        terminal.wait_for_cpr_replies(1);
+        terminal.settle(Duration::from_millis(300));
+        let config = terminal._home.path().join(".config/hokan/config.toml");
+        fs::write(&config, "[ui]\nmax_rows = 'invalid'\n").expect("invalid config fixture");
+        terminal.wait_for_screen("配置有误");
+        terminal.wait_for_screen("Esc 关闭");
+        let screen = terminal.screen_text();
+        let top = terminal.screen_rows_containing("╭");
+        let bottom = terminal.screen_rows_containing("╰");
+        assert_eq!(top.len(), 1, "{screen}");
+        assert_eq!(bottom.len(), 1, "{screen}");
+        assert!(
+            bottom[0] - top[0] <= 4,
+            "notice left empty list rows:\n{screen}"
+        );
+        assert!(
+            screen
+                .lines()
+                .nth(usize::from(top[0]))
+                .expect("heading")
+                .contains("提示")
+        );
+        assert!(
+            screen
+                .lines()
+                .nth(usize::from(top[0]))
+                .expect("heading")
+                .contains("HK-CFG-RELOAD")
+        );
+        assert!(!screen.contains("Tab 回填"));
+        assert!(!screen.contains("Enter 执行"));
+        assert!(!screen.contains('▶'));
+        terminal.write(b"\x1b");
+        terminal.wait_for_screen_absent("Esc 关闭");
+        fs::write(&config, "[ui]\nmax_rows = 8\n").expect("repaired config");
+        terminal.settle(Duration::from_millis(500));
+        terminal.wait_for_screen_absent("配置有误");
+        terminal.write(b"ls ");
+        terminal.wait_for_screen(TAG_SPEC);
+        terminal.wait_for_screen("Tab 回填");
+        terminal.exit_shell();
+        terminal.wait_until_exit();
+    }
+}
+
+#[test]
 fn real_session_keeps_overlay_and_terminal_lifecycle_stable() {
     if !command_exists("zsh") {
         return;
@@ -141,7 +293,7 @@ fn real_session_uses_non_destructive_fallback_when_mode_2026_is_unavailable() {
 }
 
 #[test]
-fn directory_errors_replace_the_list_with_a_compact_notice_and_recover() {
+fn directory_errors_offer_compact_parent_recovery_and_recover() {
     use std::os::unix::fs::PermissionsExt;
 
     if !command_exists("zsh") {
@@ -166,13 +318,14 @@ fn directory_errors_replace_the_list_with_a_compact_notice_and_recover() {
         terminal.write(b"cd ./");
         terminal.wait_for_overlay_candidate("readable/");
 
-        let mut failures = vec![("missing", "路径不存在"), ("file", "路径不是目录")];
+        let mut failures = vec![("missing", "找不到目录"), ("file", "不是目录")];
         if !nix::unistd::geteuid().is_root() {
-            failures.push(("blocked", "权限不足"));
+            failures.push(("blocked", "无权访问目录"));
         }
         for (path, cause) in failures {
             terminal.write(format!("\x15cd ./{path}/").as_bytes());
-            terminal.wait_for_overlay_candidate(cause);
+            terminal.wait_for_screen(cause);
+            terminal.wait_for_overlay_candidate("返回可用目录");
             terminal.wait_for_clean_overlay(&format!("HK> cd ./{path}/"));
             let text = terminal.screen_text();
             let top = terminal.screen_rows_containing("╭")[0];
@@ -182,6 +335,7 @@ fn directory_errors_replace_the_list_with_a_compact_notice_and_recover() {
                 "notice is too tall:\n{text}"
             );
             assert!(text.contains("Esc 关闭"), "{text}");
+            assert!(text.contains("Tab 修正"), "{text}");
             for row in top + 1..bottom {
                 assert!(
                     !terminal
@@ -191,7 +345,7 @@ fn directory_errors_replace_the_list_with_a_compact_notice_and_recover() {
                     "empty notice row:\n{text}"
                 );
             }
-            for absent in ["Tab", "Enter", "▶", "readable/", TAG_FILE] {
+            for absent in ["▶", "readable/", "HK-FS-001"] {
                 assert!(
                     !text.contains(absent),
                     "stale candidate UI {absent}:\n{text}"
@@ -212,8 +366,57 @@ fn directory_errors_replace_the_list_with_a_compact_notice_and_recover() {
             let top = terminal.screen_rows_containing("╭")[0];
             let bottom = terminal.screen_rows_containing("╰")[0];
             assert_eq!(bottom - top + 1, 8);
-            assert!(!terminal.screen_text().contains("无法读取目录"));
+            assert!(!terminal.screen_text().contains(cause));
         }
+        terminal.exit_shell();
+        terminal.wait_until_exit();
+    }
+}
+
+#[test]
+fn directory_spelling_repairs_fill_without_executing_or_selecting_a_child() {
+    if !command_exists("zsh") {
+        return;
+    }
+    for key in [b"\t".as_slice(), b"\r".as_slice()] {
+        let mut terminal = TerminalSession::spawn();
+        fs::create_dir_all(terminal._work.path().join("projects/child")).expect("directory tree");
+        let original_name = terminal
+            ._work
+            .path()
+            .file_name()
+            .expect("basename")
+            .to_string_lossy()
+            .into_owned();
+        terminal.wait_for_screen("HK> ");
+        terminal.write(b"cd projcets/");
+        terminal.wait_for_overlay_candidate("projects/");
+        terminal.wait_for_clean_overlay("HK> cd projcets/");
+        let before = terminal.screen_text();
+        assert!(before.contains("找不到目录"), "{before}");
+        assert!(before.contains("Tab 修正"), "{before}");
+        assert!(
+            !before.contains('▶'),
+            "repair must not be preselected: {before}"
+        );
+        let top = terminal.screen_rows_containing("╭")[0];
+        let bottom = terminal.screen_rows_containing("╰")[0];
+        assert_eq!(
+            bottom - top + 1,
+            4,
+            "two recovery rows should be compact: {before}"
+        );
+        terminal.write(b"\x1b[B");
+        terminal.wait_for_screen("▶");
+        terminal.write(key);
+        terminal.wait_for_overlay_candidate("child/");
+        terminal.wait_for_clean_overlay("HK> cd projects/");
+        assert!(
+            !terminal.screen_text().contains('▶'),
+            "a repair must not select the next child"
+        );
+        terminal.write(b"\x15printf '%s\\n' $PWD:t\r");
+        terminal.wait_for_bare_row(&original_name);
         terminal.exit_shell();
         terminal.wait_until_exit();
     }

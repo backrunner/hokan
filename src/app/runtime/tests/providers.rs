@@ -154,7 +154,7 @@ fn child_shell_path_event_refreshes_the_shared_provider_cache() {
         .expect("executable mode");
 
     let mut state = runtime_state(directory.path());
-    state.editing = true;
+    state.input_owner = super::super::state::InputOwner::Editing;
     state.buffer.set_exact("second".into(), 6).expect("buffer");
     let mut engine = crate::completion::CompletionEngine::new(20, 12);
     engine.register(crate::providers::PathCommandProvider::new(Arc::clone(
@@ -197,7 +197,7 @@ fn child_shell_path_event_refreshes_the_shared_provider_cache() {
 fn background_help_refresh_does_not_steal_owned_overlay_states() {
     let directory = tempfile::tempdir().expect("directory");
     let mut state = runtime_state(directory.path());
-    state.editing = true;
+    state.input_owner = super::super::state::InputOwner::Editing;
     state
         .buffer
         .set_exact("natural language request".into(), 24)

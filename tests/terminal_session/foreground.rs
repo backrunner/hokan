@@ -1,6 +1,113 @@
 use super::*;
 
 #[test]
+fn brew_confirmation_input_stays_with_the_foreground_command() {
+    if !command_exists("zsh") || !command_exists("bash") || !command_exists("python3") {
+        return;
+    }
+    for shell in ["zsh", "bash"] {
+        let (home, work) = fixture_directories();
+        fs::write(home.path().join(".bashrc"), "PS1='BASH> '\n").expect("bashrc");
+        fs::write(
+            home.path().join(".config/hokan/config.toml"),
+            "[logging]\nenabled = true\n",
+        )
+        .expect("logging config");
+        // This fixture never runs Homebrew or changes installed packages.
+        let bin = home.path().join("bin");
+        fs::create_dir(&bin).expect("bin directory");
+        fs::write(
+            bin.join("brew"),
+            r#"#!/bin/sh
+case "$1" in
+  help|--help) printf 'Usage: brew uninstall FORMULA\n';;
+  uninstall) exec python3 "$HOME/confirmation.py";;
+  *) exit 0;;
+esac
+"#,
+        )
+        .expect("fake brew");
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(bin.join("brew"), fs::Permissions::from_mode(0o700))
+            .expect("executable");
+        fs::write(
+            home.path().join("confirmation.py"),
+            r#"import os, pathlib, termios, tty
+saved = termios.tcgetattr(0)
+tty.setraw(0, termios.TCSANOW)
+try:
+    os.write(1, b"BREW_CONFIRM_READY\r\n")
+    payload = bytearray()
+    while not payload.endswith(b"\r"):
+        payload.extend(os.read(0, 1))
+    pathlib.Path("confirmation.bin").write_bytes(payload)
+finally:
+    termios.tcsetattr(0, termios.TCSANOW, saved)
+os.write(1, b"\r\nBREW_CONFIRM_DONE\r\n")
+"#,
+        )
+        .expect("confirmation fixture");
+        let mut command = CommandBuilder::new(hokan_test_bin());
+        command.arg("--shell");
+        command.arg(shell);
+        configure_command(&mut command, &home, &work);
+        command.env("SHELL", format!("/bin/{shell}"));
+        let search_path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        )))
+        .expect("fixture PATH");
+        command.env("PATH", search_path);
+        let mut terminal = TerminalSession::spawn_command(home, work, command, 2);
+        let prompt = if shell == "zsh" { "HK>" } else { "BASH>" };
+        terminal.wait_for_bare_row(prompt);
+        terminal.write(b"brew uninstall xxx\r");
+        terminal.wait_for_bare_row("BREW_CONFIRM_READY");
+        terminal.settle(Duration::from_millis(350));
+        let log_path = terminal._home.path().join(".local/state/hokan/debug.log");
+        let before = fs::read_to_string(&log_path).expect("debug log");
+        let start = terminal.transcript.len();
+        let payload = b"anomalyco/tap/private-answer\t\x1b[A\x12\r";
+        terminal.write(payload);
+        terminal.wait_for_bytes_since(start, b"BREW_CONFIRM_DONE");
+        terminal.wait_for_bare_row(prompt);
+        terminal.settle(Duration::from_millis(350));
+        assert_eq!(
+            fs::read(terminal._work.path().join("confirmation.bin")).expect("child input"),
+            payload
+        );
+        assert_no_overlay_rows(&terminal);
+        let after = fs::read_to_string(&log_path).expect("debug log");
+        assert_eq!(
+            after.matches("provider-finished").count(),
+            before.matches("provider-finished").count(),
+            "foreground input ran providers in {shell}"
+        );
+        assert!(!after.contains("private-answer"));
+        assert!(!String::from_utf8_lossy(&terminal.transcript[start..]).contains("HK-FS-001"));
+        terminal.exit_shell();
+        terminal.wait_until_exit();
+        let history =
+            hokan::history::HistoryStore::open(&terminal._home.path().join(".local/state/hokan"))
+                .expect("history store")
+                .read()
+                .expect("history");
+        assert!(
+            history
+                .events
+                .iter()
+                .any(|event| event.command == "brew uninstall xxx")
+        );
+        assert!(
+            history
+                .events
+                .iter()
+                .all(|event| !event.command.contains("private-answer")),
+            "confirmation leaked into {shell} history"
+        );
+    }
+}
+
+#[test]
 fn overlay_recovers_after_fullscreen_apps_exit() {
     if !command_exists("zsh") {
         return;

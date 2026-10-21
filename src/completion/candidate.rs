@@ -128,7 +128,11 @@ pub struct TextEdit {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CandidateAction {
     Insert,
-    InsertAndContinue { next_slot: SlotKind },
+    InsertAndContinue {
+        next_slot: SlotKind,
+    },
+    /// An explicit path repair, never an Enter-to-execute shortcut.
+    CorrectPath,
     RequestAi,
     ConfigureAi,
     Retry,
@@ -301,7 +305,9 @@ pub fn activate_candidate(
         ));
     }
     match candidate.action {
-        CandidateAction::Insert | CandidateAction::InsertAndContinue { .. } => {
+        CandidateAction::Insert
+        | CandidateAction::InsertAndContinue { .. }
+        | CandidateAction::CorrectPath => {
             let edit = candidate.edit.as_ref().ok_or_else(|| {
                 crate::Error::Completion("insert candidate is missing its text edit".into())
             })?;

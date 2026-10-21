@@ -25,6 +25,7 @@ use crossbeam_channel::Sender;
 use tokio_util::sync::CancellationToken;
 
 pub(super) struct AiResult {
+    pub(super) edit_epoch: crate::completion::EditEpoch,
     pub(super) query_id: QueryId,
     pub(super) generation: u64,
     pub(super) result: Result<Vec<crate::ai::AiCommand>, crate::ai::AiClientError>,
@@ -88,12 +89,18 @@ pub(super) fn resolve_enter(candidate: &Candidate, activation: &Activation) -> E
 pub(super) fn resolve_selected_activation(
     state: &RuntimeState,
 ) -> crate::Result<SelectedActivation> {
+    if !state.editing() {
+        return Ok(SelectedActivation::None);
+    }
     let Some(candidate) = selected_candidate(state) else {
         return Ok(SelectedActivation::None);
     };
     let Some(context) = state.candidates_context.as_ref().cloned() else {
         return Ok(SelectedActivation::Rejected);
     };
+    if !state.owns_context(&context) {
+        return Ok(SelectedActivation::Rejected);
+    }
     Ok(
         match activate_candidate(candidate, &context, &state.snapshot()?) {
             Ok(activation) => SelectedActivation::Ready {
@@ -112,6 +119,9 @@ pub(super) fn start_ai_request(
     ai_sender: &Sender<AiResult>,
     output: &OutputHandle,
 ) -> crate::Result<()> {
+    if !state.owns_context(context) {
+        return Ok(());
+    }
     state.cancel_ai();
     let ai_context = build_context(
         &context.buffer.text,
@@ -121,6 +131,7 @@ pub(super) fn start_ai_request(
         config.ai.send_cwd_basename,
     );
     let query_id = context.query_id;
+    let edit_epoch = context.edit_epoch;
     state.ai_generation = state.ai_generation.wrapping_add(1);
     let generation = state.ai_generation;
     let ai_config = config.ai.clone();
@@ -139,12 +150,14 @@ pub(super) fn start_ai_request(
                     .block_on(client.request(&ai_context, &request_cancel))
             });
             let _ = sender.send(AiResult {
+                edit_epoch,
                 query_id,
                 generation,
                 result,
             });
         })?;
     state.ai_query = Some(ActiveAiRequest {
+        edit_epoch,
         query_id,
         generation,
         cancel,
@@ -157,7 +170,7 @@ pub(super) fn start_ai_request(
     state.candidates.clear();
     state.candidates_context = None;
     state.selected = None;
-    state.pending_accept = false;
+    state.pending_accept = None;
     state.status = Some("HK-AI-WAIT requesting commands; Esc cancels".into());
     render_current(state, output)
 }
@@ -167,6 +180,9 @@ pub(super) fn handle_provider_result(
     state: &mut RuntimeState,
     output: &OutputHandle,
 ) -> crate::Result<()> {
+    if !state.editing() {
+        return Ok(());
+    }
     let Some(current) = state.context.as_ref() else {
         return Ok(());
     };
@@ -177,7 +193,8 @@ pub(super) fn handle_provider_result(
     if state.ai_query.is_some() || state.ai_owns_candidates {
         return Ok(());
     }
-    if result.context.query_id != current.query_id
+    if !state.owns_context(&result.context)
+        || result.context.query_id != current.query_id
         || result.context.buffer.revision != state.buffer.revision
         || result.context.buffer.hash != state.snapshot()?.hash
         // `mark_uncertain` changes neither the revision nor the text, so a
@@ -248,7 +265,7 @@ pub(super) fn handle_provider_result(
         .diagnostics
         .iter()
         .find(|diagnostic| diagnostic.level == crate::completion::DiagnosticLevel::Warning)
-        .map(|diagnostic| format!("{} ({})", diagnostic.message, diagnostic.code));
+        .map(|diagnostic| diagnostic.message.clone());
     if result.final_batch
         && !result.output.diagnostics.is_empty()
         && let Some(log) = &state.debug_log
@@ -281,13 +298,18 @@ pub(super) fn handle_ai_result(
     let active = state
         .ai_query
         .as_ref()
-        .map(|request| (request.query_id, request.generation));
-    if active != Some((result.query_id, result.generation)) {
+        .map(|request| (request.edit_epoch, request.query_id, request.generation));
+    if state.editing_epoch() != Some(result.edit_epoch)
+        || active != Some((result.edit_epoch, result.query_id, result.generation))
+    {
         return Ok(());
     }
     let Some(context) = state.context.as_ref().cloned() else {
         return Ok(());
     };
+    if !state.owns_context(&context) {
+        return Ok(());
+    }
     let _ = state.ai_query.take();
     state.selection_intent = None;
     match result.result {

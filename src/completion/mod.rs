@@ -1,3 +1,5 @@
+mod argument;
+pub use argument::{ArgumentSemantics, PathOrigin, ResolvedPath};
 mod candidate;
 mod context;
 mod engine;
@@ -8,7 +10,7 @@ pub use candidate::{
     Completeness, CursorPlacement, DisplayText, ScoreSignals, SlotKind, TextEdit,
     activate_candidate,
 };
-pub use context::{BufferSnapshot, CompletionContext, CompletionMode, SyncQuality};
+pub use context::{BufferSnapshot, CompletionContext, CompletionMode, EditEpoch, SyncQuality};
 pub use engine::{
     CandidateProvider, CompletionEngine, DiagnosticLevel, ProviderDiagnostic, ProviderMetric,
     ProviderOutput,

@@ -1,5 +1,6 @@
 mod ai_action;
 mod alias;
+pub(crate) mod argument;
 mod command_help;
 mod command_spec;
 mod filesystem;

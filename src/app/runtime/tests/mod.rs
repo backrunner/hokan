@@ -23,7 +23,7 @@ use crate::terminal::{
 };
 
 fn runtime_state(directory: &Path) -> RuntimeState {
-    RuntimeState::new(
+    let mut state = RuntimeState::new(
         ShellKind::Zsh,
         TerminalSize::new(24, 80).expect("terminal size"),
         directory.to_owned(),
@@ -36,7 +36,9 @@ fn runtime_state(directory: &Path) -> RuntimeState {
         Arc::new(CommandPathCache::default()),
         Arc::new(crate::specs::SpecRegistry::default()),
         Arc::new(crate::providers::CommandHelpCache::default()),
-    )
+    );
+    state.input_owner = super::state::InputOwner::Editing;
+    state
 }
 
 fn selection_candidate(state: &RuntimeState, primary: &str) -> Candidate {
@@ -126,7 +128,8 @@ fn refresh_context(state: &mut RuntimeState, query_id: QueryId) {
             state.cwd.clone(),
             state.snapshot().expect("snapshot"),
         )
-        .expect("context"),
+        .expect("context")
+        .with_edit_epoch(state.editing_epoch().unwrap_or_default()),
     );
     state.context = Some(context);
 }

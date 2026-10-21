@@ -68,19 +68,19 @@ fn argument_position_excludes_unrelated_history_commands() {
     terminal.wait_for_screen("HK> ");
     terminal.settle(Duration::from_millis(300));
 
-    // Seed an unrelated history line that matches `whoami ` only as a fuzzy
-    // subsequence (w…h…o…a…m…i…space). It must never surface as an argument
-    // of `whoami`.
-    terminal.write(b"echo who am i HKARG_JUNK\r");
-    terminal.wait_for_bare_row("who am i HKARG_JUNK");
+    // Seed an unrelated history line that matches `cat ` only as a fuzzy
+    // subsequence (c…a…t…space). It must never surface as an argument
+    // of `cat`.
+    terminal.write(b"echo c a t HKARG_JUNK\r");
+    terminal.wait_for_bare_row("c a t HKARG_JUNK");
     terminal.settle(Duration::from_millis(300));
 
-    terminal.write(b"whoami ./HKARG_");
+    terminal.write(b"cat ./HKARG_");
     // Explicit path intent produces the cwd marker file without reopening
     // broad fuzzy history at this argument position.
     terminal.wait_for_screen("HKARG_MARKER.txt");
     terminal.settle(Duration::from_millis(300));
-    // The first row can trigger a background `whoami` help refresh. Wait for
+    // The first row can trigger a background `cat` help refresh. Wait for
     // the post-refresh repaint as well instead of sampling its paint window.
     terminal.wait_for_screen("HKARG_MARKER.txt");
 
@@ -88,7 +88,7 @@ fn argument_position_excludes_unrelated_history_commands() {
     let overlay_rows: Vec<_> = text.lines().filter(|line| line.contains('│')).collect();
     assert!(
         !overlay_rows.is_empty(),
-        "expected overlay rows after an explicit whoami path:\n{text}"
+        "expected overlay rows after an explicit cat path:\n{text}"
     );
     assert!(
         overlay_rows.iter().all(|line| !line.contains("HKARG_JUNK")),

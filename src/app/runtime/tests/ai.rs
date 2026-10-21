@@ -36,6 +36,7 @@ fn ai_request_owns_candidates_until_the_next_query() {
     let generation = state.ai_query.as_ref().expect("active request").generation;
     handle_ai_result(
         AiResult {
+            edit_epoch: state.editing_epoch().expect("editing"),
             query_id: QueryId::new(1),
             generation,
             result: Ok(vec![ai_command("git commit -m wip")]),
@@ -111,6 +112,7 @@ fn stale_ai_result_never_takes_the_active_request() {
     state.ai_generation = 2;
     state.ai_owns_candidates = true;
     state.ai_query = Some(ActiveAiRequest {
+        edit_epoch: state.editing_epoch().expect("editing"),
         query_id: QueryId::new(1),
         generation: 2,
         cancel: tokio_util::sync::CancellationToken::new(),
@@ -124,6 +126,7 @@ fn stale_ai_result_never_takes_the_active_request() {
 
     handle_ai_result(
         AiResult {
+            edit_epoch: state.editing_epoch().expect("editing"),
             query_id: QueryId::new(1),
             generation: 1,
             result: Ok(vec![ai_command("git push")]),
@@ -147,12 +150,14 @@ fn stale_ai_result_never_takes_the_active_request() {
 
     // …and its own result is the one that gets accepted.
     state.ai_query = Some(ActiveAiRequest {
+        edit_epoch: state.editing_epoch().expect("editing"),
         query_id: QueryId::new(1),
         generation: 2,
         cancel: tokio_util::sync::CancellationToken::new(),
     });
     handle_ai_result(
         AiResult {
+            edit_epoch: state.editing_epoch().expect("editing"),
             query_id: QueryId::new(1),
             generation: 2,
             result: Ok(vec![ai_command("git commit -m wip")]),

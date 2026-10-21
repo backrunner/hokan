@@ -93,7 +93,7 @@ fn prepare_surface_scroll_keeps_the_actor_model_consistent() {
         .snapshot_region(ratatui::layout::Rect::new(0, 22, 80, 1));
 
     let geometry = actor
-        .prepare_surface_geometry(None)
+        .prepare_surface_geometry(None, None)
         .expect("geometry should prepare")
         .expect("overlay fits after scrolling");
     assert_eq!(geometry.rect, ratatui::layout::Rect::new(0, 21, 79, 3));
@@ -140,7 +140,7 @@ fn compact_notice_reserves_only_its_own_height_before_scrolling() {
     let cursor = actor.model.cursor();
     let status = SanitizedText::new("无法读取目录：权限不足");
     let geometry = actor
-        .prepare_surface_geometry(Some(&status))
+        .prepare_surface_geometry(Some(&status), None)
         .expect("geometry")
         .expect("fits");
     assert_eq!(geometry.rect.height, 3);
@@ -152,7 +152,7 @@ fn compact_notice_reserves_only_its_own_height_before_scrolling() {
     );
 
     let recovered = actor
-        .prepare_surface_geometry(None)
+        .prepare_surface_geometry(None, None)
         .expect("geometry")
         .expect("fits");
     assert_eq!(recovered.rect.height, 8, "candidate page height recovers");
@@ -357,7 +357,7 @@ fn prepare_surface_scroll_is_wrapped_in_a_transaction_when_2026_is_available() {
     actor.capability = SyncOutputCapability::AvailableIdle;
 
     let geometry = actor
-        .prepare_surface_geometry(None)
+        .prepare_surface_geometry(None, None)
         .expect("geometry should prepare")
         .expect("overlay fits after scrolling");
     assert_eq!(geometry.rect, ratatui::layout::Rect::new(0, 21, 79, 3));

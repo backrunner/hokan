@@ -167,7 +167,7 @@ impl CandidateProvider for CommandHelpProvider {
                         CandidateAction::Insert
                     } else {
                         CandidateAction::InsertAndContinue {
-                            next_slot: SlotKind::Path,
+                            next_slot: SlotKind::Value,
                         }
                     },
                     CandidateSource::CommandHelp,
@@ -175,11 +175,7 @@ impl CandidateProvider for CommandHelpProvider {
                     // Man-derived rows are never auto-executed: Enter degrades
                     // to a fill, exactly like an incomplete spec recipe.
                     Completeness::NeedsInput {
-                        slot: if flags_position {
-                            SlotKind::Value
-                        } else {
-                            SlotKind::Path
-                        },
+                        slot: SlotKind::Value,
                     },
                     RiskLevel::Low,
                     if target.scope.is_empty() {

@@ -78,6 +78,11 @@ if [[ -n ${HOKAN_ACTIVE:-} && -n ${HOKAN_CONTROL_FIFO:-} && -z ${__HOKAN_ZSH_LOA
 
   function __hokan_preexec() {
     setopt localoptions no_multibyte
+    # A plugin or duplicated hook entry may call us twice before precmd.
+    # Keep one START per command without changing the command's exit status.
+    if (( __hokan_command_active )) && [[ "$__hokan_last_command" == "$1" ]]; then
+      return 0
+    fi
     __hokan_last_command="$1"
     __hokan_command_active=1
     if (( ${#1} <= __hokan_payload_max_bytes )); then

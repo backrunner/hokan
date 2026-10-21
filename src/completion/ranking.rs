@@ -98,13 +98,21 @@ pub fn rank_and_dedupe(
         let replacement_match = match_signal(query, replacement_target);
         let display_match = match_signal(query, &candidate.display.primary);
         let continuation_match = history_continuation_match(context, &candidate);
-        let best_match = continuation_match
+        let mut best_match = continuation_match
             .unwrap_or(MatchSignal {
                 priority: 0,
                 quality: 0,
             })
             .max(replacement_match)
             .max(display_match);
+        if matches!(candidate.action, CandidateAction::CorrectPath) {
+            // A provider-validated spelling repair need not be a subsequence.
+            // Keep repairs below ordinary matches, including the parent exit.
+            best_match = MatchSignal {
+                priority: 0,
+                quality: 300,
+            };
+        }
         // Command-token providers are completion domains, not search results.
         // In normal mode, substring/subsequence matches are too weak to
         // justify changing what the user typed. Curated specs retain their
@@ -217,7 +225,10 @@ fn merge_duplicate(existing: &mut Candidate, candidate: Candidate) {
     let stricter = stricter_risk(existing.risk, candidate.risk);
     let merged_score = merge_score_signals(existing.score, candidate.score);
 
-    if ranking_key(&candidate) > ranking_key(existing) {
+    if matches!(candidate.action, CandidateAction::CorrectPath)
+        || (!matches!(existing.action, CandidateAction::CorrectPath)
+            && ranking_key(&candidate) > ranking_key(existing))
+    {
         *existing = candidate;
     }
 
@@ -389,7 +400,9 @@ fn has_valid_edit(context: &CompletionContext, candidate: &Candidate) -> bool {
     let Some(edit) = candidate.edit.as_ref() else {
         return !matches!(
             candidate.action,
-            CandidateAction::Insert | CandidateAction::InsertAndContinue { .. }
+            CandidateAction::Insert
+                | CandidateAction::InsertAndContinue { .. }
+                | CandidateAction::CorrectPath
         );
     };
     if edit.range.start > edit.range.end

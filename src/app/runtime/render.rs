@@ -18,7 +18,7 @@ use crate::terminal::{
 pub(super) fn render_current(state: &mut RuntimeState, output: &OutputHandle) -> crate::Result<()> {
     if state.dismissed_revision == Some(state.buffer.revision)
         || state.buffer.sync == crate::completion::SyncQuality::Uncertain
-        || state.foreground_process
+        || !state.editing()
         || state.suspended
     {
         state.repaint_pending = false;
@@ -29,7 +29,7 @@ pub(super) fn render_current(state: &mut RuntimeState, output: &OutputHandle) ->
     if state.overlay_visible
         && state.pending_confirm.is_none()
         && state.selected.is_none()
-        && !state.pending_accept
+        && state.pending_accept.is_none()
         && state
             .provider_batch_deadline
             .is_some_and(|deadline| Instant::now() < deadline)
@@ -177,6 +177,23 @@ pub(super) fn render_current(state: &mut RuntimeState, output: &OutputHandle) ->
         view.pagination = (state.candidates.len() > state.page_size)
             .then_some((selected_index.saturating_add(1), state.candidates.len()));
         view.status = state.status.as_deref().map(SanitizedText::new);
+        view.recovery = !state.candidates.is_empty()
+            && state.candidates.iter().all(|candidate| {
+                matches!(
+                    candidate.action,
+                    crate::completion::CandidateAction::CorrectPath
+                )
+            });
+        view.fill_only = view.recovery
+            || state.selected.is_some_and(|selected| {
+                state.candidates.iter().any(|candidate| {
+                    candidate.id == selected
+                        && matches!(
+                            candidate.action,
+                            crate::completion::CandidateAction::CorrectPath
+                        )
+                })
+            });
         let typed = state
             .buffer
             .text
@@ -295,8 +312,8 @@ pub(super) fn handle_terminal_reply(
                 state.pending_terminal_cursor = Some(pending);
                 return Ok(false);
             }
-            let confirmed = state.editing
-                && !state.foreground_process
+            let confirmed = state.editing()
+                && !state.foreground_process()
                 && state.buffer.revision == pending.buffer_revision
                 && output
                     .confirm_cursor_if_current(
@@ -305,7 +322,7 @@ pub(super) fn handle_terminal_reply(
                         pending.screen_epoch,
                     )
                     .map_err(output_error)?;
-            if !confirmed && state.editing && !state.foreground_process {
+            if !confirmed && state.editing() && !state.foreground_process() {
                 output
                     .allow_cursor_probe(state.buffer.revision)
                     .map_err(output_error)?;
@@ -338,7 +355,7 @@ pub(super) fn handle_terminal_reply(
             state.pending_terminal_cursor = None;
             state.pending_tmux_cursor = None;
             state.tmux_cursor_retry_at = None;
-            state.need_cpr = state.editing && !state.foreground_process;
+            state.need_cpr = state.editing() && !state.foreground_process();
             output.invalidate_anchor().map_err(output_error)?;
         }
         TerminalReply::Timeout {
@@ -370,6 +387,12 @@ pub(super) fn maybe_probe_cursor(
     {
         return Ok(());
     }
+    // Bind the permitted probe to the current prompt even when its buffer is
+    // empty and no changed BUFFER event has armed a render gate. Otherwise a
+    // successful cursor reply leaves standalone notices waiting for input.
+    output
+        .allow_cursor_probe(state.buffer.revision)
+        .map_err(output_error)?;
     match state.cursor_probe_backend {
         CursorProbeBackend::TerminalPrivate | CursorProbeBackend::TerminalStandardGuarded => {
             if router.has_outstanding() {
@@ -448,8 +471,8 @@ pub(super) fn handle_tmux_cursor_result(
     }
     let output_state = output.state().map_err(output_error)?;
     let still_current = state.cursor_probe_backend == CursorProbeBackend::Tmux
-        && state.editing
-        && !state.foreground_process
+        && state.editing()
+        && !state.foreground_process()
         && state.buffer.revision == pending.buffer_revision
         && state.terminal_size == pending.terminal_size
         && output_state.screen_revision == pending.screen_revision
@@ -458,7 +481,7 @@ pub(super) fn handle_tmux_cursor_result(
         && !output_state.foreground
         && !output_state.alternate_screen;
     if !still_current {
-        if state.editing && !state.foreground_process {
+        if state.editing() && !state.foreground_process() {
             state.need_cpr = true;
             state.tmux_cursor_retry_at = Some(Instant::now() + TMUX_CURSOR_RETRY_DELAY);
         }

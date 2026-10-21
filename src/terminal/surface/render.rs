@@ -11,7 +11,7 @@ use super::{
     layout::{
         EDGE_TRAIL, GAP, ICON_SECTION, MARKER_WIDTH, MAX_DESCRIPTION_WIDTH, MAX_TAG_WIDTH,
         MIN_DESC_VISIBLE, MIN_PRIMARY_WIDTH, PAGINATION_PAD, RISK_SLOT, SIDE_PAD,
-        common_prefix_len, status_lines, truncate_to_width,
+        common_prefix_len, status_lines, status_parts, truncate_to_width,
     },
 };
 
@@ -42,7 +42,7 @@ impl OverlaySurfaceRenderer {
     #[must_use]
     pub fn status_height(&self, width: u16, status: &SanitizedText) -> u16 {
         let lines = status_lines(
-            status.as_str(),
+            status_parts(status.as_str()).1,
             usize::from(width.saturating_sub(4)),
             usize::from(self.height.saturating_sub(2).min(3)),
         );
@@ -69,13 +69,43 @@ impl OverlaySurfaceRenderer {
         let pagination = view
             .pagination
             .map(|(position, total)| truncate_to_width(&format!(" {position}/{total} "), inner));
-        let top_content: Vec<(&str, Style)> = pagination
+        let heading = view.recovery.then(|| {
+            truncate_to_width(
+                view.status
+                    .as_ref()
+                    .map_or("选择要修正的路径", SanitizedText::as_str),
+                inner.saturating_sub(
+                    pagination
+                        .as_ref()
+                        .map_or(0, |text| UnicodeWidthStr::width(text.as_str()))
+                        + 2,
+                ),
+            )
+        });
+        let mut top_content: Vec<(&str, Style)> = heading
             .iter()
-            .map(|text| (text.as_str(), self.theme.hint_text))
+            .map(|text| (text.as_str(), self.theme.status))
             .collect();
+        top_content.extend(
+            pagination
+                .iter()
+                .map(|text| (text.as_str(), self.theme.hint_text)),
+        );
         self.render_edge(&mut buffer, top_y, "╭", "╮", &top_content, PAGINATION_PAD);
 
-        let bottom_content: Vec<(String, Style)> = if let Some(status) = &view.status {
+        let bottom_content: Vec<(String, Style)> = if view.fill_only {
+            let hint = if inner >= 42 {
+                "↑↓ 选择 · Tab 修正 · Enter 回填 · Esc 关闭"
+            } else if inner >= 24 {
+                "Tab 修正 · Esc 关闭"
+            } else {
+                "Tab 修正"
+            };
+            vec![(
+                truncate_to_width(hint, inner.saturating_sub(EDGE_TRAIL)),
+                self.theme.hint_text,
+            )]
+        } else if let Some(status) = &view.status {
             vec![(
                 truncate_to_width(status.as_str(), inner.saturating_sub(EDGE_TRAIL)),
                 self.theme.status,
@@ -123,9 +153,22 @@ impl OverlaySurfaceRenderer {
     fn render_status(&self, buffer: &mut Buffer, status: &SanitizedText) {
         let rect = *buffer.area();
         let inner = usize::from(rect.width - 2);
-        self.render_edge(buffer, rect.y, "╭", "╮", &[], 0);
+        let (code, message) = status_parts(status.as_str());
+        let title = truncate_to_width(" 提示 ", inner);
+        let code = code.map(|code| format!("· {code} ")).filter(|code| {
+            UnicodeWidthStr::width(code.as_str()) + UnicodeWidthStr::width(title.as_str()) + 2
+                <= inner
+        });
+        let mut heading = vec![(
+            title.as_str(),
+            self.theme.status.add_modifier(Modifier::BOLD),
+        )];
+        if let Some(code) = &code {
+            heading.push((code.as_str(), self.theme.hint_text));
+        }
+        self.render_edge(buffer, rect.y, "╭", "╮", &heading, 1);
         let lines = status_lines(
-            status.as_str(),
+            message,
             inner.saturating_sub(2),
             usize::from(rect.height.saturating_sub(2)),
         );

@@ -1,6 +1,67 @@
 use super::*;
 
 #[test]
+fn foreground_handoff_clears_deferred_activation_and_provider_state() {
+    let directory = tempfile::tempdir().expect("directory");
+    let mut state = runtime_state(directory.path());
+    state.input_owner = super::super::state::InputOwner::Editing;
+    state.buffer.set_exact("ec".into(), 2).expect("buffer");
+    refresh_context(&mut state, QueryId::new(1));
+    let candidate = history_candidate(QueryId::new(1), "echo unwanted");
+    state.selected = Some(candidate.id);
+    state.candidates = vec![candidate];
+    state.candidates_context = state.context.clone();
+    state.pending_accept = state.editing_epoch();
+    state.provider_pending = true;
+    state.overlay_visible = true;
+    state.status = Some("old filesystem error".into());
+    state.pending_command = Some("actual foreground command".into());
+    let worker = ProviderWorker::start(
+        Arc::new(crate::completion::CompletionEngine::new(20, 12)),
+        None,
+    )
+    .expect("worker");
+    state.begin_foreground(&worker);
+    assert!(state.foreground_process());
+    assert!(!state.editing());
+    assert!(state.pending_accept.is_none());
+    assert!(!state.provider_pending);
+    assert!(!state.overlay_visible);
+    assert!(state.candidates.is_empty());
+    assert!(state.context.is_none());
+    assert!(state.candidates_context.is_none());
+    assert!(state.status.is_none());
+    assert_eq!(
+        state.pending_command.as_deref(),
+        Some("actual foreground command")
+    );
+    assert!(matches!(
+        resolve_selected_activation(&state).expect("activation"),
+        SelectedActivation::None
+    ));
+}
+
+#[test]
+fn path_repairs_never_execute_even_when_the_result_is_runnable() {
+    let candidate = enter_candidate(
+        "cd projects/",
+        CandidateAction::CorrectPath,
+        Completeness::Runnable,
+        RiskLevel::Low,
+    );
+    assert!(matches!(
+        resolve_enter(
+            &candidate,
+            &Activation::ReplaceBuffer {
+                text: "cd projects/".into(),
+                cursor: 12,
+            }
+        ),
+        EnterResolution::Fill
+    ));
+}
+
+#[test]
 fn stale_candidate_activation_is_nonfatal() {
     let directory = tempfile::tempdir().expect("directory");
     let mut state = runtime_state(directory.path());
@@ -248,7 +309,7 @@ fn empty_partial_results_preserve_the_visible_list_and_its_activation_context() 
     let directory = tempfile::tempdir().expect("directory");
     let mut state = runtime_state(directory.path());
     let (output, join) = test_output();
-    state.editing = true;
+    state.input_owner = super::super::state::InputOwner::Editing;
     state.buffer.set_exact("ec".into(), 2).expect("buffer");
     refresh_context(&mut state, QueryId::new(1));
     output

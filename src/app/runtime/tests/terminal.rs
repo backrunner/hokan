@@ -1,6 +1,52 @@
 use super::*;
 
 #[test]
+fn delayed_shell_buffer_updates_do_not_start_completion_during_a_command() {
+    let directory = tempfile::tempdir().expect("directory");
+    let mut state = runtime_state(directory.path());
+    let (output, join) = test_output();
+    let worker = ProviderWorker::start(
+        Arc::new(crate::completion::CompletionEngine::new(20, 12)),
+        None,
+    )
+    .expect("worker");
+    let store = HistoryStore::open(&directory.path().join("state")).expect("store");
+    let history = Arc::new(RwLock::new(HistoryIndex::default()));
+    let policy = HistoryPolicy::new(1024, &[]).expect("policy");
+    state
+        .buffer
+        .set_exact("brew uninstall xxx".into(), 18)
+        .expect("buffer");
+    state.input_owner = super::super::state::InputOwner::Starting;
+    state.input_owner = super::super::state::InputOwner::Foreground;
+    let revision = state.buffer.revision;
+    let text = "brew uninstall anomalyco/tap/";
+    handle_control_message(
+        ControlMessage::Event(ShellEvent::Buffer {
+            redisplay_id: BoundaryId::new(1),
+            cursor: text.len(),
+            text: text.into(),
+        }),
+        &mut state,
+        &output,
+        &worker,
+        &store,
+        &history,
+        &policy,
+    )
+    .expect("late buffer");
+    assert_eq!(state.buffer.revision, revision);
+    assert_eq!(state.buffer.text, "brew uninstall xxx");
+    assert!(!state.provider_pending);
+    assert!(state.context.is_none());
+    state.schedule_query(&worker).expect("foreground refresh");
+    assert!(!state.provider_pending);
+    assert!(state.context.is_none());
+    output.restore_and_exit().expect("shutdown");
+    join.join().expect("actor joins").expect("actor exits");
+}
+
+#[test]
 fn shutdown_settles_an_inflight_cursor_query_without_reprobing() {
     let mut router = crate::terminal::TerminalReplyRouter::default();
     router
@@ -50,7 +96,7 @@ fn terminal_cursor_replies_cannot_rewind_a_newer_prompt_or_buffer() {
         let directory = tempfile::tempdir().expect("directory");
         let mut state = runtime_state(directory.path());
         let (output, join) = test_output();
-        state.editing = true;
+        state.input_owner = super::super::state::InputOwner::Editing;
         state.need_cpr = true;
         let mut router = crate::terminal::TerminalReplyRouter::default();
         output
@@ -103,11 +149,92 @@ fn terminal_cursor_replies_cannot_rewind_a_newer_prompt_or_buffer() {
 }
 
 #[test]
+fn recoverable_shell_diagnostics_do_not_replace_notices_or_create_empty_overlays() {
+    let directory = tempfile::tempdir().expect("directory");
+    let mut state = runtime_state(directory.path());
+    let log_directory = directory.path().join("logs");
+    state.debug_log = crate::diagnostics::DebugLog::from_config(
+        &log_directory,
+        &crate::config::LoggingConfig {
+            enabled: true,
+            ..Default::default()
+        },
+    )
+    .expect("debug log");
+    let (output, join) = test_output();
+    let worker = ProviderWorker::start(
+        Arc::new(crate::completion::CompletionEngine::new(20, 12)),
+        None,
+    )
+    .expect("worker");
+    let store = HistoryStore::open(&directory.path().join("state")).expect("store");
+    let history = Arc::new(RwLock::new(HistoryIndex::default()));
+    let policy = HistoryPolicy::new(1024, &[]).expect("policy");
+    for initial in [None, Some("保留当前提示".to_owned())] {
+        state.status = initial.clone();
+        for code in ["HK-SHL-011", "HK-SHL-013"] {
+            handle_control_message(
+                ControlMessage::Diagnostic(crate::shell::ProtocolDiagnostic {
+                    code,
+                    message: "private shell payload".into(),
+                }),
+                &mut state,
+                &output,
+                &worker,
+                &store,
+                &history,
+                &policy,
+            )
+            .expect("diagnostic");
+            assert_eq!(state.status, initial);
+            assert!(!state.overlay_visible);
+        }
+    }
+    handle_control_message(
+        ControlMessage::Diagnostic(crate::shell::ProtocolDiagnostic {
+            code: "HK-SHL-012",
+            message: "internal transport failure".into(),
+        }),
+        &mut state,
+        &output,
+        &worker,
+        &store,
+        &history,
+        &policy,
+    )
+    .expect("channel failure");
+    let notice = state.status.as_deref().expect("actionable notice");
+    assert!(notice.contains("重新打开 Hokan"));
+    assert!(!notice.contains("internal transport"));
+    handle_control_message(
+        ControlMessage::Event(ShellEvent::Prompt {
+            boundary_id: BoundaryId::new(1),
+            cwd: directory.path().to_owned(),
+            history_control: None,
+        }),
+        &mut state,
+        &output,
+        &worker,
+        &store,
+        &history,
+        &policy,
+    )
+    .expect("recovered prompt");
+    assert!(state.status.is_none());
+    let log = std::fs::read_to_string(log_directory.join("debug.log")).expect("log");
+    assert!(log.contains("shell-diagnostic"));
+    assert!(log.contains("HK-SHL-013"));
+    assert!(!log.contains("private shell payload"));
+    output.restore_and_exit().expect("shutdown");
+    join.join().expect("actor joins").expect("actor exits");
+}
+
+#[test]
 fn initial_prompt_does_not_reclaim_a_command_already_queued_by_enter() {
     let directory = tempfile::tempdir().expect("directory");
     let mut state = runtime_state(directory.path());
     state.queued_startup_enter = true;
-    state.foreground_process = true;
+    state.input_owner = super::super::state::InputOwner::Foreground;
     let (output, join) = test_output();
     output.set_foreground(true).expect("queued Enter");
     let worker = ProviderWorker::start(
@@ -134,9 +261,9 @@ fn initial_prompt_does_not_reclaim_a_command_already_queued_by_enter() {
         )
         .expect("prompt");
         let queued = boundary == 1;
-        assert_eq!(state.foreground_process, queued);
+        assert_eq!(state.foreground_process(), queued);
         assert_eq!(output.state().expect("output state").foreground, queued);
-        assert_eq!(state.editing, !queued);
+        assert_eq!(state.editing(), !queued);
         assert_eq!(state.need_cpr, !queued);
         assert!(!state.queued_startup_enter);
     }
@@ -148,7 +275,7 @@ fn initial_prompt_does_not_reclaim_a_command_already_queued_by_enter() {
 fn private_cursor_timeout_uses_guarded_standard_fallback() {
     let directory = tempfile::tempdir().expect("directory");
     let mut state = runtime_state(directory.path());
-    state.editing = true;
+    state.input_owner = super::super::state::InputOwner::Editing;
     state.need_cpr = true;
     let (output, join) = test_output();
 
@@ -188,7 +315,7 @@ fn private_cursor_timeout_uses_guarded_standard_fallback() {
 fn stale_tmux_cursor_result_is_retried_with_a_cooldown() {
     let directory = tempfile::tempdir().expect("directory");
     let mut state = runtime_state(directory.path());
-    state.editing = true;
+    state.input_owner = super::super::state::InputOwner::Editing;
     state.cursor_probe_backend = CursorProbeBackend::Tmux;
     let (output, join) = test_output();
     let output_state = output.state().expect("output state");

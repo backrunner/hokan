@@ -196,11 +196,18 @@ impl<W: Write> OutputActor<W> {
     pub(super) fn prepare_surface_geometry(
         &mut self,
         status: Option<&SanitizedText>,
+        compact_rows: Option<usize>,
     ) -> Result<Option<SurfaceGeometry>, OutputError> {
         let width = self.size.cols.saturating_sub(1).min(self.max_overlay_width);
-        let height = status.map_or(self.renderer.height(), |status| {
-            self.renderer.status_height(width, status)
-        });
+        let height = status.map_or_else(
+            || {
+                compact_rows.map_or(self.renderer.height(), |rows| {
+                    rows.saturating_add(2)
+                        .min(usize::from(self.renderer.height())) as u16
+                })
+            },
+            |status| self.renderer.status_height(width, status),
+        );
         if self.foreground
             || self.model.alternate_screen()
             || self.model.confidence() == AnchorConfidence::Unknown

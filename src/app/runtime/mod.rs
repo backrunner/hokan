@@ -279,7 +279,7 @@ pub fn run_session(options: SessionOptions) -> crate::Result<u8> {
                         state.tmux_cursor_retry_at = None;
                         if state.cursor_probe_backend == CursorProbeBackend::Tmux {
                             state.cursor_probe_backend = CursorProbeBackend::TerminalPrivate;
-                            state.need_cpr = state.editing && !state.foreground_process;
+                            state.need_cpr = state.editing() && !state.foreground_process();
                         }
                     }
                 }
@@ -312,7 +312,19 @@ pub fn run_session(options: SessionOptions) -> crate::Result<u8> {
         // Keep terminal-reply ownership aligned with the shell state. Expired
         // Hokan replies are released when a foreground child takes the PTY,
         // because the child can issue the same terminal queries itself.
-        let mut routed_input = reply_router.set_foreground(state.foreground_process);
+        route_terminal_input(
+            &[],
+            &mut reply_router,
+            &mut decoder,
+            &mut state,
+            &mut pty,
+            &shell_session,
+            output.handle(),
+            &worker,
+            &config,
+            &ai_sender,
+        )?;
+        let mut routed_input = reply_router.set_foreground(state.foreground_process());
         let expired = reply_router.expire(now);
         for reply in expired.replies {
             if handle_terminal_reply(reply, &mut state, output.handle())? {
@@ -320,6 +332,10 @@ pub fn run_session(options: SessionOptions) -> crate::Result<u8> {
             }
         }
         routed_input.extend_from_slice(&expired.input);
+        let routed_input = output
+            .handle()
+            .filter_color_replies(&routed_input, state.foreground_process())
+            .map_err(output_error)?;
         forward_terminal_input(
             &routed_input,
             &mut decoder,
@@ -353,10 +369,10 @@ pub fn run_session(options: SessionOptions) -> crate::Result<u8> {
         if !terminating {
             auto_update.tick(&config.update, now);
         }
-        detect_foreground_process(&mut state, &pty, output.handle())?;
+        detect_foreground_process(&mut state, &pty, output.handle(), &worker)?;
         if let Some(probe) = &mut title_probe {
             probe.tick(
-                config.ui.sync_title && state.foreground_process,
+                config.ui.sync_title && state.foreground_process(),
                 &pty,
                 output.handle(),
                 now,
