@@ -1,5 +1,125 @@
 use super::*;
 
+fn wait_for_fetch(cache: &CommandHelpCache, command: &str, scope: &[String]) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while cache.scope_is_pending(command, scope) {
+        assert!(std::time::Instant::now() < deadline, "help fetch timed out");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn shell_path_change_recovers_negative_root_and_scoped_help() {
+    let directory = tempfile::tempdir().expect("script directory");
+    let bin = directory.path().join("bin");
+    let runtime = directory.path().join("runtime");
+    fs::create_dir(&bin).expect("bin");
+    fs::create_dir(&runtime).expect("runtime");
+    let executable = bin.join("script-cli");
+    fs::write(&executable, "#!/usr/bin/env hokan-cache-runtime\n").expect("launcher");
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).expect("mode");
+    let interpreter = runtime.join("hokan-cache-runtime");
+    fs::write(
+        &interpreter,
+        "#!/bin/sh\nshift\ncase \"$*\" in\n  --help) printf 'Commands:\\n  update Update the CLI\\n' ;;\n  'plugin --help') printf 'Commands:\\n  install Install a plugin\\n' ;;\n  *) exit 1 ;;\nesac\n",
+    ).expect("runtime fixture");
+    fs::set_permissions(&interpreter, fs::Permissions::from_mode(0o700)).expect("mode");
+    let commands = Arc::new(CommandPathCache::from_path(Some(bin.as_os_str())));
+    let cache = Arc::new(CommandHelpCache::with_commands(Arc::clone(&commands)));
+    let scope = vec!["plugin".to_owned()];
+    cache.request("script-cli", Some(executable.clone()));
+    cache.request_scope("script-cli", Some(executable.clone()), scope.clone());
+    wait_for_fetch(&cache, "script-cli", &[]);
+    wait_for_fetch(&cache, "script-cli", &scope);
+    assert!(
+        cache
+            .peek("script-cli")
+            .expect("negative root")
+            .subcommands
+            .is_empty()
+    );
+    assert!(
+        cache
+            .peek_scope("script-cli", &scope)
+            .expect("negative scope")
+            .subcommands
+            .is_empty()
+    );
+
+    let child_path = std::env::join_paths([&bin, &runtime]).expect("child PATH");
+    assert!(commands.refresh_from_path(Some(&child_path)));
+    assert_eq!(
+        commands.path("script-cli"),
+        Some(fs::canonicalize(&executable).expect("canonical launcher"))
+    );
+    assert!(cache.peek("script-cli").is_none());
+    assert!(cache.peek_scope("script-cli", &scope).is_none());
+    cache.request("script-cli", Some(executable.clone()));
+    cache.request_scope("script-cli", Some(executable.clone()), scope.clone());
+    wait_for_fetch(&cache, "script-cli", &[]);
+    wait_for_fetch(&cache, "script-cli", &scope);
+    assert_eq!(
+        cache.peek("script-cli").expect("root help").subcommands[0].name,
+        "update"
+    );
+    assert_eq!(
+        cache
+            .peek_scope("script-cli", &scope)
+            .expect("scoped help")
+            .subcommands[0]
+            .name,
+        "install"
+    );
+    assert_eq!(cache.fetch_count(), 4);
+    cache.request("script-cli", Some(executable.clone()));
+    cache.request_scope("script-cli", Some(executable), scope);
+    assert_eq!(
+        cache.fetch_count(),
+        4,
+        "unchanged PATH must still hit the cache"
+    );
+
+    // Even an equivalent command map must invalidate cached output, since
+    // programs may inspect PATH or use non-executable helper resources.
+    let extra = directory.path().join("empty");
+    fs::create_dir(&extra).expect("extra path");
+    let changed_path = std::env::join_paths([&bin, &runtime, &extra]).expect("changed PATH");
+    assert!(commands.refresh_from_path(Some(&changed_path)));
+    assert!(cache.peek("script-cli").is_none());
+}
+
+#[test]
+fn help_finishing_after_a_shell_path_change_is_discarded() {
+    let directory = tempfile::tempdir().expect("path fixture");
+    let commands = Arc::new(CommandPathCache::default());
+    let cache = Arc::new(CommandHelpCache::with_commands(Arc::clone(&commands)));
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    cache.request_with("script-cli", move |_| {
+        started_tx.send(()).expect("started");
+        release_rx.recv().expect("released");
+        parse_help_output("script-cli", "Commands:\n  obsolete Old command\n")
+    });
+    started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("started probe");
+    assert!(commands.refresh_from_path(Some(directory.path().as_os_str())));
+    release_tx.send(()).expect("release old probe");
+    wait_for_fetch(&cache, "script-cli", &[]);
+    assert!(
+        cache.peek("script-cli").is_none(),
+        "old PATH output must not be cached"
+    );
+    cache.request_with("script-cli", |_| {
+        parse_help_output("script-cli", "Commands:\n  update Current command\n")
+    });
+    wait_for_fetch(&cache, "script-cli", &[]);
+    assert_eq!(
+        cache.peek("script-cli").expect("current help").subcommands[0].name,
+        "update"
+    );
+}
+
 #[test]
 fn negative_results_are_cached_after_one_fetch() {
     let cache = CommandHelpCache::default();

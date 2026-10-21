@@ -3,7 +3,7 @@ use super::{
     CommandHelp,
     parsing::{parse_help_output_for_scope, parse_man_page, strip_help_escapes},
 };
-use std::{collections::HashSet, path::Path, time::Duration};
+use std::{collections::HashSet, ffi::OsStr, path::Path, time::Duration};
 
 // `ps`/`ifconfig`-style probe precedent: the `man` binary is a fixed trusted
 // program, receives no shell and no user-controlled argv beyond the command
@@ -61,12 +61,18 @@ pub(super) fn fetch_command_help(command: &str) -> CommandHelp {
     fetch_with_fallback(help_command, fetch_man_page, |_| fetch_help_output(command))
 }
 
-pub(super) fn fetch_command_help_from(command: &str, executable: Option<&Path>) -> CommandHelp {
+pub(super) fn fetch_command_help_from(
+    command: &str,
+    executable: Option<&Path>,
+    search_path: Option<&OsStr>,
+) -> CommandHelp {
     let help_command = command_basename(command);
     let parsed = fetch_man_page(help_command);
-    let fallback = executable.map_or_else(
-        || fetch_help_output(command),
-        |path| fetch_help_program(help_command, path.as_os_str()),
+    let fallback = fetch_help_program_for_scope(
+        help_command,
+        executable.map_or_else(|| OsStr::new(command), Path::as_os_str),
+        &[],
+        search_path,
     );
     merge_help_sources(help_command, parsed, fallback)
 }
@@ -75,11 +81,14 @@ pub(super) fn fetch_scoped_help_from(
     command: &str,
     executable: Option<&Path>,
     scope: &[String],
+    search_path: Option<&OsStr>,
 ) -> CommandHelp {
     let help_command = command_basename(command);
-    executable.map_or_else(
-        || fetch_help_program_for_scope(help_command, std::ffi::OsStr::new(command), scope),
-        |path| fetch_help_program_for_scope(help_command, path.as_os_str(), scope),
+    fetch_help_program_for_scope(
+        help_command,
+        executable.map_or_else(|| OsStr::new(command), Path::as_os_str),
+        scope,
+        search_path,
     )
 }
 
@@ -151,19 +160,24 @@ pub(super) fn fetch_help_output(command: &str) -> CommandHelp {
 }
 
 pub(super) fn fetch_help_program(command: &str, program: &std::ffi::OsStr) -> CommandHelp {
-    fetch_help_program_for_scope(command, program, &[])
+    fetch_help_program_for_scope(command, program, &[], None)
 }
 
 pub(super) fn fetch_help_program_for_scope(
     command: &str,
     program: &std::ffi::OsStr,
     scope: &[String],
+    search_path: Option<&OsStr>,
 ) -> CommandHelp {
     let mut combined = CommandHelp::default();
     for arguments in help_probe_arguments(command, scope) {
-        let Ok(output) =
-            crate::platform::run_bounded(program, &arguments, HELP_TIMEOUT, MAN_MAX_OUTPUT_BYTES)
-        else {
+        let Ok(output) = crate::platform::run_bounded_with_path(
+            program,
+            &arguments,
+            HELP_TIMEOUT,
+            MAN_MAX_OUTPUT_BYTES,
+            search_path,
+        ) else {
             continue;
         };
         let mut parsed = CommandHelp::default();

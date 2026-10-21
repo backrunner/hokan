@@ -5,8 +5,10 @@ use super::{
         fetch_command_help, fetch_command_help_from, fetch_scoped_help_from, help_probe_allowed,
     },
 };
+use crate::platform::CommandPathCache;
 use std::{
     collections::HashMap,
+    ffi::{OsStr, OsString},
     fs,
     panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
@@ -70,33 +72,67 @@ impl ExecutableStamp {
     }
 }
 
+/// Cache identity includes the interpreter/helper search path, even when
+/// the launcher itself resolves to the same executable after a PATH change.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HelpProbe {
+    executable: Option<ExecutableStamp>,
+    search_path: Option<OsString>,
+}
+
+impl HelpProbe {
+    fn is_current(&self) -> bool {
+        self.executable
+            .as_ref()
+            .is_none_or(ExecutableStamp::is_current)
+    }
+}
+
 /// Session-scoped command → parsed help cache. Negative results (man failed,
 /// page unparsable, `--help` fallback empty) are cached as empty entries so a
-/// missing or slow page costs at most one bounded fetch per command per
-/// session. Shared between the help provider (which fetches) and the
+/// missing or slow page costs at most one bounded fetch per command and
+/// PATH/executable snapshot. Shared between the help provider (which fetches) and the
 /// filesystem provider (which only peeks) so the suppression check never
 /// spawns a subprocess.
-type CommandHelpEntries = HashMap<String, (Option<ExecutableStamp>, Arc<CommandHelp>)>;
+type CommandHelpEntries = HashMap<String, (Option<HelpProbe>, Arc<CommandHelp>)>;
 
 #[derive(Default)]
 pub struct CommandHelpCache {
+    commands: Option<Arc<CommandPathCache>>,
     entries: Mutex<CommandHelpEntries>,
-    pending: Mutex<HashMap<String, Option<PathBuf>>>,
+    pending: Mutex<HashMap<String, HelpProbe>>,
     fetches: AtomicUsize,
     revision: AtomicU64,
 }
 
 impl CommandHelpCache {
+    /// Follow the same PATH snapshot used to resolve interactive commands.
+    #[must_use]
+    pub fn with_commands(commands: Arc<CommandPathCache>) -> Self {
+        Self {
+            commands: Some(commands),
+            ..Self::default()
+        }
+    }
+
+    fn search_path(&self) -> Option<OsString> {
+        self.commands
+            .as_ref()
+            .and_then(|commands| commands.search_path())
+    }
+
     /// Cached entry only; never runs `man`. Cheap enough for `applies`-time
     /// suppression checks in other providers. Entries stamped from a binary
     /// are revalidated against the file so an in-place upgrade drops the
     /// entry instead of serving stale help for the rest of the session.
     #[must_use]
     pub fn peek(&self, command: &str) -> Option<Arc<CommandHelp>> {
+        let search_path = self.search_path();
         let mut entries = lock(&self.entries);
         let stale = matches!(
             entries.get(command),
-            Some((Some(stamp), _)) if !stamp.is_current()
+            Some((Some(probe), _))
+                if probe.search_path != search_path || !probe.is_current()
         );
         if stale {
             entries.remove(command);
@@ -139,8 +175,8 @@ impl CommandHelpCache {
             return;
         }
         let fetch_path = executable.clone();
-        self.request_with_path(command, executable, move |command| {
-            fetch_command_help_from(command, fetch_path.as_deref())
+        self.request_with_environment(command, executable, move |command, search_path| {
+            fetch_command_help_from(command, fetch_path.as_deref(), search_path)
         });
     }
 
@@ -160,8 +196,8 @@ impl CommandHelpCache {
         let key = scope_cache_key(command, &scope);
         let command = command.to_owned();
         let fetch_path = executable.clone();
-        self.request_with_path(&key, executable, move |_| {
-            fetch_scoped_help_from(&command, fetch_path.as_deref(), &scope)
+        self.request_with_environment(&key, executable, move |_, search_path| {
+            fetch_scoped_help_from(&command, fetch_path.as_deref(), &scope, search_path)
         });
     }
 
@@ -180,11 +216,26 @@ impl CommandHelpCache {
         executable: Option<PathBuf>,
         fetch: impl FnOnce(&str) -> CommandHelp + Send + 'static,
     ) {
+        self.request_with_environment(command, executable, move |command, _| fetch(command));
+    }
+
+    fn request_with_environment(
+        self: &Arc<Self>,
+        command: &str,
+        executable: Option<PathBuf>,
+        fetch: impl FnOnce(&str, Option<&OsStr>) -> CommandHelp + Send + 'static,
+    ) {
+        // Capture identity before probing, so an upgrade during the fetch
+        // cannot stamp old output as belonging to the new executable.
+        let probe = HelpProbe {
+            executable: executable.map(ExecutableStamp::resolved),
+            search_path: self.search_path(),
+        };
         {
             let mut entries = lock(&self.entries);
             if entries
                 .get(command)
-                .is_some_and(|entry| entry_satisfies(entry, &executable))
+                .is_some_and(|entry| entry_satisfies(entry, &probe))
             {
                 return;
             }
@@ -192,22 +243,22 @@ impl CommandHelpCache {
         }
         {
             let mut pending = lock(&self.pending);
-            if pending.get(command) == Some(&executable) {
+            if pending.get(command) == Some(&probe) {
                 return;
             }
             if !pending.contains_key(command) && pending.len() >= MAX_CONCURRENT_FETCHES {
                 return;
             }
-            pending.insert(command.to_owned(), executable.clone());
+            pending.insert(command.to_owned(), probe.clone());
         }
         // Close the small race with a synchronous cache fill between the
         // first lookup and the pending insertion.
         if lock(&self.entries)
             .get(command)
-            .is_some_and(|entry| entry_satisfies(entry, &executable))
+            .is_some_and(|entry| entry_satisfies(entry, &probe))
         {
             let mut pending = lock(&self.pending);
-            if pending.get(command) == Some(&executable) {
+            if pending.get(command) == Some(&probe) {
                 pending.remove(command);
             }
             return;
@@ -217,27 +268,29 @@ impl CommandHelpCache {
         let cache = Arc::clone(self);
         let command = command.to_owned();
         let pending_command = command.clone();
-        let pending_path = executable.clone();
+        let pending_probe = probe.clone();
         let spawned = thread::Builder::new()
             .name("hokan-command-help".into())
             .spawn(move || {
-                let fetched =
-                    catch_unwind(AssertUnwindSafe(|| fetch(&command))).unwrap_or_default();
+                let fetched = catch_unwind(AssertUnwindSafe(|| {
+                    fetch(&command, probe.search_path.as_deref())
+                }))
+                .unwrap_or_default();
                 let mut pending = lock(&cache.pending);
-                let current = pending.get(&command) == Some(&executable);
-                let inserted = current && {
-                    let mut entries = lock(&cache.entries);
-                    if entries
-                        .get(&command)
-                        .is_some_and(|entry| entry_satisfies(entry, &executable))
-                    {
-                        false
-                    } else {
-                        let stamp = executable.clone().map(ExecutableStamp::resolved);
-                        entries.insert(command.clone(), (stamp, Arc::new(fetched)));
-                        true
-                    }
-                };
+                let current = pending.get(&command) == Some(&probe);
+                let inserted =
+                    current && probe.search_path == cache.search_path() && probe.is_current() && {
+                        let mut entries = lock(&cache.entries);
+                        if entries
+                            .get(&command)
+                            .is_some_and(|entry| entry_satisfies(entry, &probe))
+                        {
+                            false
+                        } else {
+                            entries.insert(command.clone(), (Some(probe), Arc::new(fetched)));
+                            true
+                        }
+                    };
                 if current {
                     pending.remove(&command);
                 }
@@ -248,7 +301,7 @@ impl CommandHelpCache {
             });
         if spawned.is_err() {
             let mut pending = lock(&self.pending);
-            if pending.get(pending_command.as_str()) == Some(&pending_path) {
+            if pending.get(pending_command.as_str()) == Some(&pending_probe) {
                 pending.remove(pending_command.as_str());
             }
         }
@@ -320,13 +373,11 @@ fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// An entry is usable for `requested` when it was probed from the same
-/// binary path (or carries no stamp at all — test seeds and explicit `get`
-/// fills) and that binary is still on disk unchanged.
-fn entry_satisfies(
-    entry: &(Option<ExecutableStamp>, Arc<CommandHelp>),
-    requested: &Option<PathBuf>,
-) -> bool {
+/// binary and shell PATH (or carries no stamp at all — test seeds and
+/// explicit `get` fills) and that binary is still on disk unchanged.
+fn entry_satisfies(entry: &(Option<HelpProbe>, Arc<CommandHelp>), requested: &HelpProbe) -> bool {
     let (stamp, _) = entry;
-    (stamp.is_none() || stamp.as_ref().map(|stamp| &stamp.path) == requested.as_ref())
-        && stamp.as_ref().is_none_or(ExecutableStamp::is_current)
+    stamp
+        .as_ref()
+        .is_none_or(|stamp| stamp == requested && stamp.is_current())
 }

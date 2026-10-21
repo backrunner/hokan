@@ -128,7 +128,7 @@ pub(super) fn build_engine(
     let specs = Arc::new(SpecRegistry::load(Some(&paths.specs_directory)));
     let commands = commands.unwrap_or_else(|| Arc::new(CommandPathCache::from_environment()));
     let projects = Arc::new(ProjectCache::default());
-    let help = Arc::new(CommandHelpCache::default());
+    let help = Arc::new(CommandHelpCache::with_commands(Arc::clone(&commands)));
     let git_status = Arc::new(crate::project::GitStatusCache::default());
     let aliases = Arc::new(AliasCache::default());
     let mut engine = CompletionEngine::new(config.completion.max_candidates, config.ui.max_rows)

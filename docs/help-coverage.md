@@ -10,6 +10,16 @@ abbreviated root help is supplemented by its installed command list.
 样式。用户输入已确认的子命令后，后台探测对应帮助层级。Cargo 的精简帮助会合并已安装
 命令列表，Python 模块推荐保留全部已发现的匹配项。
 
+Help subprocesses use the child shell's current PATH, including interpreters
+loaded by nvm or other shell startup configuration. Root and nested help caches
+are invalidated when that PATH changes, including failed probes; results still
+arriving from an old PATH are discarded. This does not change Hokan's own
+process environment.
+
+帮助子进程使用子 shell 当前的 PATH，因此能够找到 nvm 等启动配置加载的解释器。
+PATH 变化后，根命令和嵌套命令的帮助缓存（包括失败结果）都会失效；仍在后台运行的
+旧 PATH 探测结果不会写回缓存。Hokan 自身的进程环境不会被修改。
+
 The [captured corpus](../tests/fixtures/command-help/README.md) covers 15 CLIs,
 32 help samples, and 785 expected recommendations. Default tests compare exact
 canonical command sets and editable candidates, excluding category headings and

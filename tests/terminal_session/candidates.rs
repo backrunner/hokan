@@ -129,6 +129,10 @@ fn overlay_opens_without_a_default_selection() {
     terminal.settle(Duration::from_millis(300));
 
     terminal.write(b"ls ");
+    // The generic footer is already present for the intermediate `l` query.
+    // Wait for the intended command's recipes before asserting list state.
+    terminal.wait_for_screen(TAG_SPEC);
+    terminal.wait_for_screen("HK> ls");
     terminal.wait_for_screen("Tab 回填 · Enter 执行 · Esc 关闭");
     let text = terminal.screen_text();
     assert!(text.contains(TAG_SPEC), "overlay rows missing:\n{text}");
@@ -276,6 +280,84 @@ fn aipass_descriptionless_commands_appear_at_root_and_nested_scopes() {
             !text.contains('▶'),
             "implicit selection for {input}:\n{text}"
         );
+        terminal.write(b"\x15");
+        terminal.wait_for_bare_row("HK>");
+    }
+    terminal.exit_shell();
+    terminal.wait_until_exit();
+}
+
+#[test]
+fn script_help_uses_the_child_shell_path_for_root_and_nested_commands() {
+    if !command_exists("zsh") {
+        return;
+    }
+    let (home, work) = empty_fixture_directories();
+    let bin = home.path().join("runtime-bin");
+    fs::create_dir(&bin).expect("runtime bin");
+    for (name, body) in [
+        ("hokan-help-runtime", "#!/bin/sh\nexec /bin/sh \"$@\"\n"),
+        (
+            "script-cli",
+            "#!/usr/bin/env hokan-help-runtime\ncase \"$*\" in\n  --help) printf '%s\\n' 'Commands:' '  update    Update the CLI' '  plugin    Manage plugins' ;;\n  'plugin --help') printf '%s\\n' 'Commands:' '  install    Install a plugin' ;;\n  *) exit 1 ;;\nesac\n",
+        ),
+    ] {
+        let executable = bin.join(name);
+        fs::write(&executable, body).expect("script fixture");
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).expect("mode");
+    }
+    // Like nvm in .zshrc, the interpreter is absent from Hokan's inherited
+    // environment and becomes available only after the child shell starts.
+    fs::write(
+        home.path().join(".zshrc"),
+        "export PATH=\"$HOME/runtime-bin:$PATH\"\nPROMPT='HK> '\nRPROMPT=''\nsetopt no_beep\n",
+    )
+    .expect("fixture zshrc");
+    let mut terminal = TerminalSession::spawn_hokan(home, work, 2);
+    terminal.wait_for_screen("HK> ");
+    for (input, expected) in [
+        ("script-cli u", "script-cli update"),
+        ("script-cli plugin i", "script-cli plugin install"),
+    ] {
+        terminal.write(input.as_bytes());
+        terminal.wait_for_overlay_candidate(expected);
+        terminal.write(b"\x15");
+        terminal.wait_for_bare_row("HK>");
+    }
+    terminal.exit_shell();
+    terminal.wait_until_exit();
+}
+
+#[test]
+#[ignore = "requires installed Codex and Node; only probes help, never runs update"]
+fn installed_codex_recommends_update_with_shell_only_node_path() {
+    assert!(command_exists("codex"), "Codex must be installed");
+    assert!(command_exists("node"), "Node must be installed");
+    let (home, work) = empty_fixture_directories();
+    fs::write(
+        home.path().join(".zshrc"),
+        "export PATH=\"$HOKAN_TEST_CHILD_PATH\"\nPROMPT='HK> '\nRPROMPT=''\nsetopt no_beep\n",
+    )
+    .expect("fixture zshrc");
+    let mut command = CommandBuilder::new(hokan_test_bin());
+    command.arg("--shell");
+    command.arg("zsh");
+    configure_command(&mut command, &home, &work);
+    command.env(
+        "HOKAN_TEST_CHILD_PATH",
+        std::env::var_os("PATH").expect("child PATH"),
+    );
+    command.env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
+    let mut terminal = TerminalSession::spawn_command(home, work, command, 2);
+    terminal.wait_for_screen("HK> ");
+    for (input, expected) in [
+        ("codex u", "codex update"),
+        ("codex mcp a", "codex mcp add"),
+    ] {
+        terminal.write(input.as_bytes());
+        terminal.wait_for_overlay_candidate(expected);
+        println!("Installed CLI overlay verified: {expected}");
         terminal.write(b"\x15");
         terminal.wait_for_bare_row("HK>");
     }

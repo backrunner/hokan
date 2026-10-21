@@ -26,9 +26,29 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    run_bounded_with_path(program, args, timeout, max_output_bytes, None)
+}
+
+/// Override PATH on this subprocess only; never mutate the multithreaded
+/// parent's environment when the interactive shell changes toolchains.
+pub(crate) fn run_bounded_with_path<P, I, S>(
+    program: P,
+    args: I,
+    timeout: Duration,
+    max_output_bytes: usize,
+    search_path: Option<&OsStr>,
+) -> Result<BoundedOutput, String>
+where
+    P: AsRef<OsStr>,
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     let program = program.as_ref();
     let started = Instant::now();
     let mut command = Command::new(program);
+    if let Some(path) = search_path {
+        command.env("PATH", path);
+    }
     command
         .args(args)
         .stdin(Stdio::null())

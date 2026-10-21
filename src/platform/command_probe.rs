@@ -1,6 +1,8 @@
 use std::{
     collections::{HashMap, HashSet},
-    env, fs,
+    env,
+    ffi::{OsStr, OsString},
+    fs,
     path::{Path, PathBuf},
     sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard},
 };
@@ -9,13 +11,19 @@ use nix::unistd::{AccessFlags, access};
 
 #[derive(Debug, Default)]
 pub struct CommandPathCache {
-    commands: RwLock<HashMap<String, PathBuf>>,
+    snapshot: RwLock<PathSnapshot>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct PathSnapshot {
+    search_path: Option<OsString>,
+    commands: HashMap<String, PathBuf>,
 }
 
 impl Clone for CommandPathCache {
     fn clone(&self) -> Self {
         Self {
-            commands: RwLock::new(read(&self.commands).clone()),
+            snapshot: RwLock::new(read(&self.snapshot).clone()),
         }
     }
 }
@@ -27,50 +35,64 @@ impl CommandPathCache {
     }
 
     #[must_use]
-    pub fn from_path(path: Option<&std::ffi::OsStr>) -> Self {
+    pub fn from_path(path: Option<&OsStr>) -> Self {
         Self {
-            commands: RwLock::new(scan_path(path)),
+            snapshot: RwLock::new(PathSnapshot {
+                search_path: path.map(OsStr::to_owned),
+                commands: scan_path(path),
+            }),
         }
     }
 
     /// Replace the cache with a snapshot of the child shell's current PATH.
-    /// Returns true only when the executable set or resolution order changed.
-    pub fn refresh_from_path(&self, path: Option<&std::ffi::OsStr>) -> bool {
-        let scanned = scan_path(path);
-        let mut commands = write(&self.commands);
-        if *commands == scanned {
+    /// Also tracks PATH changes that leave the executable map unchanged:
+    /// script interpreters and child programs need the shell's search path.
+    pub fn refresh_from_path(&self, path: Option<&OsStr>) -> bool {
+        let scanned = PathSnapshot {
+            search_path: path.map(OsStr::to_owned),
+            commands: scan_path(path),
+        };
+        let mut snapshot = write(&self.snapshot);
+        if *snapshot == scanned {
             return false;
         }
-        *commands = scanned;
+        *snapshot = scanned;
         true
     }
 
     #[must_use]
+    pub(crate) fn search_path(&self) -> Option<OsString> {
+        read(&self.snapshot).search_path.clone()
+    }
+
+    #[must_use]
     pub fn contains(&self, command: &str) -> bool {
-        read(&self.commands).contains_key(command)
+        read(&self.snapshot).commands.contains_key(command)
     }
 
     #[must_use]
     pub fn has_prefix(&self, prefix: &str) -> bool {
-        read(&self.commands)
+        read(&self.snapshot)
+            .commands
             .keys()
             .any(|command| command.starts_with(prefix))
     }
 
     #[must_use]
     pub fn has_longer_prefix(&self, prefix: &str) -> bool {
-        read(&self.commands)
+        read(&self.snapshot)
+            .commands
             .keys()
             .any(|command| command.len() > prefix.len() && command.starts_with(prefix))
     }
 
     pub fn names(&self) -> Vec<String> {
-        read(&self.commands).keys().cloned().collect()
+        read(&self.snapshot).commands.keys().cloned().collect()
     }
 
     #[must_use]
     pub fn path(&self, command: &str) -> Option<PathBuf> {
-        read(&self.commands).get(command).cloned()
+        read(&self.snapshot).commands.get(command).cloned()
     }
 }
 
@@ -98,16 +120,12 @@ fn scan_path(path: Option<&std::ffi::OsStr>) -> HashMap<String, PathBuf> {
     commands
 }
 
-fn read(
-    commands: &RwLock<HashMap<String, PathBuf>>,
-) -> RwLockReadGuard<'_, HashMap<String, PathBuf>> {
-    commands.read().unwrap_or_else(PoisonError::into_inner)
+fn read(snapshot: &RwLock<PathSnapshot>) -> RwLockReadGuard<'_, PathSnapshot> {
+    snapshot.read().unwrap_or_else(PoisonError::into_inner)
 }
 
-fn write(
-    commands: &RwLock<HashMap<String, PathBuf>>,
-) -> RwLockWriteGuard<'_, HashMap<String, PathBuf>> {
-    commands.write().unwrap_or_else(PoisonError::into_inner)
+fn write(snapshot: &RwLock<PathSnapshot>) -> RwLockWriteGuard<'_, PathSnapshot> {
+    snapshot.write().unwrap_or_else(PoisonError::into_inner)
 }
 
 pub(crate) fn is_executable(path: &Path) -> bool {
@@ -212,6 +230,22 @@ mod tests {
         assert!(!cache.contains("first-command"));
         assert!(cache.contains("second-command"));
         assert!(!cache.refresh_from_path(Some(&refreshed_path)));
+    }
+
+    #[test]
+    fn search_path_changes_are_kept_even_when_command_resolution_is_unchanged() {
+        let directory = tempfile::tempdir().expect("PATH fixture");
+        let initial = directory.path().join("initial");
+        let extra = directory.path().join("extra");
+        fs::create_dir(&initial).expect("initial directory");
+        fs::create_dir(&extra).expect("extra directory");
+        let cache = CommandPathCache::from_path(Some(initial.as_os_str()));
+        let changed = env::join_paths([&extra, &initial]).expect("search path");
+        assert!(cache.refresh_from_path(Some(&changed)));
+        assert!(cache.names().is_empty());
+        assert_eq!(cache.search_path(), Some(changed.clone()));
+        assert!(!cache.refresh_from_path(Some(&changed)));
+        assert_eq!(cache.clone().search_path(), Some(changed));
     }
 
     #[test]
