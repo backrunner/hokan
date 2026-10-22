@@ -347,6 +347,7 @@ impl HistoryProvider {
 }
 
 mod flow;
+mod paths;
 mod scripts;
 mod validation;
 

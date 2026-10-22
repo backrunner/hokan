@@ -204,6 +204,12 @@ Hokan merges and ranks candidates from several independent providers:
 | System state | Running processes, PIDs, and network interfaces |
 | AI action | An explicit OpenAI-compatible request selected by you |
 
+History suggestions recheck single-path commands such as `rm -rf`, `rmdir`,
+`cd`, `ls`, and `du` against the current filesystem. Once the target disappears,
+the command is hidden; recreating the target makes it eligible again without
+deleting its history record. Creation commands such as `mkdir` and `touch`,
+dynamic shell expressions, and compound commands retain their existing behavior.
+
 ## Keys
 
 | Key | Action |

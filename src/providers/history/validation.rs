@@ -62,6 +62,11 @@ impl HistoryProvider {
         let Some(segments) = command_segment_words(command) else {
             return true;
         };
+        if let [segment] = segments.as_slice()
+            && !super::paths::single_path_is_plausible(context, command, &segment.words, aliases)
+        {
+            return false;
+        }
         let mut states = vec![HistoryFlowState {
             cwd: context.cwd.as_ref().clone(),
             status: HistoryCommandStatus::Success,

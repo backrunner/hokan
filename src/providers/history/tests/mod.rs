@@ -127,5 +127,6 @@ fn history_index() -> HistoryIndex {
 
 mod flow;
 mod navigation;
+mod paths;
 mod scripts;
 mod validation;

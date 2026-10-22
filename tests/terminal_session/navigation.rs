@@ -1,6 +1,79 @@
 use super::*;
 
 #[test]
+fn removing_a_directory_hides_its_history_suggestions_without_restarting() {
+    if !command_exists("zsh") {
+        return;
+    }
+    let (home, work) = fixture_directories();
+    let removed = work.path().join("HK_PATH_REMOVED");
+    fs::create_dir(&removed).expect("target to delete");
+    fs::create_dir(work.path().join("HK_PATH_KEEP")).expect("remaining target");
+    let cwd = work.path().canonicalize().expect("canonical cwd");
+    let store = hokan::history::HistoryStore::open(&home.path().join(".local/state/hokan"))
+        .expect("history store");
+    let events = [
+        "rm -rf HK_PATH_REMOVED",
+        "rm -rf HK_PATH_KEEP",
+        "ls -d HK_PATH_REMOVED",
+        "ls -d HK_PATH_KEEP",
+    ]
+    .map(|command| hokan::history::HistoryEventV1 {
+        event_id: None,
+        timestamp_ms: 1_000,
+        command: command.to_owned(),
+        cwd: Some(cwd.clone()),
+        shell: hokan::shell::ShellKind::Zsh,
+        exit_code: Some(0),
+        imported: false,
+        occurrences: 1,
+        cwd_occurrences: Some(1),
+    });
+    store.append_many(&events).expect("seed history");
+    let mut terminal = TerminalSession::spawn_hokan(home, work, 2);
+    terminal.wait_for_screen("HK> ");
+    terminal.wait_for_sync_replies(1);
+    terminal.write(b"rm -rf HK_PATH_");
+    terminal.wait_for_screen("rm -rf HK_PATH_REMOVED");
+    terminal.write(b"\x15");
+    terminal.settle(Duration::from_millis(100));
+    terminal.write(b"rm -rf HK_PATH_REMOVED\r");
+    let deadline = Instant::now() + TIMEOUT;
+    while removed.exists() && Instant::now() < deadline {
+        terminal.settle(Duration::from_millis(20));
+    }
+    assert!(!removed.exists(), "shell must actually delete the fixture");
+    terminal.wait_for_bare_row("HK>");
+
+    for prefix in [b"rm -rf HK_PATH_".as_slice(), b"ls -d HK_PATH_".as_slice()] {
+        terminal.write(prefix);
+        terminal.wait_for_screen("HK_PATH_KEEP");
+        terminal.settle(Duration::from_millis(300));
+        let screen = terminal.screen_text();
+        // Filesystem/history candidates for the same edit can merge, retaining
+        // the filesystem source tag. Inspect the visible rows, not their tags.
+        let overlay_rows = screen
+            .lines()
+            .filter(|line| line.contains('│'))
+            .collect::<Vec<_>>();
+        assert!(
+            overlay_rows.iter().any(|row| row.contains("HK_PATH_KEEP")),
+            "valid target missing:\n{screen}"
+        );
+        assert!(
+            overlay_rows
+                .iter()
+                .all(|row| !row.contains("HK_PATH_REMOVED")),
+            "stale history returned after deletion:\n{screen}"
+        );
+        terminal.write(b"\x15");
+        terminal.settle(Duration::from_millis(100));
+    }
+    terminal.exit_shell();
+    terminal.wait_until_exit();
+}
+
+#[test]
 fn imported_history_subcommand_typos_are_filtered_by_dynamic_help() {
     if !command_exists("zsh") {
         return;
