@@ -20,7 +20,6 @@ if [[ -n ${HOKAN_ACTIVE:-} && -n ${HOKAN_CONTROL_FIFO:-} && -z ${__HOKAN_ZSH_LOA
   typeset -gi __hokan_prompt_id=0
   typeset -gi __hokan_redisplay_id=0
   typeset -gi __hokan_command_active=0
-  typeset -g __hokan_last_command=''
   typeset -g __hokan_last_path=''
   typeset -g __hokan_prompt_base="$PROMPT"
   typeset -g __hokan_wrapped_prompt=''
@@ -78,12 +77,12 @@ if [[ -n ${HOKAN_ACTIVE:-} && -n ${HOKAN_CONTROL_FIFO:-} && -z ${__HOKAN_ZSH_LOA
 
   function __hokan_preexec() {
     setopt localoptions no_multibyte
-    # A plugin or duplicated hook entry may call us twice before precmd.
-    # Keep one START per command without changing the command's exit status.
-    if (( __hokan_command_active )) && [[ "$__hokan_last_command" == "$1" ]]; then
+    # One accepted line owns the lifecycle until precmd, including compound
+    # commands. Plugins may repeat preexec with abbreviated/expanded text,
+    # so comparing payloads would mistake that for a second command.
+    if (( __hokan_command_active )); then
       return 0
     fi
-    __hokan_last_command="$1"
     __hokan_command_active=1
     if (( ${#1} <= __hokan_payload_max_bytes )); then
       printf 'HKP2\tSTART\t%s\0' "$1" >&$__hokan_control_fd

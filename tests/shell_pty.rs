@@ -15,6 +15,145 @@ use hokan::{
 const TIMEOUT: Duration = Duration::from_secs(5);
 
 #[test]
+fn zsh_compound_commands_keep_one_lifecycle_with_reformatted_preexec_hooks() {
+    if !command_exists("zsh") {
+        return;
+    }
+    exercise_command_lifecycles(ShellKind::Zsh, true);
+}
+
+#[test]
+fn compound_commands_keep_one_lifecycle_in_real_shells() {
+    for shell in [ShellKind::Zsh, ShellKind::Bash] {
+        if command_exists(shell.name()) {
+            exercise_command_lifecycles(shell, false);
+        }
+    }
+}
+
+fn exercise_command_lifecycles(shell: ShellKind, duplicate_hook: bool) {
+    let session = ShellSession::new(shell).expect("shell session");
+    let work = tempfile::tempdir().expect("working directory");
+    let mut command = session
+        .command_builder_isolated(false)
+        .expect("isolated shell");
+    command.cwd(work.path());
+    command.env("TERM", "xterm-256color");
+    command.env("PS1", "HK> ");
+    let (sender, receiver) = crossbeam_channel::unbounded();
+    let _control = session
+        .start_control_reader(sender)
+        .expect("control reader");
+    let mut child =
+        PtyChild::spawn(command, TerminalSize::new(24, 120).expect("size")).expect("spawn shell");
+    child.enable_nonblocking_reads().expect("nonblocking PTY");
+    let mut reader = child.take_reader().expect("PTY reader");
+    wait_for_prompt(&receiver, &mut *reader);
+
+    let mut cases = vec![];
+    if duplicate_hook {
+        // Zsh supplies original, abbreviated and expanded command text to
+        // preexec. Plugins may forward a different representation of the
+        // same accepted line. Register after Hokan, as a late-loaded plugin.
+        cases.push((
+            "alias fixture_compound='printf ALIAS; false'; autoload -Uz add-zsh-hook; function fixture_preexec() { __hokan_preexec \"$2\"; }; add-zsh-hook preexec fixture_preexec".to_owned(),
+            0,
+        ));
+        cases.push(("fixture_compound".to_owned(), 1));
+    }
+    cases.extend([
+        ("printf 'ONE\\n'; printf 'TWO\\n'".into(), 0),
+        ("true && false".into(), 1),
+        ("false || printf 'RECOVERED\\n'".into(), 0),
+        ("printf 'PIPE\\n' | cat".into(), 0),
+        ("(printf 'SUBSHELL\\n'; false)".into(), 1),
+        ("printf '%s\\n' \"$(printf substitution)\"".into(), 0),
+        (format!("{} -fc 'printf CHILD; exit 7'", shell.name()), 7),
+        ("printf 'AFTER\\n'".into(), 0),
+        ("printf 'AFTER\\n'".into(), 0),
+    ]);
+    // Optional local reproduction with an installed Vite, without making
+    // Rust's test suite depend on Node or downloading frontend dependencies.
+    if let Some(vite) = std::env::var_os("HOKAN_TEST_VITE_BIN") {
+        fs::write(work.path().join("index.html"), "<h1>Hokan PTY build</h1>")
+            .expect("Vite fixture");
+        let vite = vite.to_string_lossy().replace('\'', "'\\''");
+        fs::write(
+            work.path().join("package.json"),
+            serde_json::json!({"scripts": {
+                "build": format!("node '{vite}' build"),
+                "build:fail": format!("node '{vite}' build --config missing.config.js")
+            }})
+            .to_string(),
+        )
+        .expect("npm fixture");
+        cases.extend([
+            (format!("node '{vite}' build"), 0),
+            ("npm run build && printf 'BUILD_DONE\\n'".into(), 0),
+            ("npm run build:fail".into(), 1),
+            ("printf 'AFTER_BUILD\\n'".into(), 0),
+        ]);
+    }
+    for (line, status) in cases {
+        child
+            .write_all(format!("{line}\r").as_bytes())
+            .expect("submit");
+        let messages = collect_lifecycle(&receiver, &mut *reader);
+        let lifecycle: Vec<_> = messages
+            .iter()
+            .filter(|message| {
+                !matches!(
+                    message,
+                    ControlMessage::Event(
+                        ShellEvent::Buffer { .. } | ShellEvent::PathChanged { .. }
+                    )
+                )
+            })
+            .collect();
+        assert!(
+            matches!(lifecycle.as_slice(), [ControlMessage::Event(ShellEvent::CommandStart { command: start }), ControlMessage::Event(ShellEvent::CommandEnd { command: end, exit_code, .. }), ControlMessage::Event(ShellEvent::Prompt { .. })] if start == &line && end == &line && *exit_code == status),
+            "{shell}: {line:?}: {lifecycle:#?}"
+        );
+    }
+    if std::env::var_os("HOKAN_TEST_VITE_BIN").is_some() {
+        assert!(
+            work.path().join("dist/index.html").is_file(),
+            "Vite build artifact"
+        );
+    }
+    child.kill().expect("stop fixture shell");
+}
+
+fn collect_lifecycle(
+    receiver: &Receiver<ControlMessage>,
+    reader: &mut dyn Read,
+) -> Vec<ControlMessage> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut messages = Vec::new();
+    let mut buffer = [0; 16 * 1024];
+    while Instant::now() < deadline {
+        while let Ok(message) = receiver.try_recv() {
+            let done = matches!(message, ControlMessage::Event(ShellEvent::Prompt { .. }));
+            messages.push(message);
+            if done {
+                return messages;
+            }
+        }
+        match reader.read(&mut buffer) {
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) || error.raw_os_error() == Some(5) => {}
+            Err(error) => panic!("PTY read: {error}"),
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    panic!("missing command prompt: {messages:#?}");
+}
+
+#[test]
 fn zsh_exact_snapshot_and_native_replacement_work_in_a_real_pty() {
     if !command_exists("zsh") {
         return;
